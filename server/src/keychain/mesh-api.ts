@@ -35,7 +35,12 @@
  * `renew_url`), MESH_NAME, MESH_NATS_ENDPOINTS and MESH_AMQP_ENDPOINTS (the
  * `mesh` block a minted credential comes back with, mesh-object.ts).
  */
+import { X509Certificate } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createServer as createTlsServer, type Server as TlsServer } from "node:https";
+import type { TLSSocket } from "node:tls";
+import { createTrustAttestation, nkeys } from "../sdk.js";
 import { startBrokerAuthFor, storageOf, type StorageLike } from "../storage/index.js";
 import { adminReads } from "../admin/admin-reads.js";
 import { wouldRefuseLog } from "../shared/require-names.js";
@@ -72,6 +77,11 @@ import { loopbackPlatformSteps, PlatformStepUnavailable } from "./platform-steps
 import { customerMintSeed } from "./split-keys.js";
 import { StopStore } from "./stop-store.js";
 import { TenantLimitStore } from "./tenant-limits.js";
+import { TrustAnchorStore } from "./trust-anchors.js";
+import { HttpProofKeys } from "./proof-keys.js";
+import { ReplayCache } from "./outside-proof.js";
+import { IdentitySourceStore, WorkloadBindingStore } from "./identity-records.js";
+import { adminTrust } from "../admin/admin-trust.js";
 import { registryDocuments, registryDocumentRoute, type RawAnswer, type RegistryDocuments } from "../registry/documents-http.js";
 import { adminUsage } from "../admin/admin-usage.js";
 import { adminStreams } from "../admin/admin-streams.js";
@@ -126,6 +136,21 @@ export class MeshApi {
     const agentStatus = await AgentStatusStore.create(js);
     const stops = await StopStore.create(js);
     const limits = await TenantLimitStore.create(js);
+    // Bring your own identity (SPEC §4.14, §9.7): the identity systems each
+    // tenant trusts, where each agent's identity came from, and which agent
+    // holds each outside identity. With no trust records, every outside proof
+    // is refused and nothing else changes.
+    const trust = await TrustAnchorStore.create(js);
+    const identitySources = await IdentitySourceStore.create(js);
+    const workloads = await WorkloadBindingStore.create(js);
+    const publicUrl = env.MESH_PUBLIC_URL ?? env.API_BASE_URL ?? `http://localhost:${env.MESH_API_PORT ?? 3005}`;
+    const proofKeys = new HttpProofKeys();
+    const proofs = {
+      anchors: () => trust.all(),
+      keys: proofKeys,
+      defaultAudience: (env.MESH_PROOF_AUDIENCE ?? publicUrl).trim(),
+      replay: new ReplayCache(),
+    };
     const platformUrl = env.PLATFORM_STEPS_URL?.trim();
     const platform = opts.platform ?? (platformUrl ? loopbackPlatformSteps(platformUrl) : {});
     const deregister = opts.deregister ?? null;
@@ -154,10 +179,14 @@ export class MeshApi {
       limits,
       revokeCredential: revoke,
       platform,
-      baseUrl: env.MESH_PUBLIC_URL ?? env.API_BASE_URL ?? `http://localhost:${env.MESH_API_PORT ?? 3005}`,
+      baseUrl: publicUrl,
       logPrefix: "[keychain]",
       env,
       meshInfo: () => meshInfo(env),
+      proofs,
+      identitySources,
+      workloads,
+      attest: identityAttester(env),
     });
     console.log(`[mesh-api] the platform's steps: ${platformUrl ? `over loopback at ${platformUrl}` : opts.platform ? "in process" : "none (the core works alone)"}`);
 
@@ -221,6 +250,7 @@ export class MeshApi {
       keychainRoutes: adminKeychain({ tombstones, keyRevocations, agentStatus, stops, mintLog, bootTokens, revoke, cut, meshPause: (p) => meshPause(p, env) as never }),
       usageRoutes: adminUsage(usage),
       streamRoutes: streamRoutes,
+      trustRoutes: adminTrust({ trust, owners, identitySources, env }),
       mintSeed: () => customerMintSeed(env),
       issuerAccount: env.ROOMS_MINT_ISSUER_ACCOUNT,
       meshInfo: () => meshInfo(env),
@@ -273,12 +303,35 @@ export class MeshApi {
     });
     await new Promise<void>((resolve) => this.server!.listen(this.port, this.host, resolve));
     console.log(`[mesh-api] listening on ${this.host}:${this.listeningOn}`);
+    // The optional mTLS listener (SPEC §4.14): the same routes, over TLS that
+    // asks for a client certificate, so an agent can enroll with its
+    // X.509-SVID and a certificate-bound token can be checked. The
+    // certificate is checked against the tenant's trust bundle by the door,
+    // not by TLS, so any client may connect and an unknown one is refused there.
+    const mtlsPort = Number(this.env.MESH_MTLS_PORT ?? 0);
+    if (mtlsPort > 0) {
+      const certFile = this.env.MESH_MTLS_CERT_FILE?.trim();
+      const keyFile = this.env.MESH_MTLS_KEY_FILE?.trim();
+      if (!certFile || !keyFile) {
+        console.error("[mesh-api] MESH_MTLS_PORT is set without MESH_MTLS_CERT_FILE and MESH_MTLS_KEY_FILE; the mTLS listener is off.");
+      } else {
+        this.mtls = createTlsServer({ cert: readFileSync(certFile), key: readFileSync(keyFile), requestCert: true, rejectUnauthorized: false }, (req, res) => {
+          void this.route(req, res).catch((err) => {
+            console.error("[mesh-api] unhandled:", err);
+            if (!res.headersSent) send(res, { status: 500, body: { error: "internal error" } });
+          });
+        });
+        await new Promise<void>((resolve) => this.mtls!.listen(mtlsPort, this.host, resolve));
+        console.log(`[mesh-api] mTLS listener on ${this.host}:${mtlsPort}`);
+      }
+    }
     // On the RabbitMQ binding the broker asks the key chain who may connect
     // and what each connection may do (storage/rabbitmq/broker-auth.ts).
     if (this.storage) this.brokerAuth = await startBrokerAuthFor(storageOf(this.storage), this.env);
   }
 
   private brokerAuth: { close(): void } | null = null;
+  private mtls: TlsServer | null = null;
   private storage: StorageLike | null = null;
   /** The admission roster's own door (admission/roster-door.ts). */
   private rosters: RosterDoor | null = null;
@@ -289,6 +342,7 @@ export class MeshApi {
     this.brokerAuth?.close();
     this.brokerAuth = null;
     await this.closeUsage().catch((err) => console.warn(`[mesh-api] the usage store's last batch: ${(err as Error).message}`));
+    if (this.mtls) { await new Promise<void>((resolve) => this.mtls!.close(() => resolve())); this.mtls = null; }
     if (!this.server) return;
     await new Promise<void>((resolve) => this.server!.close(() => resolve()));
     this.server = null;
@@ -310,8 +364,8 @@ export class MeshApi {
       if (method === "GET" && path === "/v1/capabilities") {
         return send(res, url.searchParams.get("core") === "1" ? { status: 200, body: coreCapabilities() as Record<string, unknown> } : await capabilitiesAnswer(this.platform));
       }
-      if (method === "POST" && path === "/v1/bootstrap") return send(res, await this.doors.bootstrap(await readJson(req)));
-      if (method === "POST" && path === "/v1/node-credential") return send(res, await this.doors.nodeCredential(await readJson(req), ip, () => meshInfo(this.env)));
+      if (method === "POST" && path === "/v1/bootstrap") return send(res, await this.doors.bootstrap(await readJson(req), doorRequest(req, this.env)));
+      if (method === "POST" && path === "/v1/node-credential") return send(res, await this.doors.nodeCredential(await readJson(req), ip, () => meshInfo(this.env), doorRequest(req, this.env)));
       if (method === "POST" && path === "/v1/credential/revoke-own") return send(res, await this.doors.revokeOwnCredential(await readJson(req)));
       if (method === "POST" && path === "/v1/agent-key/revoke-own") return send(res, await this.doors.revokeOwnAgentKey(await readJson(req), ip));
       // Whether an account holds the caller's own agent key (doors.ts keyStanding):
@@ -335,6 +389,65 @@ export class MeshApi {
       throw err;
     }
   }
+}
+
+/**
+ * Sign an agent's identity source as a portable trust attestation (§9.7),
+ * with the key the doors mint credentials with. Null when minting is not
+ * configured; the record is then kept without one. Thirty days: the doors
+ * sign again at each enrollment, and a reader checks the expiry.
+ */
+export function identityAttester(env: NodeJS.ProcessEnv): (agent: string, source: import("../sdk.js").IdentitySource) => Record<string, unknown> | null {
+  return (agent, source) => {
+    const seed = customerMintSeed(env);
+    if (!seed.ok) return null;
+    try {
+      const kp = nkeys.fromSeed(new TextEncoder().encode(seed.seed));
+      return createTrustAttestation(kp as never, agent, { identity_source: source }, 30 * 24 * 60 * 60 * 1000) as unknown as Record<string, unknown>;
+    } catch (err) {
+      console.warn(`[keychain] the identity source of ${agent.slice(0, 12)}… was not signed: ${(err as Error).message}`);
+      return null;
+    }
+  };
+}
+
+/**
+ * What a door reads from the request beyond its body: the DPoP header, and
+ * the client certificate chain when the request came over mTLS. Behind a
+ * proxy that ends TLS, the proxy may pass the client certificate in the
+ * header MESH_CLIENT_CERT_HEADER names (PEM, URL-encoded, as Envoy and nginx
+ * forward it), which is believed only from this machine.
+ */
+export function doorRequest(req: IncomingMessage, env: NodeJS.ProcessEnv = process.env): import("./doors.js").DoorRequest {
+  const out: import("./doors.js").DoorRequest = {};
+  const dpop = req.headers.dpop;
+  if (typeof dpop === "string" && dpop) out.dpop = dpop;
+  const sock = req.socket as TLSSocket;
+  if (typeof sock.getPeerCertificate === "function" && sock.encrypted) {
+    const chain: X509Certificate[] = [];
+    let c = sock.getPeerCertificate(true) as { raw?: Buffer; issuerCertificate?: unknown } | null;
+    const seen = new Set<string>();
+    while (c && c.raw && chain.length < 10) {
+      const fp = c.raw.toString("base64");
+      if (seen.has(fp)) break;
+      seen.add(fp);
+      try { chain.push(new X509Certificate(c.raw)); } catch { break; }
+      c = c.issuerCertificate as typeof c;
+    }
+    if (chain.length) out.clientCerts = chain;
+    return out;
+  }
+  const header = env.MESH_CLIENT_CERT_HEADER?.trim().toLowerCase();
+  const local = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket.remoteAddress ?? "");
+  if (header && local) {
+    const v = req.headers[header];
+    const pem = typeof v === "string" ? decodeURIComponent(v.replace(/^"|"$/g, "")) : "";
+    const blocks = pem.match(/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g) ?? [];
+    const chain: X509Certificate[] = [];
+    for (const b of blocks.slice(0, 10)) { try { chain.push(new X509Certificate(b)); } catch { /* skip */ } }
+    if (chain.length) out.clientCerts = chain;
+  }
+  return out;
 }
 
 export const ADMIN_PROXY_SETTING = "MESH_ADMIN_THROUGH_PROXY";

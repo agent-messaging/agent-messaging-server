@@ -276,6 +276,8 @@ export type {
   PublicAccessScheme,
   AdmissionPolicy,
   TrustAttestation,
+  IdentitySource,
+  IdentitySourceKind,
   Availability,
   OfferingExample,
   NodeProfile,

@@ -17,6 +17,7 @@
     "@google-cloud/storage": "^7.21.0",
     "amqplib": "^2.2.0",
     "better-sqlite3": "^12.11.1",
+    "jose": "^6.2.12",
     "nats": "^2.28.2",
     "nats-jwt": "^0.0.9",
     "nkeys.js": "^1.1.0",

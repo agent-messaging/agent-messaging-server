@@ -4,6 +4,7 @@ import type {
   TrustTier,
   AvailabilityClass,
   Reachability,
+  IdentitySourceKind,
 } from "./manifest.js";
 import type { CancelReason, TaskState } from "./task.js";
 import type { CostCeiling } from "./envelope.js";
@@ -28,6 +29,10 @@ export interface DiscoverQuery {
   availability_class?: AvailabilityClass;
   /** Node reachability, joined from the node profile (§9.7). */
   reachability?: Reachability;
+  /** Where the agent's identity came from (§9.7 `identity_source`): every
+   *  member given must match. Agents with no recorded source are excluded
+   *  whenever this is set. */
+  identity_source?: { kind?: IdentitySourceKind; issuer?: string; trust_domain?: string };
   version?: string;
   limit?: number;
   /** Only these agents, by agent ID (§9.3). Naming is not browsing: an

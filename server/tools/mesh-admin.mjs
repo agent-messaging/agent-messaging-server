@@ -37,6 +37,18 @@ Tenants
   tenants key TENANT --label LABEL [--name NAME] [--out FILE]
                                            a one-time enrollment key: the agent runs
                                            agentmesh up <key>. Printed unless --out.
+  tenants trust list [TENANT]              the identity systems a tenant trusts (all
+                                           tenants' with no TENANT)
+  tenants trust add TENANT --oauth ISSUER --audience AUD [--require-binding]
+                           [--jwks-uri URL] [--id ID]
+                                           trust an OAuth issuer: its agents enroll with
+                                           a token whose aud is AUD (--require-binding:
+                                           only DPoP- or certificate-bound tokens)
+  tenants trust add TENANT --spiffe TRUST_DOMAIN (--bundle FILE | --bundle-endpoint URL)
+                           [--require-mtls] [--audience AUD] [--id ID]
+                                           trust a SPIFFE trust domain: its agents enroll
+                                           with a JWT-SVID, or an X.509-SVID over mTLS
+  tenants trust remove TENANT ID           new enrollments and renewals through it stop
 
 Agents
   agents list [--tenant TENANT]
@@ -47,6 +59,9 @@ Agents
   agents set AGENT [--tenant TENANT] [--label LABEL] [--listed | --unlisted]
   agents remove AGENT [--reason TEXT]      revoke its credentials, deregister it, and
                                            drop its record
+  agents identity AGENT                    where its identity came from: this mesh's
+                                           enrollment, an OAuth issuer, a SPIFFE trust
+                                           domain, or a bridge
   agents admission AGENT [--registered STANCE] [--anonymous STANCE]
                          [--allow KEY]... [--hold KEY]... [--block KEY]...
                          [--per-sender-per-hour N]
@@ -84,7 +99,7 @@ Options for every command
 const FLAGS_WITH_VALUE = new Set([
   "url", "token-file", "token-name", "out", "name", "home-org", "owner-key", "max-agents", "max-rooms", "max-drive-mb",
   "requests-per-minute", "clear", "label", "tenant", "reason", "registered", "anonymous", "allow", "hold", "block",
-  "per-sender-per-hour", "agent", "key", "limit",
+  "per-sender-per-hour", "agent", "key", "limit", "oauth", "audience", "jwks-uri", "id", "spiffe", "bundle", "bundle-endpoint",
 ]);
 const REPEATABLE = new Set(["agent", "allow", "hold", "block", "clear"]);
 
@@ -196,6 +211,17 @@ function table(rows, cols) {
   return [line(cols), ...rows.map((r) => line(cols.map((c) => r[c])))].join("\n");
 }
 
+function trustTable(list) {
+  return table(list.map((t) => ({
+    id: t.id,
+    kind: t.kind,
+    trusts: t.kind === "oauth" ? t.issuer : t.trust_domain,
+    audience: t.audience ?? "",
+    binding: t.kind === "oauth" ? (t.require_binding ? "required" : "") : (t.require_mtls ? "mTLS only" : ""),
+    keys: t.kind === "oauth" ? (t.jwks_uri ?? "from metadata") : (t.bundle_endpoint ?? `${t.bundle_keys ?? 0} keys inline`),
+  })), ["id", "kind", "trusts", "audience", "binding", "keys"]);
+}
+
 function said(out) {
   return [out.note, out.what_now].filter(Boolean).join("\n");
 }
@@ -298,6 +324,76 @@ export async function run(argv, { env = process.env, fetch: fetchImpl = globalTh
       return 0;
       }
       show(r, `${r.key}\nOne agent enrolls with it, once, within ${r.expires_in_days} days: agentmesh up <key>`);
+      return 0;
+    }
+
+    case "tenants trust": {
+      const sub = arg;
+      const tenant = pos[3];
+      if (sub === "list") {
+        if (!tenant) {
+          const r = await call(ctx, "GET", "/trust");
+          show(r, r.tenants.length ? r.tenants.map((t) => `${t.tenant}\n${trustTable(t.trust)}`).join("\n\n") : "No tenant trusts an outside identity system.");
+          return 0;
+        }
+        const r = await call(ctx, "GET", `/tenants/${enc(tenant)}/trust`);
+        show(r, trustTable(r.trust));
+        return 0;
+      }
+      if (sub === "add") {
+        need(tenant, "which tenant");
+        let body;
+        if (opt.oauth && opt.spiffe) throw new UsageError("Give --oauth or --spiffe, not both.");
+        if (opt.oauth) {
+          body = {
+            kind: "oauth", issuer: opt.oauth,
+            audience: need(opt.audience, "the audience its tokens carry for this mesh (--audience)"),
+            require_binding: opt["require-binding"] === true,
+            ...(opt["jwks-uri"] ? { jwks_uri: opt["jwks-uri"] } : {}),
+          };
+        } else if (opt.spiffe) {
+          if (!!opt.bundle === !!opt["bundle-endpoint"]) throw new UsageError("Give the trust bundle as --bundle FILE or --bundle-endpoint URL, one of them.");
+          let bundle;
+          if (opt.bundle) {
+            try { bundle = JSON.parse(readFileSync(opt.bundle, "utf8")); } catch { throw new UsageError(`${opt.bundle} is not a JSON trust bundle.`); }
+          }
+          body = {
+            kind: "spiffe", trust_domain: opt.spiffe, require_mtls: opt["require-mtls"] === true,
+            ...(bundle ? { bundle } : { bundle_endpoint: opt["bundle-endpoint"] }),
+            ...(opt.audience ? { audience: opt.audience } : {}),
+          };
+        } else {
+          throw new UsageError("Say what to trust: --oauth ISSUER --audience AUD, or --spiffe TRUST_DOMAIN with --bundle or --bundle-endpoint.");
+        }
+        if (opt.id) body.id = opt.id;
+        const r = await call(ctx, "POST", `/tenants/${enc(tenant)}/trust`, body);
+        const what = r.added.kind === "oauth" ? `the issuer ${r.added.issuer} (audience ${r.added.audience})` : `the SPIFFE trust domain ${r.added.trust_domain}`;
+        show(r, `Tenant ${tenant} now trusts ${what}, as record ${r.added.id}. Its agents can enroll with a proof from it.`);
+        return 0;
+      }
+      if (sub === "remove") {
+        need(tenant, "which tenant");
+        const id = need(pos[4], "which trust record (its id, from tenants trust list)");
+        const r = await call(ctx, "DELETE", `/tenants/${enc(tenant)}/trust/${enc(id)}`);
+        show(r, `Trust record ${id} was removed from tenant ${tenant}. New enrollments through it, and renewals of the agents that enrolled through it, are refused from now on.`);
+        return 0;
+      }
+      throw new UsageError("tenants trust has three commands: list, add and remove.");
+    }
+
+    case "agents identity": {
+      const r = await call(ctx, "GET", `/agents/${enc(need(arg, "which agent"))}/identity`);
+      const src = r.identity_source;
+      show(r, !src ? "This mesh holds no record of where this agent's identity came from (it enrolled before the record was kept)." : [
+        `Identity source: ${src.kind}`,
+        ...(src.issuer ? [`Issuer: ${src.issuer}`] : []),
+        ...(src.trust_domain ? [`Trust domain: ${src.trust_domain}`] : []),
+        ...(src.workload_id ? [`Workload identifier: ${src.workload_id}`] : []),
+        ...(src.bridge ? [`Bridged by node: ${src.bridge}`] : []),
+        `Since: ${src.since}`,
+        `Tenant: ${r.tenant ?? "(none)"}`,
+        `Signed attestation: ${r.attestation ? `yes, until ${r.attestation.expires_at}` : "no"}`,
+      ].join("\n"));
       return 0;
     }
 

@@ -36,7 +36,7 @@ export interface TrustAttestation {
   issuer: string;
   /** The node (or agent) key the claim is about. */
   subject: string;
-  claims: { trust_tier?: TrustTier; role?: NodeRole };
+  claims: { trust_tier?: TrustTier; role?: NodeRole; identity_source?: IdentitySource };
   issued_at: string;
   expires_at: string;
   sig: string;
@@ -876,6 +876,30 @@ export interface Manifest {
   /** When `owner` differs from the node, an attestation signed by the owner key
    *  binding owner→agent (same shape as the node vouch); verified at register. */
   owner_attestation?: AgentAttestation;
+  /** Where this agent's identity came from (§9.7, Agent Messaging 0.8).
+   *  Registry-populated from the key chain's record, never from the
+   *  registration: a manifest that carries it has it replaced. Absent when the
+   *  mesh holds no record (an agent enrolled before the record existed). */
+  identity_source?: IdentitySource;
+}
+
+/** Where an agent's identity came from (§9.7 `identity_source`). */
+export type IdentitySourceKind = "mesh" | "oauth" | "spiffe" | "wimse" | "bridged";
+
+/** The `identity_source` attested attribute (§9.7): which system vouched for
+ *  the agent's identity when it enrolled. Attested by the mesh, never declared. */
+export interface IdentitySource {
+  kind: IdentitySourceKind;
+  /** The OAuth or WIMSE issuer, when there is one. */
+  issuer?: string;
+  /** The SPIFFE trust domain, when there is one. */
+  trust_domain?: string;
+  /** The WIMSE identifier: the SPIFFE ID, or for OAuth the token's client_id, else azp, else sub. */
+  workload_id?: string;
+  /** Bridged only: the bridge node that signs for the agent. */
+  bridge?: string;
+  /** When the mesh recorded it, ISO-8601. */
+  since: string;
 }
 
 // ── Node Profile (§9.7) ──────────────────────────────────────────────
