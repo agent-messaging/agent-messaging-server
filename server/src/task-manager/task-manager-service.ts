@@ -1,0 +1,134 @@
+import { messagingOf, type MessagingLike } from "../storage/index.js";
+import type { BusSubscription, Messaging } from "../storage/index.js";
+import { keyedOf, storageOf, type KeyedLike, type KeyedStore, type StorageLike } from "../storage/index.js";
+import { subscribeWithHandler } from "../shared/handler.js";
+import { serviceQueue } from "../shared/queue-groups.js";
+import { identityFromEnv } from "../shared/seed.js";
+import { handleTaskUpdate } from "./handlers/task-update.js";
+import { handleTaskGet } from "./handlers/task-get.js";
+import { OverdueSweep } from "./overdue-sweep.js";
+import { declaredNeedRefs, type DeclaredNeedsFn } from "./cancel.js";
+
+export class TaskManagerService {
+  /** Signing identity (§4.5). Stable if TASK_MANAGER_SEED is set; a set-but-
+   *  unusable seed refuses to boot rather than falling back (shared/seed.ts). */
+  private readonly kp = identityFromEnv("TASK_MANAGER_SEED");
+  private readonly SERVICE_ID = this.kp.getPublicKey();
+  private subs: BusSubscription[] = [];
+  /** §7.7 deadline enforcement: marks non-terminal tasks overdue on this
+   *  service's clock and notifies the requester. */
+  private overdueSweep: OverdueSweep | null = null;
+
+  private kv: KeyedStore;
+  /** The registry's bucket, once it has opened (see `declaredNeeds`). */
+  private registryKv: KeyedStore | null = null;
+
+  constructor(
+    private nc: Messaging,
+    private js: StorageLike,
+    kv: KeyedLike,
+  ) {
+    this.kv = keyedOf(kv, js);
+  }
+
+  /**
+   * §10.8a: read the responder's own declared `needs` out of the registry so a
+   * "the caller did not furnish X" claim can be checked against something the
+   * responder published before the work started.
+   *
+   * Read-only, and opened on first use rather than at boot: the registry
+   * bucket may not exist yet in a task-manager-only deployment, and a task
+   * manager that refused to boot without it would be trading a working mesh
+   * for a reputation nicety. An open that fails is tried again on the next
+   * call. Every failure here returns null, which the attribution rule reads as
+   * "could not check" and attributes to the provider.
+   */
+  private declaredNeeds: DeclaredNeedsFn = async (responder, offering) => {
+    try {
+      const kv = (this.registryKv ??= await storageOf(this.js).keyed("mesh_registry"));
+      const entry = await kv.get(responder);
+      if (!entry) return null;
+      return declaredNeedRefs(entry.json<unknown>(), offering);
+    } catch {
+      return null;
+    }
+  };
+
+  static async create(
+    nc: MessagingLike,
+    js: StorageLike,
+  ): Promise<TaskManagerService> {
+    // Ten revisions a task, kept seven days (storage/catalog.ts).
+    const kv = await storageOf(js).keyed("mesh_tasks");
+    // EXT-8 §3's reported-spend rollup is not this service's: whoever
+    // operates the mesh folds it from the §19.2 receipts this service
+    // publishes (on AgentMesh, platform-shared/spend-rollup.ts).
+    return new TaskManagerService(messagingOf(nc), js, kv);
+  }
+
+  async start(): Promise<void> {
+    // Subscribe to all task updates: mesh.task.*.update
+    //
+    // Queue group, even though this one never replies. `handleTaskUpdate` is a
+    // read-modify-write on the task record: it loads the task from KV, validates
+    // the transition, appends the update envelope to `task.history`, and writes
+    // the whole record back. Two instances handling the same update both read
+    // the same prior state and both write their own version back, so one of the
+    // two history entries is lost — and each instance also publishes its own
+    // `mesh.event.task.<state>` event, so every subscriber sees the transition
+    // twice. Exactly one instance must apply an update.
+    const updateSubject = "mesh.task.*.update";
+    const updateSub = this.nc.subscribe(updateSubject, { queue: serviceQueue(updateSubject) });
+    this.subs.push(updateSub);
+
+    (async () => {
+      for await (const msg of updateSub) {
+        try {
+          await handleTaskUpdate(
+            msg,
+            this.kv,
+            this.nc,
+            this.kp,
+            // §10.8 stranded-delegate fan-out: the same snapshot enumeration
+            // the overdue sweep uses (never `kv.keys()` — shared/kv.ts).
+            async () => (await this.kv.list()).entries,
+            // §10.8a: the responder's declared needs, for attributing a
+            // failure the responder says was the caller's doing.
+            this.declaredNeeds,
+          );
+        } catch (err) {
+          console.error("[task-manager] update handler error:", err);
+        }
+      }
+    })();
+
+    // Request-reply for task lookup: mesh.task.get.*
+    this.subs.push(
+      subscribeWithHandler(
+        this.nc,
+        "mesh.task.get.*",
+        this.kp,
+        (env, msg) => handleTaskGet(env, msg, this.kv, this.SERVICE_ID),
+        undefined,
+        undefined,
+        serviceQueue("mesh.task.get.*"),
+      ),
+    );
+
+    // §7.7: the deadline half of the budget is the half the platform CAN
+    // enforce without the responder's cooperation, because this service holds
+    // Task state and the clock centrally.
+    this.overdueSweep = new OverdueSweep(this.nc, this.js, this.kv, this.kp);
+    this.overdueSweep.start();
+
+    console.log("[task-manager] service started (task updates + task lookup + overdue sweep)");
+  }
+
+  async stop(): Promise<void> {
+    for (const sub of this.subs) {
+      sub.unsubscribe();
+    }
+    this.overdueSweep?.stop();
+    console.log("[task-manager] service stopped");
+  }
+}

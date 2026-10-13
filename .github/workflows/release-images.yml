@@ -1,0 +1,293 @@
+name: Release images
+
+# Builds, tests and publishes the Agent Messaging Server's two images:
+#
+#   agent-messaging-server       the server: first-run setup, the core
+#                                services, the admin CLI (server/Dockerfile)
+#   agent-messaging-a2a-gateway  the A2A gateway, a mesh node that puts outside A2A
+#                                agents on the mesh and the other way round
+#                                (a2a-gateway/Dockerfile)
+#
+# One version for both, from server/server-release.json. They are released
+# together and tested together, so separate numbers would only make combinations
+# nobody has tried.
+#
+# Registry: ghcr.io, under the repository's owner. Tags: the version, and
+# sha-<12 characters of the commit>. A published tag is never replaced: the
+# job looks for both tags first and stops if either is there, and there is no
+# `latest`, because moving it would replace a published tag. To publish again,
+# raise the version in server/server-release.json.
+#
+# A new package on ghcr.io starts private. Making it public is a choice made
+# once, by hand, in the package's settings; until then an anonymous pull is
+# refused.
+#
+# When it runs:
+#   - a tag `server-v<version>`: build, test, publish. The tag must name the
+#     version in server/server-release.json.
+#   - by hand (workflow_dispatch) with that same version: the same.
+#   - a pull request that changes how the images are built: build and test
+#     only, nothing published.
+#
+# CI (ci.yml) builds both images on every change and runs the conformance
+# profile and the examples on them, on both brokers; this workflow is the
+# release.
+on:
+  push:
+    tags: ["server-v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, without the leading v. Must equal server/server-release.json."
+        required: true
+  pull_request:
+    paths:
+      - ".github/workflows/release-images.yml"
+      - ".dockerignore"
+      - "server/Dockerfile"
+      - "server/server-entrypoint.sh"
+      - "server/server-release.json"
+      - "a2a-gateway/Dockerfile"
+
+concurrency:
+  group: release-images-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_SERVER: ${{ github.repository_owner }}/agent-messaging-server
+  IMAGE_GATEWAY: ${{ github.repository_owner }}/agent-messaging-a2a-gateway
+  NATS_IMAGE: nats:2.10.24-alpine
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the version and the tags
+        id: v
+        run: |
+          FILE=$(node -p "require('./server/server-release.json').version")
+          case "${{ github.event_name }}" in
+            workflow_dispatch) ASKED="${{ github.event.inputs.version }}" ;;
+            push) ASKED="${GITHUB_REF_NAME#server-v}" ;;
+            *) ASKED="$FILE" ;;
+          esac
+          case "$ASKED" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::version '$ASKED' is not X.Y.Z"; exit 1 ;;
+          esac
+          if [ "$ASKED" != "$FILE" ]; then
+            echo "::error::asked to publish $ASKED, but server/server-release.json says $FILE. Raise the file in a commit first, then tag that commit server-v$FILE."
+            exit 1
+          fi
+          SHA="sha-$(echo "$GITHUB_SHA" | cut -c1-12)"
+          echo "version=$FILE" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=$SHA" >> "$GITHUB_OUTPUT"
+          echo "publish=${{ github.event_name != 'pull_request' }}" >> "$GITHUB_OUTPUT"
+          echo "version $FILE, commit tag $SHA, publish: ${{ github.event_name != 'pull_request' }}"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        if: steps.v.outputs.publish == 'true'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Before anything is built: a tag that is already published stays as it is.
+      - name: Refuse to replace a published tag
+        if: steps.v.outputs.publish == 'true'
+        run: |
+          taken=""
+          for ref in \
+            "$REGISTRY/$IMAGE_SERVER:${{ steps.v.outputs.version }}" \
+            "$REGISTRY/$IMAGE_SERVER:${{ steps.v.outputs.sha_tag }}" \
+            "$REGISTRY/$IMAGE_GATEWAY:${{ steps.v.outputs.version }}" \
+            "$REGISTRY/$IMAGE_GATEWAY:${{ steps.v.outputs.sha_tag }}"; do
+            if docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then taken="$taken $ref"; fi
+          done
+          if [ -n "$taken" ]; then
+            echo "::error::already published, and never replaced:$taken. Raise the version in server/server-release.json."
+            exit 1
+          fi
+          echo "no tag of this version or commit is published yet"
+
+      # Build and load locally first, so a broken image is never pushed.
+      - name: Build the server
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: server/Dockerfile
+          load: true
+          tags: agent-messaging-server:smoke
+          build-args: |
+            MESH_SERVER_VERSION=${{ steps.v.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build the A2A gateway
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: a2a-gateway/Dockerfile
+          load: true
+          tags: agent-messaging-a2a-gateway:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # From empty: first-run on a new volume, the broker on what it wrote, the
+      # server on top. Nothing is prepared by hand.
+      - name: First-run setup on an empty volume
+        run: |
+          docker network create smoke
+          docker volume create smoke-config
+          docker run --rm -v smoke-config:/config -e MESH_NAME=smoke agent-messaging-server:smoke first-run | tee /tmp/first-run.log
+          grep -q "KEEP A COPY OF THE OPERATOR KEY" /tmp/first-run.log \
+            || { echo "::error::first-run did not say where the operator key is"; exit 1; }
+          # An nkey seed is a whole token of 58 base32 characters starting S and
+          # the key type. None may be printed. Anchored, because the public keys
+          # first-run prints (56 characters) can hold "SO", "SA" or "SU" inside.
+          if grep -Eq '(^|[^A-Z2-7])S[OAUNCX][A-Z2-7]{56}([^A-Z2-7]|$)' /tmp/first-run.log; then
+            echo "::error::first-run printed something shaped like a seed"; exit 1
+          fi
+          docker run --rm -v smoke-config:/config agent-messaging-server:smoke first-run | tee /tmp/first-run-again.log
+          grep -q "Nothing was changed" /tmp/first-run-again.log \
+            || { echo "::error::a second first-run did not leave the folder as it was"; exit 1; }
+
+      - name: Start the broker and the server
+        run: |
+          docker run -d --name nats --network smoke -v smoke-config:/config "$NATS_IMAGE" -c /config/nats/nats.conf
+          docker run -d --name server --network smoke -v smoke-config:/config -p 3005:3005 agent-messaging-server:smoke
+          for i in $(seq 1 45); do
+            if docker logs server 2>&1 | grep -q "All services ready"; then echo "the server is ready"; break; fi
+            if [ "$(docker inspect -f '{{.State.Status}}' server)" != "running" ]; then
+              echo "::error::the server exited before it was ready"; docker logs nats; docker logs server; exit 1
+            fi
+            if [ "$i" = 45 ]; then echo "::error::the server was not ready in 90 seconds"; docker logs nats; docker logs server; exit 1; fi
+            sleep 2
+          done
+          CAPS=$(curl -fsS http://localhost:3005/v1/capabilities)
+          echo "$CAPS" | head -c 400; echo
+          echo "$CAPS" | grep -q '"profile":"core"' || { echo "::error::the capabilities answer is not the core's"; exit 1; }
+          echo "$CAPS" | grep -q "\"version\":\"${{ steps.v.outputs.version }}\"" \
+            || { echo "::error::the capabilities answer does not carry release ${{ steps.v.outputs.version }}"; exit 1; }
+          docker exec server /entrypoint.sh mesh-admin status | tee /tmp/status.log
+          grep -q "Live revocation: on" /tmp/status.log || { echo "::error::live revocation is not set up after first-run"; exit 1; }
+          grep -q "Credential minting: on" /tmp/status.log || { echo "::error::credential minting is not set up after first-run"; exit 1; }
+
+      # The point of the full resolver and the system user: an admin-minted
+      # credential, connected, is cut off live when its agent is revoked.
+      - name: Revoke a connected agent live
+        run: |
+          KEY=$(docker run --rm --entrypoint node agent-messaging-server:smoke -e 'console.log(require("nats").nkeys.createUser().getPublicKey())')
+          docker exec server /entrypoint.sh mesh-admin tenants create smoke-tenant
+          docker exec server /entrypoint.sh mesh-admin agents enroll "$KEY" --tenant smoke-tenant
+          docker exec server /entrypoint.sh mesh-admin credentials mint --agent "$KEY" --out /config/smoke-agent.creds
+          docker run -d --name holder --network smoke -v smoke-config:/config --entrypoint node agent-messaging-server:smoke -e '
+            const { connect, credsAuthenticator } = require("nats");
+            const { readFileSync } = require("fs");
+            (async () => {
+              const nc = await connect({ servers: "nats://nats:4222", authenticator: credsAuthenticator(readFileSync("/config/smoke-agent.creds")), maxReconnectAttempts: 0 });
+              console.log("connected");
+              const err = await nc.closed();
+              console.log("cut off: " + (err ? err.message : "closed"));
+            })().catch((e) => { console.log("failed: " + e.message); process.exit(1); });
+          '
+          for i in $(seq 1 20); do docker logs holder 2>&1 | grep -q connected && break; sleep 1; done
+          docker logs holder 2>&1 | grep -q connected || { echo "::error::the admin-minted credential could not connect"; docker logs holder; exit 1; }
+          START=$(date +%s)
+          docker exec server /entrypoint.sh mesh-admin credentials revoke --agent "$KEY" --reason "release smoke test"
+          for i in $(seq 1 20); do docker logs holder 2>&1 | grep -q "cut off" && break; sleep 1; done
+          docker logs holder
+          docker logs holder 2>&1 | grep -q "cut off" || { echo "::error::the revoked agent's connection was not cut"; docker logs server | tail -30; exit 1; }
+          echo "cut off live, $(( $(date +%s) - START )) s after the revoke"
+
+      - name: Connect the A2A gateway with the credential first-run made
+        run: |
+          docker run -d --name gateway --network smoke -v smoke-config:/config:ro -p 8090:8090 \
+            -e MESH_URL=ws://nats:4443 -e CREDS_FILE=/config/creds/a2a-gateway.creds \
+            agent-messaging-a2a-gateway:smoke
+          CODE=000
+          for i in $(seq 1 30); do
+            CODE=$(curl -sS -o /tmp/gateway-healthz -w '%{http_code}' http://localhost:8090/healthz 2>/dev/null || true)
+            [ "$CODE" = "200" ] && break
+            if [ "$(docker inspect -f '{{.State.Status}}' gateway)" != "running" ]; then
+              echo "::error::the gateway exited"; docker logs gateway; exit 1
+            fi
+            sleep 2
+          done
+          docker logs gateway
+          cat /tmp/gateway-healthz; echo
+          [ "$CODE" = "200" ] || { echo "::error::the gateway did not reach the mesh (HTTP $CODE)"; exit 1; }
+          grep -q '"ready":true' /tmp/gateway-healthz || { echo "::error::/healthz did not report ready:true"; exit 1; }
+
+      - name: Logs, on failure
+        if: failure()
+        run: |
+          for c in nats server holder gateway; do echo "---- $c"; docker logs "$c" 2>&1 | tail -60 || true; done
+
+      - name: Publish the server
+        if: steps.v.outputs.publish == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: server/Dockerfile
+          push: true
+          # linux/amd64 only for now: better-sqlite3 has not been tried under arm64 emulation.
+          platforms: linux/amd64
+          build-args: |
+            MESH_SERVER_VERSION=${{ steps.v.outputs.version }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_SERVER }}:${{ steps.v.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_SERVER }}:${{ steps.v.outputs.sha_tag }}
+          labels: |
+            org.opencontainers.image.title=Agent Messaging Server
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.v.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=Apache-2.0
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Publish the A2A gateway
+        if: steps.v.outputs.publish == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: a2a-gateway/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_GATEWAY }}:${{ steps.v.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_GATEWAY }}:${{ steps.v.outputs.sha_tag }}
+          labels: |
+            org.opencontainers.image.title=Agent Messaging Server A2A gateway
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.v.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=Apache-2.0
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        if: steps.v.outputs.publish == 'true'
+        run: |
+          {
+            echo "### Published"
+            echo ""
+            echo '```'
+            echo "docker pull $REGISTRY/$IMAGE_SERVER:${{ steps.v.outputs.version }}"
+            echo "docker pull $REGISTRY/$IMAGE_GATEWAY:${{ steps.v.outputs.version }}"
+            echo '```'
+            echo ""
+            echo "Also tagged ${{ steps.v.outputs.sha_tag }}. A new package starts private: an anonymous pull is"
+            echo "refused until the package is made public in its settings."
+          } >> "$GITHUB_STEP_SUMMARY"

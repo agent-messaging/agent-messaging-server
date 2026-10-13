@@ -1,0 +1,6 @@
+# Every text file is stored and checked out with LF, on every system. The
+# images and the Kubernetes and Compose files are used on Linux, where a shell
+# script with a carriage return does not run.
+* text=auto eol=lf
+*.png binary
+*.tgz binary

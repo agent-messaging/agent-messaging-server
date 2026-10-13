@@ -1,0 +1,228 @@
+# The Agent Messaging Server on NATS JetStream, on one Kubernetes node.
+#
+#   kubectl apply -f mesh.yaml
+#
+# The same shape as deploy/compose/nats: a first-run Job fills the volume
+# `config` once, then NATS, the server and the A2A gateway start on what it
+# wrote. Every pod mounts that one volume, which is ReadWriteOnce, so they all
+# run on one node. That is the shape version 1 supports; README.md says why.
+#
+# The images are the release's. To try a build of your own on a local cluster,
+# load it (kind load docker-image, k3d image import) and change the two image
+# lines.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agent-messaging
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: config
+  namespace: agent-messaging
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+---
+# The settings first-run reads. Change the addresses to the ones agents use to
+# reach this cluster before the first apply: they go into every credential.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: first-run
+  namespace: agent-messaging
+data:
+  MESH_NAME: agent-messaging
+  MESH_NATS_ENDPOINTS: nats://localhost:4222,ws://localhost:4443
+  MESH_PUBLIC_URL: http://localhost:3005
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: first-run
+  namespace: agent-messaging
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: first-run
+          image: ghcr.io/jeffrschneider/agent-messaging-server:0.1.0
+          args: ["first-run"]
+          envFrom:
+            - configMapRef:
+                name: first-run
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      volumes:
+        - name: config
+          persistentVolumeClaim:
+            claimName: config
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nats
+  namespace: agent-messaging
+spec:
+  serviceName: nats
+  replicas: 1
+  selector:
+    matchLabels: { app: nats }
+  template:
+    metadata:
+      labels: { app: nats }
+    spec:
+      initContainers:
+        # Waits for first-run, which writes nats/nats.conf and, last of all,
+        # first-run.json.
+        - name: wait-for-first-run
+          image: busybox:1.36
+          command: ["sh", "-c", "until [ -f /config/first-run.json ]; do echo waiting for first-run; sleep 2; done"]
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      containers:
+        - name: nats
+          image: nats:2.10.24-alpine
+          args: ["-c", "/config/nats/nats.conf"]
+          ports:
+            - { name: client, containerPort: 4222 }
+            - { name: websocket, containerPort: 4443 }
+          readinessProbe:
+            exec:
+              command: ["wget", "-qO-", "http://127.0.0.1:8222/healthz?js-enabled-only=true"]
+            periodSeconds: 3
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      volumes:
+        - name: config
+          persistentVolumeClaim:
+            claimName: config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats
+  namespace: agent-messaging
+spec:
+  selector: { app: nats }
+  ports:
+    - { name: client, port: 4222, targetPort: 4222 }
+    - { name: websocket, port: 4443, targetPort: 4443 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: server
+  namespace: agent-messaging
+spec:
+  replicas: 1
+  # One server per mesh in version 1: never two at once, even during a rollout.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: server }
+  template:
+    metadata:
+      labels: { app: server }
+    spec:
+      securityContext:
+        fsGroup: 1000
+      initContainers:
+        - name: wait-for-first-run
+          image: busybox:1.36
+          command: ["sh", "-c", "until [ -f /config/first-run.json ]; do echo waiting for first-run; sleep 2; done"]
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      containers:
+        - name: server
+          image: ghcr.io/jeffrschneider/agent-messaging-server:0.1.0
+          env:
+            - { name: NATS_URL, value: "nats://nats:4222" }
+          ports:
+            - { name: api, containerPort: 3005 }
+          readinessProbe:
+            httpGet: { path: /v1/capabilities, port: 3005 }
+            periodSeconds: 3
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      volumes:
+        - name: config
+          persistentVolumeClaim:
+            claimName: config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: server
+  namespace: agent-messaging
+spec:
+  selector: { app: server }
+  ports:
+    - { name: api, port: 3005, targetPort: 3005 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: a2a-gateway
+  namespace: agent-messaging
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: a2a-gateway }
+  template:
+    metadata:
+      labels: { app: a2a-gateway }
+    spec:
+      securityContext:
+        fsGroup: 1000
+      initContainers:
+        - name: wait-for-first-run
+          image: busybox:1.36
+          command: ["sh", "-c", "until [ -f /config/first-run.json ]; do echo waiting for first-run; sleep 2; done"]
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      containers:
+        - name: a2a-gateway
+          image: ghcr.io/jeffrschneider/agent-messaging-a2a-gateway:0.1.0
+          env:
+            - { name: MESH_URL, value: "ws://nats:4443" }
+            - { name: CREDS_FILE, value: /config/creds/a2a-gateway.creds }
+            - { name: PUBLIC_BASE_URL, value: "http://localhost:8090" }
+            - { name: ATTACHMENTS_FILE, value: /config/a2a-gateway/attachments.json }
+            - { name: API_KEYS_FILE, value: /config/a2a-gateway/api-keys.json }
+            - { name: CALLER_IDS_FILE, value: /config/a2a-gateway/caller-identities.json }
+          ports:
+            - { name: a2a, containerPort: 8090 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8090 }
+            periodSeconds: 3
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      volumes:
+        - name: config
+          persistentVolumeClaim:
+            claimName: config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: a2a-gateway
+  namespace: agent-messaging
+spec:
+  selector: { app: a2a-gateway }
+  ports:
+    - { name: a2a, port: 8090, targetPort: 8090 }

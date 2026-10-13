@@ -1,0 +1,111 @@
+name: CI
+
+# Every push to main and every pull request:
+#   checks    typecheck and unit tests of the server, the A2A gateway and the
+#             SDK; the secret check; the Kubernetes manifests checked against
+#             the Kubernetes schemas
+#   mesh      for each broker: the Compose setup brought up from empty (images
+#             built from this commit, first-run, broker, server, gateway), the
+#             core conformance profile against it with --ci, and every example
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Secrets
+        run: node tools/check-secrets.mjs
+
+      - name: The SDK
+        working-directory: sdk-typescript
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+          npx tsc --noEmit
+          npx vitest run
+
+      - name: The server
+        working-directory: server
+        run: |
+          npm ci --no-audit --no-fund
+          npm run typecheck
+          npm test
+
+      - name: The A2A gateway
+        working-directory: a2a-gateway
+        run: |
+          npm ci --no-audit --no-fund
+          npm run typecheck
+          npm test
+
+      - name: The Kubernetes manifests
+        run: |
+          curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar -xz kubeconform
+          ./kubeconform -strict -summary deploy/kubernetes/nats/mesh.yaml deploy/kubernetes/rabbitmq/mesh.yaml
+
+  mesh:
+    name: mesh (${{ matrix.broker }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        broker: [nats, rabbitmq]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Bring the mesh up from empty
+        working-directory: deploy/compose/${{ matrix.broker }}
+        run: |
+          docker compose build
+          docker compose up -d --wait --wait-timeout 300
+          docker compose ps
+          docker compose logs setup | tee "$RUNNER_TEMP/first-run.log"
+          grep -q "KEEP A COPY OF THE OPERATOR KEY" "$RUNNER_TEMP/first-run.log" || { echo "::error::first-run did not say where the operator key is"; exit 1; }
+          if grep -Eq '(^|[^A-Z2-7])S[OAUNCX][A-Z2-7]{56}([^A-Z2-7]|$)' "$RUNNER_TEMP/first-run.log"; then echo "::error::first-run printed something shaped like a seed"; exit 1; fi
+          docker compose exec -T server /entrypoint.sh mesh-admin status | tee "$RUNNER_TEMP/status.log"
+          grep -q "Live revocation: on" "$RUNNER_TEMP/status.log"
+          curl -fsS http://127.0.0.1:3005/v1/capabilities | grep -q "\"binding\":\"${{ matrix.broker }}\""
+
+      - name: Install the SDK, the suite and the examples
+        run: |
+          (cd sdk-typescript && npm ci --no-audit --no-fund && npm run build)
+          (cd server && npm ci --no-audit --no-fund)
+          node tools/conformance.mjs install
+          (cd examples && npm ci --no-audit --no-fund)
+
+      - name: The core conformance profile
+        run: node tools/conformance.mjs ${{ matrix.broker }} --ci
+
+      - name: The examples
+        run: node examples/run.mjs ${{ matrix.broker }}
+
+      - name: Logs, on failure
+        if: failure()
+        working-directory: deploy/compose/${{ matrix.broker }}
+        run: docker compose logs --tail 120
+
+      - name: Stop the mesh
+        if: always()
+        working-directory: deploy/compose/${{ matrix.broker }}
+        run: docker compose down -v

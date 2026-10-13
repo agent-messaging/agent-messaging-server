@@ -1,0 +1,154 @@
+# The Agent Messaging Server on RabbitMQ, with Postgres for its state: one
+# host, one command.
+#
+#   docker compose up -d
+#
+# What starts, in order:
+#   setup        first-run setup, once: the operator, the signing keys,
+#                RabbitMQ's settings (its virtual host, the topic exchange, the
+#                server's own user, the check that asks the server about every
+#                node), a password for Postgres and the first admin token, in
+#                the volume `config`. On every later start it changes nothing.
+#   postgres     Postgres 18, where the server keeps its state. To use a
+#                Postgres you already run instead, see README.md
+#                (compose.own-postgres.yaml).
+#   rabbitmq     RabbitMQ 4.3 on the settings first-run wrote.
+#   server       the Agent Messaging Server: the core services, the credential
+#                doors and the admin API on 3005, and the check RabbitMQ asks
+#                about node connections (on the Compose network only).
+#   a2a-gateway  the A2A gateway on 8090, on the credential first-run made.
+#
+# Every port is published on 127.0.0.1 only, unless BIND_ADDRESS says
+# otherwise (.env.example). Postgres and RabbitMQ's management API are not
+# published at all: only the server uses them.
+
+name: agent-messaging-rabbitmq
+
+services:
+  setup:
+    image: ${SERVER_IMAGE:-agent-messaging-server:local}
+    build:
+      context: ../../..
+      dockerfile: server/Dockerfile
+    command: ["first-run"]
+    environment:
+      MESH_BROKER: rabbitmq
+      MESH_NAME: ${MESH_NAME:-agent-messaging}
+      # Where RabbitMQ reaches the server's check of node connections.
+      MESH_BROKER_AUTH_URL: http://server:3006
+      # The addresses agents are given with their credentials.
+      MESH_AMQP_ENDPOINTS: ${MESH_AMQP_ENDPOINTS:-amqp://localhost:${AMQP_PORT:-5672}/mesh}
+      MESH_PUBLIC_URL: ${MESH_PUBLIC_URL:-http://localhost:${SERVER_PORT:-3005}}
+    volumes:
+      - config:/config
+    restart: "no"
+
+  postgres:
+    image: postgres:18.4
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    # First-run wrote the database's password into the config volume, readable
+    # by the server's user only. Postgres reads it as root and keeps a copy
+    # readable by its own user, before its usual start.
+    entrypoint:
+      - sh
+      - -c
+      - install -o postgres -g postgres -m 600 /config/creds/postgres.password /run/postgres.password && exec docker-entrypoint.sh postgres
+    environment:
+      POSTGRES_USER: mesh
+      POSTGRES_DB: mesh
+      POSTGRES_PASSWORD_FILE: /run/postgres.password
+    volumes:
+      - config:/config:ro
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "mesh", "-d", "mesh"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:4.3.6
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    environment:
+      RABBITMQ_CONFIG_FILE: /config/rabbitmq/rabbitmq.conf
+      RABBITMQ_ENABLED_PLUGINS_FILE: /config/rabbitmq/enabled_plugins
+    volumes:
+      - config:/config:ro
+      - rabbitmq-data:/var/lib/rabbitmq
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${AMQP_PORT:-5672}:5672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_listener", "5672"]
+      interval: 5s
+      timeout: 15s
+      retries: 40
+    restart: unless-stopped
+
+  server:
+    image: ${SERVER_IMAGE:-agent-messaging-server:local}
+    build:
+      context: ../../..
+      dockerfile: server/Dockerfile
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+        required: false
+    environment:
+      MESH_AMQP_URL: amqp://rabbitmq:5672/mesh
+      MESH_RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
+      MESH_POSTGRES_URL: postgres://mesh@postgres:5432/mesh
+      # RabbitMQ is another container, so the check listens on the Compose
+      # network. It is not published on the host.
+      MESH_BROKER_AUTH_HOST: 0.0.0.0
+    volumes:
+      - config:/config
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${SERVER_PORT:-3005}:3005"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3005/v1/capabilities').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 3s
+      timeout: 5s
+      retries: 60
+    restart: unless-stopped
+
+  a2a-gateway:
+    image: ${GATEWAY_IMAGE:-agent-messaging-a2a-gateway:local}
+    build:
+      context: ../../..
+      dockerfile: a2a-gateway/Dockerfile
+    depends_on:
+      server:
+        condition: service_healthy
+    environment:
+      MESH_URL: amqp://rabbitmq:5672/mesh
+      CREDS_FILE: /config/creds/a2a-gateway.creds
+      PUBLIC_BASE_URL: ${GATEWAY_PUBLIC_URL:-http://localhost:${GATEWAY_PORT:-8090}}
+      # key=label pairs for A2A callers; with none, every inbound call is refused.
+      API_KEYS: ${GATEWAY_API_KEYS:-}
+      ATTACH: ${GATEWAY_ATTACH:-}
+    volumes:
+      - config:/config:ro
+      - gateway-data:/app/a2a-gateway/data
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${GATEWAY_PORT:-8090}:8090"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8090/healthz').then(async (r) => process.exit(r.ok && (await r.json()).ready ? 0 : 1), () => process.exit(1))"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    restart: unless-stopped
+
+volumes:
+  # Everything first-run made: keys, credentials, settings. Back it up with
+  # the database (docs/operator-handbook.md).
+  config:
+  postgres-data:
+  rabbitmq-data:
+  gateway-data:

@@ -1,0 +1,29 @@
+# Every image here builds with the repository root as its context.
+
+# Never in an image: a mesh's keys and settings, and environment files.
+mesh-config/
+**/mesh-config/
+creds/
+*.creds
+*.nk
+*.token
+.env
+.env.*
+
+# Installed inside the image by npm ci. A host's own node_modules would also
+# bring native builds (better-sqlite3) for the wrong system.
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+*.tgz
+.git/
+.github/
+
+# Not needed by any image.
+conformance/
+deploy/
+docs/
+examples/
+tools/
+**/__tests__/

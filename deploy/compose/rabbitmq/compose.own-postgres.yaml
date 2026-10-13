@@ -1,0 +1,35 @@
+# Use a Postgres you already run instead of the one compose.yaml brings up.
+#
+#   MESH_POSTGRES_URL=postgres://mesh@db.example.com:5432/mesh \
+#   MESH_POSTGRES_PASSWORD_HOST_FILE=./postgres.password \
+#   docker compose -f compose.yaml -f compose.own-postgres.yaml up -d
+#
+# The password is in a file on this host, never in the URL or in the
+# environment. The database user needs the right to create tables and
+# functions in that database: first-run makes the server's tables there, and
+# the server applies the same schema at every start (it only adds what is new).
+#
+# The bundled Postgres is not started (it is moved to a profile nobody turns
+# on), and its volume stays empty.
+
+services:
+  postgres:
+    profiles: ["bundled-postgres"]
+
+  setup:
+    environment:
+      MESH_POSTGRES_URL: ${MESH_POSTGRES_URL:?set MESH_POSTGRES_URL to your database, as postgres://user@host:port/database}
+      MESH_POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+
+  server:
+    environment:
+      MESH_POSTGRES_URL: ${MESH_POSTGRES_URL:?set MESH_POSTGRES_URL to your database, as postgres://user@host:port/database}
+      MESH_POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+
+secrets:
+  postgres_password:
+    file: ${MESH_POSTGRES_PASSWORD_HOST_FILE:-./postgres.password}

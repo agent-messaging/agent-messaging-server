@@ -1,0 +1,90 @@
+import type { BusMessage } from "../../storage/index.js";
+import type { KeyedStore } from "../../storage/index.js";
+import type { Envelope, Task } from "../../sdk.js";
+import { createEnvelope, childSpan, ErrorCode } from "../../sdk.js";
+import { isPartyToTask, reportRefusal } from "../task-parties.js";
+
+export async function handleTaskGet(
+  env: Envelope,
+  msg: BusMessage,
+  kv: KeyedStore,
+  serviceId: string,
+): Promise<Envelope> {
+  // Extract task_id from subject: mesh.task.get.{task_id}
+  const parts = msg.subject.split(".");
+  const taskId = parts[3];
+
+  if (!taskId) {
+    return createEnvelope({
+      type: "respond",
+      from: serviceId,
+      to: env.from,
+      in_reply_to: env.id,
+      trace: childSpan(env.trace),
+      error: {
+        code: ErrorCode.TASK_NOT_FOUND,
+        message: "Missing task_id in subject",
+        retryable: false,
+      },
+    });
+  }
+
+  const entry = await kv.get(taskId);
+  if (!entry) {
+    return createEnvelope({
+      type: "respond",
+      from: serviceId,
+      to: env.from,
+      in_reply_to: env.id,
+      trace: childSpan(env.trace),
+      error: {
+        code: ErrorCode.TASK_NOT_FOUND,
+        message: `Task ${taskId} not found`,
+        retryable: false,
+      },
+    });
+  }
+
+  const task = entry.json<Task>();
+
+  // The read half of the same defect. This returned the WHOLE record — every
+  // history envelope with its payloads, and every artifact, which §7.5 defines
+  // as the task's deliverables — to whoever asked, with no identity check at
+  // all. `mesh.task.get.*` is inside the `pub mesh.task.>` every durable
+  // credential holds (keychain/cred-template.ts), and task ids are broadcast on
+  // `mesh.event.task.*` and visible on `mesh.task.>`, so this was every agent's
+  // task history and output readable by every other agent. The task id in
+  // `env.payload.task_id` is ignored here on purpose — the subject is the id, and
+  // the identity comes from the signature-verified `env.from`, never the payload.
+  //
+  // UNAUTHORIZED rather than TASK_NOT_FOUND. It does confirm the id exists, but
+  // that is not a secret worth protecting by lying: anyone with the credential
+  // can already enumerate live task ids off `mesh.task.>` and `mesh.event.task.*`
+  // — while a false "not found" would send a genuine party debugging an expiry
+  // or a typo instead of a permission.
+  if (!isPartyToTask(task, env.from)) {
+    reportRefusal(`mesh.task.get.${taskId}`, env.from, `it is not a party to this task.`);
+    return createEnvelope({
+      type: "respond",
+      from: serviceId,
+      to: env.from,
+      in_reply_to: env.id,
+      trace: childSpan(env.trace),
+      error: {
+        code: ErrorCode.UNAUTHORIZED,
+        message:
+          `Task ${taskId} may only be read by its requester or its responder.`,
+        retryable: false,
+      },
+    });
+  }
+
+  return createEnvelope({
+    type: "respond",
+    from: serviceId,
+    to: env.from,
+    in_reply_to: env.id,
+    trace: childSpan(env.trace),
+    payload: task,
+  });
+}

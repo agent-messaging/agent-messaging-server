@@ -1,0 +1,58 @@
+name: Kubernetes
+
+# The Kubernetes manifests on a throwaway one-node cluster (kind), for each
+# broker: the images built from this commit and loaded into the cluster, the
+# manifest applied from empty, every pod ready, and the server's status asked
+# with mesh-admin. Run by hand, and on a pull request that changes a manifest.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "deploy/kubernetes/**"
+      - ".github/workflows/kubernetes.yml"
+
+jobs:
+  kind:
+    name: kind (${{ matrix.broker }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        broker: [nats, rabbitmq]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the images
+        run: |
+          docker build -f server/Dockerfile -t agent-messaging-server:local .
+          docker build -f a2a-gateway/Dockerfile -t agent-messaging-a2a-gateway:local .
+
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: mesh
+
+      - name: Apply the manifest from empty
+        run: |
+          kind load docker-image agent-messaging-server:local agent-messaging-a2a-gateway:local --name mesh
+          sed -e 's#ghcr.io/jeffrschneider/agent-messaging-server:[0-9.]*#agent-messaging-server:local#' \
+              -e 's#ghcr.io/jeffrschneider/agent-messaging-a2a-gateway:[0-9.]*#agent-messaging-a2a-gateway:local#' \
+              deploy/kubernetes/${{ matrix.broker }}/mesh.yaml > "$RUNNER_TEMP/mesh.yaml"
+          kubectl apply -f "$RUNNER_TEMP/mesh.yaml"
+          kubectl -n agent-messaging wait --for=condition=complete job/first-run --timeout=180s
+          kubectl -n agent-messaging rollout status deploy/server --timeout=300s
+          kubectl -n agent-messaging rollout status deploy/a2a-gateway --timeout=180s
+          kubectl -n agent-messaging get pods
+
+      - name: Ask the server
+        run: |
+          kubectl -n agent-messaging exec deploy/server -- /entrypoint.sh mesh-admin status | tee "$RUNNER_TEMP/status.log"
+          grep -q "Live revocation: on" "$RUNNER_TEMP/status.log"
+          kubectl -n agent-messaging exec deploy/server -- node -e "fetch('http://127.0.0.1:3005/v1/capabilities').then(r=>r.json()).then(c=>{console.log(c.binding, c.profile); process.exit(c.binding==='${{ matrix.broker }}'?0:1)})"
+
+      - name: Logs, on failure
+        if: failure()
+        run: |
+          kubectl -n agent-messaging get pods -o wide || true
+          for d in job/first-run deploy/server deploy/a2a-gateway; do echo "---- $d"; kubectl -n agent-messaging logs $d --all-containers --tail 80 || true; done
+          kubectl -n agent-messaging logs statefulset/${{ matrix.broker }} --tail 80 || true

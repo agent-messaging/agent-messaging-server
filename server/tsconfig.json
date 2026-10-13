@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "rootDir": "..",
+    "lib": ["ES2022"],
+    "types": ["node"]
+  },
+  "include": ["src", "../sdk-typescript/src"],
+  "exclude": ["node_modules", "dist", "__tests__"]
+}

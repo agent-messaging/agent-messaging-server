@@ -1,0 +1,18 @@
+node_modules/
+dist/
+*.tgz
+coverage/
+
+# A mesh's own files: keys, credentials and settings first-run made.
+mesh-config/
+*.creds
+*.nk
+*.token
+*.password
+.env
+.env.*
+!deploy/**/.env.example
+
+# What the examples write while they run.
+examples/**/.state/
+.state/

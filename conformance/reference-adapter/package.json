@@ -1,0 +1,30 @@
+{
+  "name": "mesh-adapter",
+  "version": "0.99.1",
+  "description": "The thin reference AgentMesh node: give a local CLI agent an inbound mesh address and a PAN handle.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "agentmesh": "./mesh-adapter.mjs",
+    "mesh": "./mesh-adapter.mjs",
+    "mesh-adapter": "./mesh-adapter.mjs"
+  },
+  "files": [
+    "mesh-adapter.mjs",
+    "am-env.generated.mjs",
+    "mesh-operator.mjs",
+    "am-envs.generated.mjs",
+    "services.generated.mjs",
+    "README.md",
+    "LOCAL-API.md",
+    "skills/",
+    "rules/"
+  ],
+  "dependencies": {
+    "agentmesh": "https://storage.googleapis.com/agentmesh-releases/agentmesh-0.57.0.tgz",
+    "nats.ws": "^1.29.2"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

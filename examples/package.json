@@ -1,0 +1,14 @@
+{
+  "name": "agent-messaging-server-examples",
+  "private": true,
+  "type": "module",
+  "description": "The Agent Messaging Server's examples. They use this repository's SDK (../sdk-typescript); LangChain.js is for the internal network example.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "nats": "node run.mjs nats",
+    "rabbitmq": "node run.mjs rabbitmq"
+  },
+  "dependencies": {
+    "@langchain/core": "0.3.72"
+  }
+}

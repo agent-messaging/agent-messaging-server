@@ -1,0 +1,336 @@
+# The Agent Messaging Server on RabbitMQ, with Postgres for its state, on one
+# Kubernetes node.
+#
+#   kubectl apply -f mesh.yaml
+#
+# The same shape as deploy/compose/rabbitmq: a first-run Job fills the volume
+# `config` once, then Postgres, RabbitMQ, the server and the A2A gateway start
+# on what it wrote. Every pod that mounts `config` runs on one node, because
+# the volume is ReadWriteOnce. README.md says how to use a Postgres you already
+# run instead of the one this file brings up.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agent-messaging
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: config
+  namespace: agent-messaging
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+# The settings first-run reads. Change the addresses to the ones agents use to
+# reach this cluster before the first apply: they go into every credential.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: first-run
+  namespace: agent-messaging
+data:
+  MESH_BROKER: rabbitmq
+  MESH_NAME: agent-messaging
+  MESH_BROKER_AUTH_URL: http://server:3006
+  MESH_AMQP_ENDPOINTS: amqp://localhost:5672/mesh
+  MESH_PUBLIC_URL: http://localhost:3005
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: first-run
+  namespace: agent-messaging
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: first-run
+          image: ghcr.io/jeffrschneider/agent-messaging-server:0.1.0
+          args: ["first-run"]
+          envFrom:
+            - configMapRef:
+                name: first-run
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      volumes:
+        - name: config
+          persistentVolumeClaim:
+            claimName: config
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: agent-messaging
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      initContainers:
+        - name: wait-for-first-run
+          image: busybox:1.36
+          command: ["sh", "-c", "until [ -f /config/first-run.json ]; do echo waiting for first-run; sleep 2; done"]
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      containers:
+        - name: postgres
+          image: postgres:18.4
+          # First-run wrote the database's password into the config volume,
+          # readable by the server's user only. Postgres reads it as root and
+          # keeps a copy readable by its own user, before its usual start.
+          command:
+            - sh
+            - -c
+            - install -o postgres -g postgres -m 600 /config/creds/postgres.password /run/postgres.password && exec docker-entrypoint.sh postgres
+          env:
+            - { name: POSTGRES_USER, value: mesh }
+            - { name: POSTGRES_DB, value: mesh }
+            - { name: POSTGRES_PASSWORD_FILE, value: /run/postgres.password }
+          ports:
+            - { name: postgres, containerPort: 5432 }
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "mesh", "-d", "mesh"]
+            periodSeconds: 3
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/postgresql
+      volumes:
+        - name: config
+          persistentVolumeClaim:
+            claimName: config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: agent-messaging
+spec:
+  selector: { app: postgres }
+  ports:
+    - { name: postgres, port: 5432, targetPort: 5432 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq
+  namespace: agent-messaging
+spec:
+  serviceName: rabbitmq
+  replicas: 1
+  selector:
+    matchLabels: { app: rabbitmq }
+  template:
+    metadata:
+      labels: { app: rabbitmq }
+    spec:
+      initContainers:
+        - name: wait-for-first-run
+          image: busybox:1.36
+          command: ["sh", "-c", "until [ -f /config/first-run.json ]; do echo waiting for first-run; sleep 2; done"]
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      containers:
+        - name: rabbitmq
+          image: rabbitmq:4.3.6
+          env:
+            - { name: RABBITMQ_CONFIG_FILE, value: /config/rabbitmq/rabbitmq.conf }
+            - { name: RABBITMQ_ENABLED_PLUGINS_FILE, value: /config/rabbitmq/enabled_plugins }
+          ports:
+            - { name: amqp, containerPort: 5672 }
+            - { name: management, containerPort: 15672 }
+          readinessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "check_port_listener", "5672"]
+            periodSeconds: 10
+            timeoutSeconds: 15
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/rabbitmq
+      volumes:
+        - name: config
+          persistentVolumeClaim:
+            claimName: config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  namespace: agent-messaging
+spec:
+  selector: { app: rabbitmq }
+  ports:
+    - { name: amqp, port: 5672, targetPort: 5672 }
+    - { name: management, port: 15672, targetPort: 15672 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: server
+  namespace: agent-messaging
+spec:
+  replicas: 1
+  # One server per mesh in version 1: never two at once, even during a rollout.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: server }
+  template:
+    metadata:
+      labels: { app: server }
+    spec:
+      securityContext:
+        fsGroup: 1000
+      initContainers:
+        - name: wait-for-first-run
+          image: busybox:1.36
+          command: ["sh", "-c", "until [ -f /config/first-run.json ]; do echo waiting for first-run; sleep 2; done"]
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      containers:
+        - name: server
+          image: ghcr.io/jeffrschneider/agent-messaging-server:0.1.0
+          env:
+            - { name: MESH_AMQP_URL, value: "amqp://rabbitmq:5672/mesh" }
+            - { name: MESH_RABBITMQ_MANAGEMENT_URL, value: "http://rabbitmq:15672" }
+            - { name: MESH_POSTGRES_URL, value: "postgres://mesh@postgres:5432/mesh" }
+            # RabbitMQ asks the server about every node connection on 3006.
+            - { name: MESH_BROKER_AUTH_HOST, value: "0.0.0.0" }
+          ports:
+            - { name: api, containerPort: 3005 }
+            - { name: broker-auth, containerPort: 3006 }
+          readinessProbe:
+            httpGet: { path: /v1/capabilities, port: 3005 }
+            periodSeconds: 3
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      volumes:
+        - name: config
+          persistentVolumeClaim:
+            claimName: config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: server
+  namespace: agent-messaging
+spec:
+  selector: { app: server }
+  ports:
+    - { name: api, port: 3005, targetPort: 3005 }
+    - { name: broker-auth, port: 3006, targetPort: 3006 }
+---
+# Only RabbitMQ may ask the server's check of node connections. Enforced where
+# the cluster's network plugin enforces network policies.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: server-broker-auth
+  namespace: agent-messaging
+spec:
+  podSelector:
+    matchLabels: { app: server }
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - { port: 3005, protocol: TCP }
+    - from:
+        - podSelector:
+            matchLabels: { app: rabbitmq }
+      ports:
+        - { port: 3006, protocol: TCP }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: a2a-gateway
+  namespace: agent-messaging
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: a2a-gateway }
+  template:
+    metadata:
+      labels: { app: a2a-gateway }
+    spec:
+      securityContext:
+        fsGroup: 1000
+      initContainers:
+        - name: wait-for-first-run
+          image: busybox:1.36
+          command: ["sh", "-c", "until [ -f /config/first-run.json ]; do echo waiting for first-run; sleep 2; done"]
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      containers:
+        - name: a2a-gateway
+          image: ghcr.io/jeffrschneider/agent-messaging-a2a-gateway:0.1.0
+          env:
+            - { name: MESH_URL, value: "amqp://rabbitmq:5672/mesh" }
+            - { name: CREDS_FILE, value: /config/creds/a2a-gateway.creds }
+            - { name: PUBLIC_BASE_URL, value: "http://localhost:8090" }
+            - { name: ATTACHMENTS_FILE, value: /config/a2a-gateway/attachments.json }
+            - { name: API_KEYS_FILE, value: /config/a2a-gateway/api-keys.json }
+            - { name: CALLER_IDS_FILE, value: /config/a2a-gateway/caller-identities.json }
+          ports:
+            - { name: a2a, containerPort: 8090 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8090 }
+            periodSeconds: 3
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      volumes:
+        - name: config
+          persistentVolumeClaim:
+            claimName: config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: a2a-gateway
+  namespace: agent-messaging
+spec:
+  selector: { app: a2a-gateway }
+  ports:
+    - { name: a2a, port: 8090, targetPort: 8090 }
