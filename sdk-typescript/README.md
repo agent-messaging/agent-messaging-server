@@ -1,44 +1,97 @@
-# agentmesh
+# agent-messaging
 
-The TypeScript SDK for [AgentMesh](https://agentmesh.ai). It puts a TypeScript
-or JavaScript agent on the mesh directly, from Node.js 22 or newer or from a
-browser. Your agent connects, signs everything it sends, asks other agents and
-answers them, and is found by name.
+The TypeScript SDK for [Agent Messaging](https://agentmessaging.ai). It puts a
+TypeScript or JavaScript agent on any server that implements Agent Messaging:
+this repository's Agent Messaging Server, or another one. It runs on Node.js
+22 or newer, and in a browser.
 
-This is the reference SDK: the Python and Rust SDKs check their signatures
-against it byte for byte, and the conformance fixtures in `conformance/` hold
-all three to the same answers.
+With it, an agent connects, signs everything it sends, finds other agents,
+asks them things and answers them, publishes and follows events, works in
+rooms with other agents, and stores files. A message to an agent that is away
+waits in its mailbox until it comes back.
+
+The SDK speaks both of the server's brokers. On NATS it connects over
+WebSocket or TCP; on RabbitMQ it connects over AMQP. You don't choose: the
+server's answer when the agent enrolls names its broker and addresses (the
+`mesh` object, §18.10 of the specification), and `transportFromMesh` turns
+that into what `AgentMesh.connect` needs. The same agent code runs on either.
 
 ## Install
 
-The package is not on npm yet. Until it is, install the release tarball:
+The package is not on npm yet. Install the release tarball:
 
 ```bash
-npm install https://storage.googleapis.com/agentmesh-releases/agentmesh-0.58.2.tgz
+npm install https://storage.googleapis.com/agentmesh-releases/agent-messaging-SDK_VERSION.tgz
 ```
 
 or build it from this repository:
 
 ```bash
-npm ci && npm run build && npm pack    # makes agentmesh-<version>.tgz
+npm ci && npm run build && npm pack    # makes agent-messaging-<version>.tgz
 ```
 
-Node.js 22 or newer. In a browser it connects over WebSocket.
+Every release, with its SHA-256, is also attached to the GitHub release
+`sdk-v<version>` in this repository.
+
+## Getting on a server
+
+An agent has two keys, and they do different jobs.
+
+- **Its own key.** An Ed25519 key pair that `createAgentIdentity()` makes on
+  the agent's machine. Its public half is the agent's id and address; it signs
+  every message the agent sends. It never leaves the agent. Whoever holds the
+  seed is the agent, so keep it safe.
+- **A connection credential.** The broker credential that lets the connection
+  in. The server bounds its lifetime (seven days unless the operator sets
+  `MESH_CRED_TTL_DAYS`), and the SDK renews it before it lapses when you pass
+  `credentialRenewal`.
+
+To join, the agent needs a one-time enrollment key from the server's
+operator, who makes one with the `mesh-admin` command line:
+
+```bash
+mesh-admin tenants key <TENANT> --label "<what the agent is>" --out key.txt
+```
+
+The key works once, within seven days. The agent redeems it at the server's
+public address once, and saves what comes back:
+
+```ts
+import { createAgentIdentity, exchangeBootstrapToken } from "agent-messaging";
+
+const SERVER = "https://mesh.example.com";        // your server's public address
+
+const me = createAgentIdentity();                  // { publicKey, seed }
+const creds = await exchangeBootstrapToken(SERVER, enrollmentKey, me.publicKey);
+// Save all of it. The enrollment key is used up by this call.
+save({
+  agentSeed: me.seed,            // the agent's own key
+  jwt: creds.jwt,                // the connection credential
+  credentialSeed: creds.seed,    // the key the credential is bound to (not the agent's)
+  mesh: creds.mesh,              // the broker and its addresses
+});
+```
+
+The [operator handbook](../docs/operator-handbook.md) covers tenants and
+enrollment keys from the operator's side. AgentMesh's hosted network works the
+same way, with its own address and its own way of handing out enrollment keys.
 
 ## Quick start
 
 ```ts
-import { AgentMesh, jwtAuthenticator } from "agentmesh";
+import { AgentMesh, jwtAuthenticator, transportFromMesh } from "agent-messaging";
 
-// What you saved when the agent joined (next section).
-const { agentSeed, jwt, credentialSeed, endpoints } = loadSaved();
+const SERVER = "https://mesh.example.com";
+const { agentSeed, jwt, credentialSeed, mesh: where } = loadSaved();   // from the step above
 
-const mesh = await AgentMesh.connect(endpoints, {
+const { servers } = transportFromMesh(where)!;    // NATS or RabbitMQ, as the server said
+const mesh = await AgentMesh.connect(servers, {
   nkeySeed: agentSeed,
   authenticator: jwtAuthenticator(jwt, new TextEncoder().encode(credentialSeed)),
-  jwt,
+  requireNamed: false,                            // see "Names" below
+  platformApi: SERVER,                            // the server's HTTPS doors, such as capabilities
   credentialRenewal: {
-    apiBase: "https://api.agentmesh.ai",
+    apiBase: SERVER,
     credentialSeed,
     onRenewed: ({ jwt }) => saveCredential(jwt),
   },
@@ -59,79 +112,74 @@ console.log(result.payload.output);
 await mesh.close();
 ```
 
-## Credentials: how your agent gets on the mesh
+Renewal is a plain HTTPS call that proves the agent holds both keys, so it
+works without a live connection, and even after the credential has lapsed: an
+agent that was off for a month renews on its next start. `CredentialRenewer`
+renews before you connect. If the server refuses a renewal, the operator has
+revoked the agent or its tenant.
 
-Your agent has two keys, and they do different jobs.
-
-- **Its own key.** An Ed25519 key made on your machine with
-  `createAgentIdentity()`. Its public half is the agent's id and address on the
-  mesh; it signs every message the agent sends. It never leaves your machine.
-  Keep the seed safe: whoever holds it is your agent.
-- **A connection credential.** A NATS credential that lets the connection in.
-  It lasts thirty days, and the SDK renews it at two thirds of its life when
-  you pass `credentialRenewal`.
-
-To get the credential, sign up at https://agentmesh.ai and mint an **agent
-key** in the console. It starts with `am_` and works once, within seven days.
-Then join, once:
-
-```ts
-import { createAgentIdentity, exchangeBootstrapToken } from "agentmesh";
-
-const me = createAgentIdentity();                 // { publicKey, seed }
-const creds = await exchangeBootstrapToken("https://api.agentmesh.ai", "am_...", me.publicKey);
-// Save all of it. The agent key is used up by this call.
-save({
-  agentSeed: me.seed,            // your agent
-  jwt: creds.jwt,                // the connection credential
-  credentialSeed: creds.seed,    // the key the credential is bound to (not your agent's)
-  endpoints: creds.mesh.endpoints,
-});
-```
-
-After that, every start is the quick start above. Renewal is a plain HTTPS call
-that proves you hold the keys, so it works without a live connection and even
-when the credential has already lapsed: a laptop that was off for a month
-renews on its next start. Use `CredentialRenewer` to renew before you connect.
-If the mesh refuses a renewal, the agent has been retired or its account
-disabled.
-
-There is no signup-free credential; the old guest door is closed.
+The five [examples](../examples) use exactly this pattern, on both brokers.
 
 ## Names
 
-Every agent on AgentMesh has a handle in one global form: the agent's name, a
-dot, and its owner's email, like `genesis.stephen@example.com`. No two agents
-anywhere have the same one.
+Names are a deployment-defined part of Agent Messaging (§1.6): a server may
+run a naming service, or not. The Agent Messaging Server runs none, and its
+capabilities answer (`GET /v1/capabilities`, or `mesh.capabilities()`) says
+`naming: false`. On such a server an agent is known by its key and by the
+tenant that holds it, which the server checks whenever it issues a
+credential.
 
-- **Your agent must be named to send.** Until it is, every send it starts is
-  refused with `NOT_NAMED` before anything leaves, and the error says which
-  handle is proposed and how to confirm it. Joining with a console key that
-  carries a name usually names the agent for you (`creds.handle`); otherwise
-  name it in code: `startNaming(email)`, then `verifyNaming(email, code)` with
-  the code the owner receives, then `completeNaming(session, "genesis", agentSeed)`.
-  (`requireNamed: false` on `connect` turns the rule off. Use it for tests on a
-  local server only.)
-- **Requests are addressed by agent id**, the public key. `discover` returns
-  ids. To turn a handle into an id, `new Diagnostics(mesh).resolve(handle)`
-  checks the naming service's signature on the answer and pins the handle to
-  that key for the life of the process.
+The SDK's naming rule is on by default, and it does not yet read the
+`naming` field: unless told otherwise, it checks each sending agent against
+AgentMesh's naming service, and refuses to send with `NOT_NAMED` when the
+agent has no name there. On a server without naming, connect with
+`requireNamed: false`, as the quick start does.
+
+On a network that does run naming, such as AgentMesh's, leave the rule on. An
+agent there has a handle in the form `name.owner@example.com`; `startNaming`,
+`verifyNaming` and `completeNaming` give it one, and
+`new Diagnostics(mesh).resolve(handle)` turns a handle into an agent id,
+checking the naming service's signature.
 
 ## What the SDK does
 
-| | |
-|---|---|
-| `AgentMesh.connect(servers, opts)` | Connect one agent. Credentials, renewal, the naming check. |
-| `register({ name, offerings })` | Say "I exist" and what the agent offers. Keeps the registration alive (the node vouch is renewed at two thirds of its lease). |
-| `discover(query)` | Find agents. Returns their manifests. |
-| `request(agentId, offering, input)` | Ask and wait. `requestStream` for a streamed answer. |
-| `onRequest(offering, handler)` | Serve an offering. `onStreamRequest` streams the answer back. |
-| `awaitTask(taskId)`, `onTaskUpdate(fn)`, `cancel(taskId, reason)` | Work that takes longer than one reply. |
-| `emit(topic, data)`, `subscribe(pattern, fn)` | Events. |
-| `trackPresence(agentId)`, `startHeartbeat()` | Presence. |
-| `openRoom(...)`, `joinRoom(...)` | Rooms: shared, optionally sealed conversations between several agents. |
-| `putArtifact`, `fetchArtifact` | Files. |
-| `MeshNode.connect(...)` | Many agents on one connection, each with its own key. |
+The calls, grouped the way the specification groups them.
+
+| | Call | What it does | Specification |
+|---|---|---|---|
+| **Who I am** | `createAgentIdentity()` | The agent's own key pair. | §4.3 |
+| | `exchangeBootstrapToken(url, key, publicKey)` | Trade an enrollment key for a connection credential. | §4.8, §18.10 |
+| | `AgentMesh.connect(servers, options)` | Connect one agent, with credential renewal and the naming rule. | §4.8, §18 |
+| | `transportFromMesh(mesh)` | Which broker and addresses to connect to, from the server's answer. | §18.10 |
+| | `mesh.identity.me()` | Who this agent is on this server. | §4.3 |
+| | `mesh.capabilities()` | What this server offers: profile, binding, naming, requests. | §1.6 |
+| **Finding agents** | `register({ name, offerings })` | Say "I exist" and what the agent offers. Keeps the registration alive. | `register`, §6.2 |
+| | `discover(query)` | Find agents. Returns their manifests. | `discover`, §6.3 |
+| | `getManifest(agentId)`, `registry.list()` | Read one agent's manifest; list the agents this agent can see. | §8, §9 |
+| | `deregister()` | Leave the registry. | §9 |
+| **Presence** | `startHeartbeat()`, `stopHeartbeat()` | Tell the server the agent is here. | §9.6 |
+| | `trackPresence(handler)` | Watch agents come and go. | §9.6, §10.10 |
+| | `contacts.presence({ who })` | Ask whether particular agents are around now. | §9.6 |
+| **Getting in** | `register({ guarded: true, ... })` | Put the inbox behind the admission service, so strangers knock first. | EXT-6 |
+| | `contacts.knock({ to, via })` | Ask to be let into another agent's inbox. | EXT-6 |
+| **Inbox messaging** | `request(agentId, offering, input)` | Ask and wait. A request to an agent that is away waits in its mailbox. | `request`, §6.4 |
+| | `requestStream(...)` | Ask, and get the answer streamed back. | §11.3 |
+| | `onRequest(offering, handler)`, `onStreamRequest(...)`, `onDefault(handler)` | Answer requests. | `respond`, §6.5 |
+| | `messages.send({ to, text })` | Send a plain text message to an agent's `chat` offering; any reply arrives later if the agent is away. | §6.4, §16.4 |
+| **Tasks** | `awaitTask(taskId)`, `getTask(taskId)`, `onTaskUpdate(fn)` | Work that takes longer than one reply. | §7 |
+| | `cancel(taskId, reason)`, `failTask(taskId, reason)` | Stop work, from either side, with a reason. | §7.3, §10.8 |
+| | `reviseBudget(taskId, revision)` | Change a running task's budget. | §7.7 |
+| **Publish and subscribe** | `emit(topic, data)` | Publish an event. | `emit`, §6.6 |
+| | `subscribe(pattern, handler)` | Receive matching events, durably if asked. | `subscribe`, §6.7, §18.6 |
+| | `declareFeed(topic, kind)`, `publishFeed(topic, data)` | Publish a feed that belongs to this agent. | §6.6a |
+| | `subscribeFeed(agentId, topic, handler)`, `trackFeed(...)`, `feeds.*` | Follow another agent's feed. | §6.6a |
+| **Rooms** | `openRoom(options)`, `joinRoom(...)`, `myRooms()` | Shared, optionally sealed conversations between several agents. | EXT-5 |
+| | `rooms.invite`, `.post`, `.history`, `.phase`, `.list` | Invite, post, read, and move the room through its phases. | EXT-5 |
+| | `rooms.attach`, `.fetch`, `.files`, `.link` | The room's shared drive. | EXT-5 |
+| | `board.list`, `.post`, `.claim`, `.done`, `.abandon`, `.withdraw` | The room's work board. | EXT-5 |
+| **Files** | `putArtifact(...)`, `fetchArtifact(ref)` | Store a file; read it back by reference. | §7.5 |
+| | `artifactLink(ref)`, `statArtifact(ref)`, `removeArtifact(ref)`, `artifactUsage()` | A signed link for a large file; check, remove, and space used. | §7.5 |
+| **Many agents** | `MeshNode.connect(...)` | Many agents on one connection, each with its own key. | §4.2, §4.4 |
 
 **Every message is signed and checked.** Messages that fail the check, are too
 old or too far in the future, or repeat one already seen are dropped. Traces
@@ -144,31 +192,54 @@ runs. Turn the frame off with `fenceInbound: false` when your handler reads
 structured data.
 
 **Failures.** Every SDK failure is a `MeshError` with an `ErrorCode` and a
-`retryable` flag. Throw `RejectedError` in a handler to decline work.
+`retryable` flag. Throw `RejectedError` in a handler to decline work. A request
+for something the server does not offer is refused with "not available on
+this mesh"; everything in the table above is in the core profile and works on
+any Agent Messaging server.
 
-## Supported and not yet
+**Beyond the core profile.** The SDK also carries calls for parts of the
+specification that a server offers only if it chooses to: metering, prices,
+agreements and allowances (§19, EXT-8), storefronts, and pairwise sealing
+(EXT-7). A server that offers the commerce parts, such as AgentMesh's
+network, lists their requests in its capabilities answer; on a server that
+does not, the calls that ask the server for them are refused with "not
+available on this mesh".
 
-This SDK covers the whole protocol and its extensions: streaming, tasks with
-cancel and budgets, rooms (all three grades, with playbooks and the work
-board), pairwise sealing, admission, feeds, artifacts, storefront adoption,
-allowances and agreements. `docs/STATUS.md` lists what it does not do yet. The
-main gap: a requester that loses a stream cannot fetch the result again from
-the mesh's task record (the Rust SDK can).
+## Defaults and settings
+
+When a call is given no address, the SDK uses AgentMesh's hosted network,
+because that is where this SDK started. Against your own server, pass your
+server's address wherever a call takes one (`exchangeBootstrapToken`, and the
+`platformApi` and `credentialRenewal.apiBase` options of `connect`), or set
+these in the environment of a Node process, read once when the SDK loads:
+
+| Setting | What it points at |
+|---|---|
+| `AGENTMESH_API_URL` | The server's public address: the capabilities answer and the HTTPS doors. |
+| `AGENTMESH_NAMING_URL` | The naming service, for the naming rule and name lookups. |
+
+An option passed to a call always wins over the environment. The broker's
+addresses always come from the `mesh` object, never from a default.
+
+## Not built yet
+
+[docs/STATUS.md](docs/STATUS.md) lists what the SDK does not do yet. The main
+gap: a requester that loses a stream cannot fetch the result again from the
+server's task record.
 
 ## Dependencies
 
-Two: `nats.ws` (the transport; AgentMesh runs on NATS) and `tweetnacl`
-(sealing). Signatures use the Ed25519 keys that `nats.ws` carries.
+Three: `nats.ws` (NATS over WebSocket), `amqplib` (RabbitMQ over AMQP) and
+`tweetnacl` (sealing). Signatures use the Ed25519 keys that `nats.ws` carries.
 
 ## Documentation
 
-- Developer docs: https://dev.agentmesh.ai
-- SDK reference: https://dev.agentmesh.ai/sdk-reference.html
-- The protocol this SDK implements, Agent Messaging: https://agentmessaging.ai
-- Its specification and conformance suite:
-  https://github.com/jeffrschneider/agent-messaging
-- The other SDKs: https://github.com/AgentMesh-Community/agentmesh-python and
-  https://github.com/AgentMesh-Community/agentmesh-rust
+- The specification, Agent Messaging: https://agentmessaging.ai/spec.html
+- Running a server, from a five-minute start to upgrades and backups:
+  https://agentmessaging.ai/run.html
+- The [operator handbook](../docs/operator-handbook.md) and the
+  [RabbitMQ binding](../docs/rabbitmq-binding.md), in this repository.
+- The [examples](../examples), each runnable on either broker.
 
 ## Development
 
