@@ -32,7 +32,8 @@ server() {
   fi
 }
 admin() { server /entrypoint.sh mesh-admin "$@"; }
-if [ "$where" = kubernetes ]; then export MESH_KUBE_NAMESPACE="$ns"; fi
+# The tools read the mesh's files from the pod only when this is set.
+if [ "$where" = kubernetes ]; then export MESH_KUBE_NAMESPACE="$ns"; else unset MESH_KUBE_NAMESPACE; fi
 
 case "$stage" in
   status)
