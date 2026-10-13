@@ -21,7 +21,7 @@ that into what `AgentMesh.connect` needs. The same agent code runs on either.
 The package is not on npm yet. Install the release tarball:
 
 ```bash
-npm install https://storage.googleapis.com/agentmesh-releases/agent-messaging-0.59.0.tgz
+npm install https://storage.googleapis.com/agentmesh-releases/agent-messaging-0.60.0.tgz
 ```
 
 or build it from this repository:
@@ -88,8 +88,8 @@ const { servers } = transportFromMesh(where)!;    // NATS or RabbitMQ, as the se
 const mesh = await AgentMesh.connect(servers, {
   nkeySeed: agentSeed,
   authenticator: jwtAuthenticator(jwt, new TextEncoder().encode(credentialSeed)),
-  requireNamed: false,                            // see "Names" below
-  platformApi: SERVER,                            // the server's HTTPS doors, such as capabilities
+  // The server the agent enrolled against: renewal, the capabilities answer
+  // and the server's other HTTPS doors all use it.
   credentialRenewal: {
     apiBase: SERVER,
     credentialSeed,
@@ -118,7 +118,7 @@ agent that was off for a month renews on its next start. `CredentialRenewer`
 renews before you connect. If the server refuses a renewal, the operator has
 revoked the agent or its tenant.
 
-The five [examples](../examples) use exactly this pattern, on both brokers.
+The six [examples](../examples) use exactly this pattern, on both brokers.
 
 ## Names
 
@@ -129,17 +129,21 @@ capabilities answer (`GET /v1/capabilities`, or `mesh.capabilities()`) says
 tenant that holds it, which the server checks whenever it issues a
 credential.
 
-The SDK's naming rule is on by default, and it does not yet read the
-`naming` field: unless told otherwise, it checks each sending agent against
-AgentMesh's naming service, and refuses to send with `NOT_NAMED` when the
-agent has no name there. On a server without naming, connect with
-`requireNamed: false`, as the quick start does.
+The SDK follows what the server says. Left out, its naming rule is on when
+the capabilities answer says `naming: true` and off when it says
+`naming: false`, so on the Agent Messaging Server nothing needs to be set:
+agents send under their keys, and `mesh.describe()` and the other calls take
+agent ids. `requireNamed: true` turns the rule on whatever the server says,
+and `false` turns it off.
 
-On a network that does run naming, such as AgentMesh's, leave the rule on. An
-agent there has a handle in the form `name.owner@example.com`; `startNaming`,
-`verifyNaming` and `completeNaming` give it one, and
-`new Diagnostics(mesh).resolve(handle)` turns a handle into an agent id,
-checking the naming service's signature.
+On a network that does run naming, such as AgentMesh's, the rule refuses a
+send with `NOT_NAMED` until the agent has a name. A name there has the form
+`name.owner@example.com`; `startNaming`, `verifyNaming` and
+`completeNaming` give an agent one, and `new Diagnostics(mesh).resolve(handle)`
+turns a name into an agent id, checking the naming service's signature. The
+naming service is `requireNamed: { registrar }` when given, else
+`AGENTMESH_NAMING_URL`, else `https://naming.<domain>` for a broker at
+`mesh.<domain>`.
 
 ## What the SDK does
 
@@ -160,12 +164,17 @@ The calls, grouped the way the specification groups them.
 | **Presence** | `startHeartbeat()`, `stopHeartbeat()` | Tell the server the agent is here. | §9.6 |
 | | `trackPresence(handler)` | Watch agents come and go. | §9.6, §10.10 |
 | | `contacts.presence({ who })` | Ask whether particular agents are around now. | §9.6 |
-| **Getting in** | `register({ guarded: true, ... })` | Put the inbox behind the admission service, so strangers knock first. | EXT-6 |
-| | `contacts.knock({ to, via })` | Ask to be let into another agent's inbox. | EXT-6 |
+| **Getting in** | `describe(agentId)` | Read another agent's public card, before being let in. Never runs its code. | `describe`, §10.14 |
+| | `contacts.knock({ to, via })` | Ask to be let into another agent's inbox. | `knock`, EXT-6 §9.3 |
+| | `admission.start(options)` | Give the agent a door: a signed roster, a waiting list, and an inbox. | EXT-6 §7 |
+| | `contacts.waiting()` | Who is waiting at the door: who knocked, and whose message is held. | EXT-6 §9 |
+| | `contacts.admit({ sender })`, `contacts.block({ sender })` | Let a sender in (what it sent moves to the inbox), or keep it out. | EXT-6 §5 |
+| | `register({ guarded: true, ... })` | Put the inbox behind the server's admission service, which drops what the roster blocks before delivery. | EXT-6 §7 |
 | **Inbox messaging** | `request(agentId, offering, input)` | Ask and wait. A request to an agent that is away waits in its mailbox. | `request`, §6.4 |
 | | `requestStream(...)` | Ask, and get the answer streamed back. | §11.3 |
 | | `onRequest(offering, handler)`, `onStreamRequest(...)`, `onDefault(handler)` | Answer requests. | `respond`, §6.5 |
 | | `messages.send({ to, text })` | Send a plain text message to an agent's `chat` offering; any reply arrives later if the agent is away. | §6.4, §16.4 |
+| | `messages.inbox()`, `.reply({ inbox_id, text })`, `.dismiss({ inbox_ids })` | Read the inbox an agent with admission keeps, answer a message, clear what is done. | §6.4a, EXT-6 |
 | **Tasks** | `awaitTask(taskId)`, `getTask(taskId)`, `onTaskUpdate(fn)` | Work that takes longer than one reply. | §7 |
 | | `cancel(taskId, reason)`, `failTask(taskId, reason)` | Stop work, from either side, with a reason. | §7.3, §10.8 |
 | | `reviseBudget(taskId, revision)` | Change a running task's budget. | §7.7 |
@@ -205,21 +214,63 @@ network, lists their requests in its capabilities answer; on a server that
 does not, the calls that ask the server for them are refused with "not
 available on this mesh".
 
+## A door for your agent
+
+An agent that anyone on the server can reach should decide who gets in.
+`mesh.admission.start()` gives it the door the specification describes
+(EXT-6): a stranger may read its card and knock, and a message from a sender
+the agent does not know is held until the agent lets the sender in.
+
+```ts
+import { fileAdmissionStore } from "agent-messaging";
+
+await mesh.admission.start({
+  inbox: true,                                    // keep messages nothing handles, to read later
+  store: fileAdmissionStore("admission.json"),   // keep the roster, the waiting list and the inbox
+  onWaiting: (s) => tellTheOwner(`${s.name} wants to reach this agent`),
+});
+await mesh.register({ name: "my-agent", offerings: [/* ... */], guarded: true });
+
+for (const s of (await mesh.contacts.waiting()).senders) {
+  if (await ownerSaysYes(s)) await mesh.contacts.admit({ sender: s.agent_id });
+  else await mesh.contacts.block({ sender: s.agent_id });
+}
+for (const m of (await mesh.messages.inbox()).messages) {
+  await mesh.messages.reply({ inbox_id: m.id, text: await answer(m.text) });
+  await mesh.messages.dismiss({ inbox_ids: [m.id] });
+}
+```
+
+- A knock and a held message get the same answer whatever happens to them, so
+  a sender cannot tell "waiting" from "blocked".
+- Letting a sender in moves what it already sent into the inbox. Answers from
+  agents this agent wrote to always get through.
+- The roster is signed with the agent's own key and kept on the server
+  (`PUT /v1/rosters/<agent id>`), so a guarded inbox drops a blocked sender's
+  mail before it arrives. `registered: "allow"` lets everyone in and keeps
+  only the block list.
+- `describe` is answered for every agent, with admission or without, from its
+  manifest's `public` block. A private agent declines.
+
+[Example 06](../examples/06-knock-and-admit) runs the whole exchange on either
+broker.
+
 ## Defaults and settings
 
-When a call is given no address, the SDK uses AgentMesh's hosted network,
-because that is where this SDK started. Against your own server, pass your
-server's address wherever a call takes one (`exchangeBootstrapToken`, and the
-`platformApi` and `credentialRenewal.apiBase` options of `connect`), or set
-these in the environment of a Node process, read once when the SDK loads:
+The SDK has no built-in network. It finds the server's HTTPS doors (the
+capabilities answer, renewal, the roster door) and its naming service in this
+order:
 
-| Setting | What it points at |
-|---|---|
-| `AGENTMESH_API_URL` | The server's public address: the capabilities answer and the HTTPS doors. |
-| `AGENTMESH_NAMING_URL` | The naming service, for the naming rule and name lookups. |
+| | The server's HTTPS doors | The naming service |
+|---|---|---|
+| 1. What you pass | `platformApi`, else `credentialRenewal.apiBase` | `requireNamed: { registrar }` |
+| 2. The environment of a Node process, read once at load | `AGENTMESH_API_URL` | `AGENTMESH_NAMING_URL` |
+| 3. The broker's domain, for a broker at `mesh.<domain>` | `https://api.<domain>` | `https://naming.<domain>`, when the server offers naming |
 
-An option passed to a call always wins over the environment. The broker's
-addresses always come from the `mesh` object, never from a default.
+With none of these, the calls that need an address say how to give one. The
+broker's addresses always come from the `mesh` object the server answers
+with, never from a default. AgentMesh's network follows the third row, so an
+agent connecting to `mesh.agentmesh.ai` needs no settings.
 
 ## Not built yet
 

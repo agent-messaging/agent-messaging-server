@@ -57,12 +57,17 @@ tasks, rooms and files. Each one works on either broker.
 | **Presence** | `mesh.startHeartbeat()` | Tells the server the agent is here. | §9.6 |
 | | `mesh.trackPresence(handler)` | Watches agents come and go. | §9.6, §10.10 |
 | | `mesh.contacts.presence({ who })` | Asks whether particular agents are around now. | §9.6 |
-| **Getting in** | `mesh.register({ guarded: true, ... })` | Puts the agent's inbox behind the admission service, so a stranger has to knock first. | EXT-6 |
-| | `mesh.contacts.knock({ to, via })` | Asks to be let into another agent's inbox. | EXT-6 |
+| **Getting in** | `mesh.describe(agentId)` | Reads another agent's public card before you are let in. It never runs that agent's code. | `describe`, §10.14 |
+| | `mesh.contacts.knock({ to, via })` | Asks to be let into another agent's inbox. | `knock`, EXT-6 §9.3 |
+| | `mesh.admission.start(options)` | Gives the agent a door: a signed roster, a waiting list for senders it does not know, and an inbox. A stranger's message is held until the agent lets it in. | EXT-6 §7 |
+| | `mesh.contacts.waiting()` | Lists who is waiting at the door: who knocked, and who sent a message that is held. | EXT-6 §9 |
+| | `mesh.contacts.admit({ sender })`, `mesh.contacts.block({ sender })` | Lets a sender in, which moves what it sent into the inbox, or keeps it out. | EXT-6 §5 |
+| | `mesh.register({ guarded: true, ... })` | Puts the agent's inbox behind the server's admission service, which drops what the roster blocks before it is delivered. | EXT-6 §7 |
 | **Inbox messaging** | `mesh.request(agentId, offering, input)` | Asks an agent something and waits for the answer. A request to an agent that is away waits in its mailbox. | `request`, §6.4 |
 | | `mesh.requestStream(...)` | The same, with the answer streamed back in parts. | §11.3 |
 | | `mesh.onRequest(offering, handler)` | Answers requests for one offering. `onStreamRequest` streams the answer, and `onDefault` takes everything else. | `respond`, §6.5 |
 | | `mesh.messages.send({ to, text })` | Sends a plain text message to an agent's `chat` offering. If the agent is busy or away, the mailbox holds it and any reply comes later. | §6.4, §16.4 |
+| | `mesh.messages.inbox()`, `.reply({ inbox_id, text })`, `.dismiss({ inbox_ids })` | Reads the inbox an agent with admission keeps, answers a message in it, and clears what is done. | §6.4a, EXT-6 |
 | **Tasks** | `mesh.awaitTask(taskId)`, `mesh.getTask(taskId)`, `mesh.onTaskUpdate(fn)` | Follows work that takes longer than one reply. | §7 |
 | | `mesh.cancel(taskId, reason)`, `mesh.failTask(taskId, reason)` | Stops work, from either side, with a reason. | §7.3, §10.8 |
 | | `mesh.reviseBudget(...)` | Changes a task's budget while it runs. | §7.7 |
@@ -149,7 +154,7 @@ down in [docs/rabbitmq-binding.md](docs/rabbitmq-binding.md).
 | `deploy/compose/` | Docker Compose for NATS, and for RabbitMQ with Postgres. |
 | `deploy/kubernetes/` | Kubernetes manifests for both, on one node. |
 | `docs/` | The [operator handbook](docs/operator-handbook.md), the [sizing guide](docs/sizing.md), the RabbitMQ binding, and [changes and releases](docs/releasing.md). |
-| `examples/` | Five examples, each runnable on either broker. |
+| `examples/` | Six examples, each runnable on either broker. |
 | `tools/` | The conformance runner for a Compose setup, the secret check and the boundary check. |
 
 ## The examples
@@ -163,6 +168,9 @@ down in [docs/rabbitmq-binding.md](docs/rabbitmq-binding.md).
 4. [The kill switch](examples/04-kill-switch): revoke an agent and watch it get
    cut off live.
 5. [A room](examples/05-room): three agents share files and work on one task.
+6. [Knock, admit and block](examples/06-knock-and-admit): an agent keeps a
+   door. A stranger reads its card and knocks, is let in, and gets an answer;
+   a blocked agent is stopped on the mesh.
 
 ## Conformance
 

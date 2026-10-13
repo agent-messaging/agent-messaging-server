@@ -1,4 +1,4 @@
 {
   "about": "The Agent Messaging Server's release number. One number for both images the release workflow publishes (the server and the A2A gateway). .github/workflows/release-images.yml publishes only this version, and tools/ci/check-version-pins.mjs holds every image pin in the repository to it.",
-  "version": "0.1.2"
+  "version": "0.1.3"
 }
