@@ -125,8 +125,8 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           kind load docker-image agent-messaging-server:local agent-messaging-a2a-gateway:local --name mesh
-          sed -e 's#ghcr.io/jeffrschneider/agent-messaging-server:[0-9.]*#agent-messaging-server:local#' \
-              -e 's#ghcr.io/jeffrschneider/agent-messaging-a2a-gateway:[0-9.]*#agent-messaging-a2a-gateway:local#' \
+          sed -e 's#ghcr.io/[^/]*/agent-messaging-server:[0-9.]*#agent-messaging-server:local#' \
+              -e 's#ghcr.io/[^/]*/agent-messaging-a2a-gateway:[0-9.]*#agent-messaging-a2a-gateway:local#' \
               "deploy/kubernetes/$BROKER/mesh.yaml" > "$RUNNER_TEMP/mesh.yaml"
           kubectl apply -f "$RUNNER_TEMP/mesh.yaml"
           if [ "$BROKER" = nats ]; then broker_ports='{ name: client, port: 4222, nodePort: 30422 }, { name: websocket, port: 4443, nodePort: 30443 }'; else broker_ports='{ name: amqp, port: 5672, nodePort: 30672 }'; fi

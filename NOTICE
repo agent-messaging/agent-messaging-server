@@ -19,4 +19,4 @@ This repository also contains:
 
 - conformance/SPEC.md, the Agent Messaging specification, as published at
   https://agentmessaging.ai, and the conformance suite's core profile, from
-  https://github.com/jeffrschneider/agent-messaging.
+  https://github.com/agent-messaging/agent-messaging.
