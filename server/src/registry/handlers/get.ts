@@ -73,7 +73,9 @@ export async function handleGet(
   }
 
   const entry = await kv.get(agentId);
-  if (!entry) {
+  // A deregistered agent leaves a delete marker, which is absent too
+  // (storage/types.ts): reading it as a manifest answered INTERNAL_ERROR.
+  if (!entry || entry.operation === "DEL" || entry.operation === "PURGE" || entry.value?.length === 0) {
     return createEnvelope({
       type: "respond",
       from: serviceId,

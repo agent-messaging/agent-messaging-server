@@ -30,7 +30,8 @@ export async function handleTaskGet(
   }
 
   const entry = await kv.get(taskId);
-  if (!entry) {
+  // A removed task leaves a delete marker, which is absent too (storage/types.ts).
+  if (!entry || entry.operation === "DEL" || entry.operation === "PURGE" || entry.value?.length === 0) {
     return createEnvelope({
       type: "respond",
       from: serviceId,

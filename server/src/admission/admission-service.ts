@@ -16,7 +16,8 @@ import { AdmissionStore } from "./admission-store.js";
 import { storageOf, type KeyedStore, type StorageLike } from "../storage/index.js";
 import { InboxBuffer } from "../registry/inbox-buffer.js";
 import { AgentStatusStore } from "../shared/agent-status.js";
-import { StopAnswerer, answerStopped } from "./stop-answerer.js";
+import { StopAnswerer, answerStopped, answerStatus } from "./stop-answerer.js";
+import { AgentKeyRevocationStore } from "../shared/agent-key-revocations.js";
 import { actOf, entryExpired, hasGrants, permits, readKnock, type GrantedEntry } from "./grants.js";
 
 /** Ceiling on guarded inboxes. Each guard is a live subscription plus a KV entry
@@ -83,6 +84,9 @@ export class AdmissionService {
    *  bucket cannot be opened; then nothing is answered for stopped agents and
    *  senders see the silence they saw before. */
   private status: AgentStatusStore | null = null;
+  /** Revoked signing keys (§4.10), so a paused agent whose key was revoked is
+   *  answered as revoked. Null: unread, and stops are answered as before. */
+  private revocations: AgentKeyRevocationStore | null = null;
   private answerer: StopAnswerer | null = null;
   private stopFollow: (() => void) | null = null;
 
@@ -151,7 +155,8 @@ export class AdmissionService {
     // service runs as before.
     try {
       this.status = await AgentStatusStore.create(this.js);
-      this.answerer = new StopAnswerer(this.nc, this.kp, (k) => this.guards.has(k));
+      this.revocations = await AgentKeyRevocationStore.create(this.js).catch(() => null);
+      this.answerer = new StopAnswerer(this.nc, this.kp, (k) => this.guards.has(k), this.revocations ?? undefined);
       this.stopFollow = await this.status.follow((k, rec) => this.answerer?.onStatus(k, rec));
     } catch (err) {
       console.error(`[admission] agent status unavailable, stopped agents are not answered for: ${err instanceof Error ? err.message : err}`);
@@ -332,7 +337,10 @@ export class AdmissionService {
     const recipientStop = this.status ? await this.status.get(recipientId).catch(() => null) : null;
     if (recipientStop) {
       if (recipientStop.status === "paused") this.nc.publish(guardedSubject, msg.data);
-      if (env) answerStopped(this.nc, msg, env, recipientId, recipientStop.status, this.kp);
+      if (env) {
+        const revocation = this.revocations ? await this.revocations.get(recipientId).catch(() => null) : null;
+        answerStopped(this.nc, msg, env, recipientId, answerStatus(recipientStop.status, revocation), this.kp, revocation);
+      }
       return;
     }
     const senderStop = from && this.status ? await this.status.get(from).catch(() => null) : null;

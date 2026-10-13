@@ -70,6 +70,12 @@ export const Subjects = {
     return `mesh.task.${token("task id", taskId)}.update`;
   },
 
+  /** The task manager's read of one Task's durable record (§7.4); only the
+   *  Task's two parties are answered. */
+  taskGet(taskId: string): string {
+    return `mesh.task.get.${token("task id", taskId)}`;
+  },
+
   taskStream(taskId: string): string {
     return `mesh.task.${token("task id", taskId)}.stream`;
   },

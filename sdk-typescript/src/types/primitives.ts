@@ -148,6 +148,12 @@ export interface QueuedAck {
   inbox_id: string;
   /** Informative only; never part of the contract. */
   text?: string;
+  /** The target is paused by the kill switch (§4.12): the message waits in
+   *  its inbox and is delivered when it resumes. Set by the mesh's answer
+   *  for a stopped agent. */
+  paused?: true;
+  /** Why it was queued, when the answer says: `agent_paused` for a pause. */
+  reason?: string;
 }
 
 export interface EmitPayload {

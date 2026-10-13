@@ -244,6 +244,13 @@ export class ConnectionManager {
     return sub;
   }
 
+  /** Wait until the server has everything sent so far, subscriptions included:
+   *  a subscription opened before this call is live when it returns. The AMQP
+   *  transport has the same method (its queue binds in order). */
+  async flush(): Promise<void> {
+    await this.nc.flush();
+  }
+
   async drain(): Promise<void> {
     await this.nc.drain();
   }

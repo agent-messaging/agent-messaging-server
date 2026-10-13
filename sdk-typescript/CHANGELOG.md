@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.61.1 (2026-10-13)
+
+Fixes. No API change.
+
+- **A deferred task's terminal answer is never lost on RabbitMQ.** When a
+  responder defers (`deferAfterMs`) the requester learns the task id from its
+  `working` answer and only then subscribes to the task's updates. On
+  RabbitMQ that subscription is a queue bound a few round trips later, and a
+  terminal update published in that gap was routed to no queue, so
+  `awaitTask` timed out (seen at about 50 ms between `working` and the
+  finish). Now `request()` returns `working` only once the subscription is
+  live, the task manager's record (`mesh.task.get.<id>`, §7.4) is read then for
+  anything published before, and `awaitTask` reads the record too, again at
+  growing intervals while it waits. A requester that restarted, and holds no
+  local record of the task, is answered from the task manager's record.
+  Each statement read back is checked like a live one: its signature, and
+  only the task's two parties.
+- **A caller is told when the agent it wrote to was stopped (§4.12).** The
+  mesh's answer for a paused agent now reaches the caller as a
+  `REQUEST_QUEUED` that says the agent is paused (`details.paused: true`,
+  `details.reason: "agent_paused"`) instead of an ordinary held mailbox. When
+  the target stays silent, the SDK asks the registry before it says "may just
+  be offline": a revoked signing key (§4.10) or a terminated agent is refused
+  with `AGENT_UNAVAILABLE`, `details.reason` `agent_key_revoked` or
+  `agent_terminated`, and `captured: false`, since nothing will read the
+  message; a paused one is `REQUEST_QUEUED` as above.
+
 ## 0.61.0 (2026-10-13)
 
 Bring your own identity (Agent Messaging 0.8, §4.12 to §4.16 and EXT-6 0.5.0).

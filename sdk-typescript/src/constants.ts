@@ -60,6 +60,18 @@ export const MAX_CLOCK_SKEW_BEHIND_MS = 10 * 60_000;
  *  stream could ever have held it did not come from the stream honestly. */
 export const MAX_MAILBOX_AGE_MS = 7 * 24 * 60 * 60_000;
 
+/** How long one read of a Task's durable record (`mesh.task.get.<id>`, §7.4)
+ *  may take before it counts as unanswered. */
+export const TASK_RECORD_TIMEOUT_MS = 10_000;
+/** After a deferred Task's update subscription goes live and the first record
+ *  read finds it still running, when the one later read happens. It covers a
+ *  terminal update the task manager had not stored yet at the first read. */
+export const TASK_RECORD_RECHECK_MS = 1_500;
+/** While awaitTask waits, the task record is read again at growing intervals
+ *  (1 s, 2 s, 4 s, ...) up to this one, so a terminal update lost in transit
+ *  is still found. */
+export const TASK_RECORD_POLL_MAX_MS = 30_000;
+
 /** How many mailbox messages one §16.4 drain pull asks for. Bounds client-side
  *  buffering: a 25 MB backlog is drained in batches, never pulled into memory
  *  in one request. */

@@ -515,4 +515,13 @@ describe("mesh.task.get returns a task only to its parties", () => {
     const resp = await get(requesterKp);
     expect(resp.error?.code).toBe("TASK_NOT_FOUND");
   });
+
+  it("reports a removed task (a delete marker) as not found, never an internal error", async () => {
+    kv.get.mockResolvedValueOnce({
+      key: TASK_ID, operation: "DEL" as const, value: new Uint8Array(0),
+      json: () => { throw new Error("Bad JSON"); }, string: () => "",
+    } as never);
+    const resp = await get(requesterKp);
+    expect(resp.error?.code).toBe("TASK_NOT_FOUND");
+  });
 });

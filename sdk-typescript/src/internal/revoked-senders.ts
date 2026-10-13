@@ -23,7 +23,7 @@
  */
 
 export type RevocationAnswer =
-  | { revoked: true; revokedAt?: string; replacedBy?: string }
+  | { revoked: true; revokedAt?: string; replacedBy?: string; terminated?: boolean }
   | { revoked: false; paused?: boolean; since?: string }
   | { unknown: true };
 
