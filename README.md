@@ -124,8 +124,8 @@ docker compose up -d
 ```
 
 The first start builds the two images from this clone (to run the released
-images instead, set `SERVER_IMAGE=ghcr.io/jeffrschneider/agent-messaging-server:0.1.3`
-and `GATEWAY_IMAGE=ghcr.io/jeffrschneider/agent-messaging-a2a-gateway:0.1.3`), runs first-run setup
+images instead, set `SERVER_IMAGE=ghcr.io/jeffrschneider/agent-messaging-server:0.2.0`
+and `GATEWAY_IMAGE=ghcr.io/jeffrschneider/agent-messaging-a2a-gateway:0.2.0`), runs first-run setup
 once (the operator key, the signing keys, the broker's settings and the first
 admin token, all in the Compose volume `config`), and starts NATS, the server
 and the A2A gateway. Every port is published on 127.0.0.1 only.
