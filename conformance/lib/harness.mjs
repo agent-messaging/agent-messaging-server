@@ -11,8 +11,13 @@
 //             HTTPS describe door, federation, AgentMesh's own retired routes.
 //   naming    a test of Agent Naming registrars, not of a messaging server. It
 //             belongs to Agent Naming's own suite and runs here until it moves.
+//   identity  bring your own identity (SPEC §4.12 stop signals, §4.13 to
+//             §4.16, §9.7, EXT-6 0.5.0): deployment-defined parts any server
+//             MAY offer. Each test names its `part`, and is an env-skip on a
+//             mesh whose capabilities answer does not offer it
+//             (core/lib/identity.mjs).
 //
-// `--profile core|platform|naming|all` picks which run. The suite runners
+// `--profile core|platform|naming|identity|all` picks which run. The suite runners
 // default to `all`, which is what the nightly has always run; the profile
 // runner defaults to `core`.
 //
@@ -32,7 +37,7 @@ import { readFileSync, writeFileSync, readdirSync, existsSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 
-export const PROFILES = ["core", "platform", "naming"];
+export const PROFILES = ["core", "platform", "naming", "identity"];
 
 /** The bindings a mesh can run (SPEC §18; docs/agent-messaging-server-plan.md,
  *  steps 9 and 10). A test that checks something only one binding has says so
@@ -87,7 +92,8 @@ export function parseArgs(argv, { defaultProfile }) {
 export function profileLine(profile) {
   const version = specVersion();
   if (profile === "core") return `Agent Messaging ${version}, core profile (SPEC.md §1.6)`;
-  if (profile === "all") return `Agent Messaging ${version}, every profile: core, platform (AgentMesh's deployment-defined parts) and naming`;
+  if (profile === "all") return `Agent Messaging ${version}, every profile: core, platform (AgentMesh's deployment-defined parts), naming and identity`;
+  if (profile === "identity") return `Agent Messaging ${version}, bring your own identity: the deployment-defined parts of §4.12 and §4.13 to §4.16 (SPEC.md §1.6)`;
   if (profile === "platform") return `Agent Messaging ${version}, AgentMesh's deployment-defined parts (SPEC.md §1.6)`;
   return `Agent Messaging ${version}, Agent Naming registrar tests (SPEC-NAMING.md)`;
 }

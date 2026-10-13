@@ -133,7 +133,7 @@ export interface ProofDeps {
   anchors(): Promise<Map<string, TrustRecord[]>>;
   keys: ProofKeySource;
   /** The audience a JWT-SVID must carry when its record names none. */
-  defaultAudience: string;
+  defaultAudience: string | string[];
   replay: ReplayCache;
   now?: () => number;
 }
@@ -241,7 +241,7 @@ function expiresAt(p: JWTPayload): string | null {
 async function verifyAgainst(
   token: string,
   loadKeys: (refresh: boolean) => Promise<JwkSet>,
-  opts: { issuer?: string; audience: string; now: number },
+  opts: { issuer?: string; audience: string | string[]; now: number },
 ): Promise<{ ok: true; payload: JWTPayload } | { ok: false; reason: "keys" | "nokey" | "claims" | "signature"; detail: string }> {
   for (const refresh of [false, true]) {
     let set: JwkSet;
@@ -382,7 +382,8 @@ async function verifyJwtSvid(token: string, req: ProofRequest, deps: ProofDeps, 
   if (!match) return refuse(401, "proof_issuer_untrusted", `No tenant on this mesh trusts the SPIFFE trust domain ${td}.`);
   const { tenant, anchor } = match;
   if (anchor.require_mtls && !req.clientCerts?.length) return refuse(401, "mtls_required", `The trust domain ${td} enrolls only with an X.509-SVID presented over mTLS.`);
-  const audience = anchor.audience ?? deps.defaultAudience;
+  // The mesh home, and at a bridge the front the caller called (RFC 8707).
+  const audience = anchor.audience ?? [...(Array.isArray(deps.defaultAudience) ? deps.defaultAudience : [deps.defaultAudience]), ...(req.extraAudiences ?? [])];
   const v = await verifyAgainst(token, async (refresh) => jwtSvidKeys(await deps.keys.spiffeBundle(anchor, refresh)), { audience, now });
   if (!v.ok) return refusalFor(v, "JWT-SVID");
   return {

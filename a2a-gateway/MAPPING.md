@@ -1,9 +1,9 @@
 # The A2A gateway: normative mapping between Agent Messaging and A2A
 
-**Version:** 0.3.0-draft
+**Version:** 0.3.1-draft
 **Status:** Working Draft
 **Date:** 2026-07-14
-**Revised:** 2026-10-06 (see §15)
+**Revised:** 2026-10-13 (see §15)
 **Applies to:** Agent Messaging 0.2 (SPEC.md) · Agent2Agent (A2A) Protocol v1.0, JSON-RPC and HTTP+JSON bindings · PACT 1.0 (§14)
 
 > This document specifies the translation between Agent Messaging and the
@@ -53,6 +53,12 @@ vouch (SPEC.md §4.4). A bridge MUST NOT share one mesh identity across
 distinct external parties in a way that makes their traffic indistinguishable.
 
 ### 2.1. Trust Boundary Rules (Normative)
+
+Since Agent Messaging 0.8 the rules every bridge follows are SPEC.md §4.15,
+"Identity bridges", and this bridge is one bridge under them: rules 1, 2 and 5
+below are its rules 1, 2 and 4 applied to A2A, and §9.0 below is its rule 3.
+Where this section and §4.15 differ, §4.15 governs. What follows is kept for
+the A2A particulars.
 
 End-to-end Ed25519 signatures do not traverse the HTTP leg, in either
 direction. Inside the mesh, a signature on bridged traffic is the **bridge's
@@ -277,6 +283,11 @@ they are dropped rather than guessed at.
 
 ### 8.3. The Bridge Marker
 
+This is the A2A form of the general marker of SPEC.md §4.15 rule 4. An inbound
+bridged envelope carries both: `meta.a2a_bridge` below, which receivers written
+before Agent Messaging 0.8 read, and `meta.identity_bridge` with `front: "a2a"`
+and the same `caller_kind` and `caller_ref`.
+
 Every bridged manifest MUST include:
 
 ```json
@@ -320,6 +331,9 @@ next request. The anonymous tier is permitted, never default: a bridge with
 no keys configured and anonymity off MUST refuse every caller.
 
 ### 9.0 A credentialed caller's identity is durable
+
+This is SPEC.md §4.15 rule 3, "One lasting identity per caller", stated for
+A2A callers; the general rule governs where the two differ.
 
 "Stable, reused across calls" in the table above is a promise about the
 identity's whole life, not about one process's uptime. A bridge MUST persist

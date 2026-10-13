@@ -150,7 +150,9 @@ export class MeshApi {
     const proofs = {
       anchors: () => trust.all(),
       keys: proofKeys,
-      defaultAudience: (env.MESH_PROOF_AUDIENCE ?? publicUrl).trim(),
+      // A JWT-SVID names the mesh home: its public address, or any other
+      // address it answers on (MESH_PUBLIC_ORIGINS), or MESH_PROOF_AUDIENCE.
+      defaultAudience: [...new Set([(env.MESH_PROOF_AUDIENCE ?? publicUrl).trim().replace(/\/$/, ""), ...(env.MESH_PUBLIC_ORIGINS ?? "").split(",").map((x) => x.trim().replace(/\/$/, "")).filter(Boolean)])],
       replay: new ReplayCache(),
     };
     const platformUrl = env.PLATFORM_STEPS_URL?.trim();
