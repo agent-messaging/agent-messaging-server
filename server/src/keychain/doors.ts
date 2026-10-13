@@ -25,7 +25,7 @@
  *
  * Each door answers { status, body } and never throws.
  */
-import type { X509Certificate } from "node:crypto";
+import { createHash, type X509Certificate } from "node:crypto";
 import { nkeys } from "../sdk.js";
 import { verifyAgentSig } from "../admission/held-store.js";
 import { metrics } from "../shared/ops-events.js";
@@ -563,6 +563,125 @@ export function credentialDoors(deps: DoorDeps) {
     });
   }
 
+  // ── POST /v1/bridged-callers (SPEC §4.15) ───────────────────────────
+
+  /**
+   * An identity bridge asks the key chain about a caller that holds no mesh
+   * key: `{ node_id, ts, node_sig, caller_id, caller_sig, proof, binding? }`.
+   * The bridge is a node this mesh names as one (MESH_BRIDGE_NODES); it signs
+   * the request with its node key, and the caller's hosted identity signs too,
+   * so the bridge proves it holds the key it speaks for. The proof is checked
+   * as at enrollment, with the binding the bridge checked on the caller's own
+   * request (its DPoP key's thumbprint, or its certificate's hash) in place of
+   * one this door can check itself.
+   *
+   * A caller that passes belongs to the tenant whose trust record accepted its
+   * proof: the hosted identity is recorded as that tenant's, unlisted, with an
+   * identity source of kind "bridged". The bridge asks again whenever a token
+   * is new and at least once a minute, so a stop, a revoked key or a removed
+   * trust record reaches a bridged caller within a minute.
+   */
+  async function bridgedCaller(b: {
+    node_id?: string; ts?: number; node_sig?: string; caller_id?: string; caller_sig?: string;
+    proof?: unknown; binding?: { jkt?: unknown; x5t?: unknown };
+  } | null): Promise<DoorAnswer> {
+    const reply = (status: number, body: Record<string, unknown>): DoorAnswer => ({ status, body });
+    if (!deps.proofs) return reply(403, { error: "This mesh accepts no outside proofs.", code: "proofs_not_offered" });
+    if (!b?.node_id || !b.ts || !b.node_sig || !b.caller_id || !b.caller_sig) return reply(400, { error: "node_id, ts, node_sig, caller_id, caller_sig and proof are required" });
+    if (!NKEY.test(b.node_id) || !NKEY.test(b.caller_id)) return reply(400, { error: "node_id and caller_id must be user public nkeys (U…)" });
+    const bridges = new Set((env.MESH_BRIDGE_NODES ?? "").split(",").map((x) => x.trim()).filter(Boolean));
+    if (!bridges.has(b.node_id)) return reply(403, { error: "This node is not one this mesh names as an identity bridge (MESH_BRIDGE_NODES).", code: "not_a_bridge" });
+    if (Math.abs(Date.now() / 1000 - b.ts) > 600) return reply(401, { error: "stale timestamp, re-sign with the current time" });
+    if (!verifyAgentSig(b.node_id, bridgedCallerStatement(b.ts, b.node_id, b.caller_id), b.node_sig)) return reply(401, { error: "node_sig does not verify against node_id" });
+    if (!verifyAgentSig(b.caller_id, bridgedHostedStatement(b.ts, b.node_id, b.caller_id), b.caller_sig)) return reply(401, { error: "caller_sig does not verify against caller_id" });
+    const proof = b.proof as ProofInput | null;
+    if (!proof || typeof proof !== "object" || (proof.kind !== "oauth" && proof.kind !== "jwt-svid")) return reply(400, { error: 'proof must be { "kind": "oauth" | "jwt-svid", "token": "…" }' });
+    const bound = b.binding && typeof b.binding === "object" ? b.binding : null;
+    const v = await verifyOutsideProof(proof, {
+      method: "POST",
+      urls: [],
+      ...(bound ? { verifiedBinding: { ...(typeof bound.jkt === "string" ? { jkt: bound.jkt } : {}), ...(typeof bound.x5t === "string" ? { x5t: bound.x5t } : {}) } } : {}),
+    }, deps.proofs);
+    if (!v.ok) return reply(v.status, { error: v.error, code: v.code });
+    const p = v.proof;
+    const caller = b.caller_id;
+    const tenant = p.tenant;
+
+    let homeOrg: string | null = null;
+    if (deps.platform.enrollCheck) {
+      const c = await deps.platform.enrollCheck(tenant, caller).catch(() => null);
+      if (!c) return reply(503, { error: "Could not check this account right now. Try again shortly." });
+      if (!c.found) return reply(404, { error: "The tenant that trusts this proof's issuer was not found.", code: "account_not_found" });
+      if (c.disabled) return reply(403, { error: "This account is disabled.", code: "account_disabled" });
+      homeOrg = c.homeOrg ?? null;
+    } else {
+      const t = deps.owners ? await deps.owners.tenant(tenant).catch(() => null) : null;
+      if (!t) return reply(404, { error: "The tenant that trusts this proof's issuer was not found.", code: "account_not_found" });
+      if (t.disabled) return reply(403, { error: "This account is disabled.", code: "account_disabled" });
+      homeOrg = t.home_org;
+    }
+    if (await deps.keyRevocations?.get(caller).catch(() => null)) return reply(403, { error: "This caller's hosted key has been revoked.", code: "agent_key_revoked" });
+    try {
+      let found = (await stopsFor([caller])).get(caller);
+      if (!found) {
+        const active = deps.stops ? await deps.stops.active() : [];
+        found = active.length ? stopFor(active, { key: caller, person: tenant, org: orgsOn() ? homeOrg : null }) ?? undefined : undefined;
+      }
+      if (found) {
+        const r = mintRefusal(found, caller);
+        return reply(r.status, r.body);
+      }
+    } catch {
+      return reply(503, { error: "Could not check whether this caller is stopped. Try again shortly." });
+    }
+    let holder: Holder | null;
+    try { holder = await holderOf(caller); } catch { return reply(503, { error: "Could not check who holds this caller right now. Try again shortly." }); }
+    if (holder && holder.id !== tenant) return reply(409, { error: EXCLUSIVITY_ERROR, code: "held_elsewhere" });
+
+    const scope = p.kind === "oauth" ? p.issuer! : "spiffe";
+    const callerRef = p.kind === "oauth" ? createHash("sha256").update(`${p.issuer}\n${p.subject}`).digest("hex") : p.workload_id;
+    const prior = await deps.identitySources?.get(caller).catch(() => null);
+    const same = prior?.identity_source.kind === "bridged" && prior.identity_source.bridge === b.node_id && prior.identity_source.workload_id === p.workload_id;
+    const source: IdentitySource = same ? prior!.identity_source : identitySourceOf(p, new Date().toISOString(), b.node_id);
+    if (!same) {
+      try {
+        if (!holder) {
+          const label = `bridged ${p.workload_id}`.slice(0, 120); // cut-ok: a display label; the whole id is in the identity source
+          if (deps.platform.enrolled) await deps.platform.enrolled({ accountId: tenant, agentId: caller, label, deferName: true });
+          else if (deps.owners) {
+            await deps.owners.putAgent({
+              key: caller, account: tenant, org: null, home_org: homeOrg, person: tenant, category: "account",
+              listed: false, label, custody: null, payer: tenant, updated_at: new Date().toISOString(),
+            });
+          }
+        }
+        await recordSource(caller, tenant, source);
+        await deps.workloads?.put(workloadKey(p.kind === "oauth" ? "oauth" : "spiffe", `bridged:${scope}`, p.workload_id), {
+          agent: caller, tenant, kind: p.kind === "oauth" ? "oauth" : "spiffe", workload_id: p.workload_id,
+          ...(p.issuer ? { issuer: p.issuer } : {}), ...(p.trust_domain ? { trust_domain: p.trust_domain } : {}),
+          bridge: b.node_id, since: source.since, updated_at: new Date().toISOString(),
+        });
+      } catch (err) {
+        console.error(`${log} bridged-callers: the records for ${caller.slice(0, 12)}… could not be written: ${(err as Error).message}`);
+        return reply(503, { error: "This caller could not be recorded right now. Try again shortly." });
+      }
+      console.log(`${log} bridged-callers: ${b.node_id.slice(0, 12)}… bridges ${caller.slice(0, 12)}… for ${p.workload_id} (tenant ${tenant})`);
+    }
+    return reply(200, {
+      ok: true,
+      tenant,
+      caller_id: caller,
+      caller_kind: p.kind === "oauth" ? "oauth" : "spiffe",
+      caller_ref: callerRef,
+      workload_id: p.workload_id,
+      ...(p.issuer ? { issuer: p.issuer } : {}),
+      ...(p.trust_domain ? { trust_domain: p.trust_domain } : {}),
+      binding: p.binding?.kind ?? null,
+      expires_at: p.expires_at,
+      identity_source: source,
+    });
+  }
+
   /**
    * The fresh-proof rule at renewal (SPEC §4.8, §4.14): an agent that enrolled
    * with an outside proof renews only with a fresh proof of the same identity,
@@ -926,7 +1045,7 @@ export function credentialDoors(deps: DoorDeps) {
     return { status: 200, body: { agent_key: key, enrolled: !!holder && !holder.disabled, ...(holder?.disabled ? { account_disabled: true } : {}) } };
   }
 
-  return { bootstrap, nodeCredential, revokeOwnCredential, revokeOwnAgentKey, revokeAgentKeyAction, keyCheck, keyStanding, stopsFor, holderOf };
+  return { bootstrap, bridgedCaller, nodeCredential, revokeOwnCredential, revokeOwnAgentKey, revokeAgentKeyAction, keyCheck, keyStanding, stopsFor, holderOf };
 }
 
 export type CredentialDoors = ReturnType<typeof credentialDoors>;
@@ -954,6 +1073,16 @@ export async function agentLimitRefusal(
     code: "tenant_agent_limit",
     limit: max,
   };
+}
+
+/** What an identity bridge signs with its node key to ask about a caller (§4.15). */
+export function bridgedCallerStatement(ts: number, node: string, caller: string): string {
+  return `mesh-bridge-caller-v1:${ts}:${node}:${caller}`;
+}
+
+/** What the caller's hosted identity signs beside it: the bridge holds this key. */
+export function bridgedHostedStatement(ts: number, node: string, caller: string): string {
+  return `mesh-bridge-hosted-v1:${ts}:${node}:${caller}`;
 }
 
 /** The statement an agent signs to ask the key-standing door about itself. */

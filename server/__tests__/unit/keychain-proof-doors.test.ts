@@ -177,6 +177,54 @@ describe("the SDK's side (sdk-typescript/src/outside-proof.ts)", () => {
   });
 });
 
+describe("an identity bridge asking about a caller (POST /v1/bridged-callers, §4.15)", () => {
+  const ask = (node: ReturnType<typeof nkeys.createUser>, caller: ReturnType<typeof nkeys.createUser>, proof: unknown, binding?: unknown) => {
+    const ts = Math.floor(Date.now() / 1000);
+    const n = node.getPublicKey();
+    const c = caller.getPublicKey();
+    return {
+      node_id: n, ts, caller_id: c, proof, ...(binding ? { binding } : {}),
+      node_sig: sign(node, `mesh-bridge-caller-v1:${ts}:${n}:${c}`),
+      caller_sig: sign(caller, `mesh-bridge-hosted-v1:${ts}:${n}:${c}`),
+    };
+  };
+
+  it("answers only a node this mesh names as a bridge, and records the caller as the trusting tenant's, bridged", async () => {
+    const r = await rig();
+    const bridge = nkeys.createUser();
+    const caller = nkeys.createUser();
+    const stranger = await r.doors.bridgedCaller(ask(bridge, caller, { kind: "oauth", token: await tok("buyer") }));
+    expect(stranger).toMatchObject({ status: 403, body: { code: "not_a_bridge" } });
+    env.MESH_BRIDGE_NODES = bridge.getPublicKey();
+    try {
+      const out = await r.doors.bridgedCaller(ask(bridge, caller, { kind: "oauth", token: await tok("buyer") }));
+      expect(out).toMatchObject({ status: 200, body: { tenant: "acme", caller_kind: "oauth", workload_id: "buyer", identity_source: { kind: "bridged", bridge: bridge.getPublicKey(), issuer: ISSUER } } });
+      expect((out.body.caller_ref as string)).toMatch(/^[0-9a-f]{64}$/);
+      expect(r.owners.agents.get(caller.getPublicKey())).toMatchObject({ account: "acme", listed: false });
+      expect(r.sources.map.get(caller.getPublicKey())?.identity_source).toMatchObject({ kind: "bridged" });
+      // A forged hosted signature is refused: the bridge must hold the key it speaks for.
+      const forged = { ...ask(bridge, caller, { kind: "oauth", token: await tok("buyer") }), caller_sig: sign(nkeys.createUser(), "x") };
+      expect(await r.doors.bridgedCaller(forged)).toMatchObject({ status: 401 });
+    } finally {
+      delete env.MESH_BRIDGE_NODES;
+    }
+  });
+
+  it("takes the DPoP key the bridge checked for a bound token, and refuses a different one", async () => {
+    const r = await rig();
+    const bridge = nkeys.createUser();
+    env.MESH_BRIDGE_NODES = bridge.getPublicKey();
+    try {
+      const bound = await tok("buyer", { cnf: { jkt: "THUMB" } });
+      expect(await r.doors.bridgedCaller(ask(bridge, nkeys.createUser(), { kind: "oauth", token: bound }))).toMatchObject({ status: 401, body: { code: "dpop_required" } });
+      expect(await r.doors.bridgedCaller(ask(bridge, nkeys.createUser(), { kind: "oauth", token: bound }, { jkt: "OTHER" }))).toMatchObject({ status: 401, body: { code: "dpop_key_mismatch" } });
+      expect(await r.doors.bridgedCaller(ask(bridge, nkeys.createUser(), { kind: "oauth", token: bound }, { jkt: "THUMB" }))).toMatchObject({ status: 200, body: { binding: "dpop" } });
+    } finally {
+      delete env.MESH_BRIDGE_NODES;
+    }
+  });
+});
+
 describe("renewal of an agent that enrolled with an outside proof", () => {
   it("needs a fresh proof of the same identity (i09); one for another identity, or none, leaves it off", async () => {
     const r = await rig();

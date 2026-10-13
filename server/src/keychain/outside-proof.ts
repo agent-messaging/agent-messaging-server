@@ -79,6 +79,11 @@ export interface ProofRequest {
   dpop?: string;
   /** The client certificate chain, leaf first, when the request came over mTLS. */
   clientCerts?: X509Certificate[];
+  /** A binding a bridge already checked on the caller's own request (an
+   *  identity bridge, §4.15): the DPoP key's thumbprint or the certificate's
+   *  hash. Accepted in place of a DPoP proof or a client certificate here,
+   *  and only from a node this mesh names as a bridge. */
+  verifiedBinding?: { jkt?: string; x5t?: string };
 }
 
 /** A proof that passed, and what it says. */
@@ -287,6 +292,14 @@ async function bindingOf(
   const cnf = payload.cnf as Record<string, unknown> | undefined;
   const jkt = cnf && typeof cnf.jkt === "string" ? cnf.jkt : null;
   const x5t = cnf && typeof cnf["x5t#S256"] === "string" ? (cnf["x5t#S256"] as string) : null;
+  if (jkt && req.verifiedBinding?.jkt !== undefined) {
+    if (req.verifiedBinding.jkt !== jkt) return { ok: false, status: 401, code: "dpop_key_mismatch", error: "The DPoP proof the bridge checked was made with a different key from the one the token is bound to." };
+    return { ok: true, binding: { kind: "dpop", jkt } };
+  }
+  if (x5t && req.verifiedBinding?.x5t !== undefined) {
+    if (req.verifiedBinding.x5t !== x5t) return { ok: false, status: 401, code: "mtls_cert_mismatch", error: "The client certificate the bridge saw is not the one the token is bound to." };
+    return { ok: true, binding: { kind: "mtls", x5t } };
+  }
   if (jkt) {
     if (!req.dpop) return { ok: false, status: 401, code: "dpop_required", error: "This token is bound to a key (cnf.jkt), so the request must carry a DPoP proof made with that key." };
     const d = await verifyDpopProof(req.dpop, { method: req.method, urls: req.urls, accessToken: token }, replay, now);

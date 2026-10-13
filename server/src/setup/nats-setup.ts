@@ -322,6 +322,7 @@ export const natsSetup: BrokerSetup = {
       { name: CUSTOMER_KEY_SETTING, value: customerMint.getPublicKey(), about: "Its public key, which the mesh pause takes out of the account and the resume puts back." },
       { name: JWT_HISTORY_SETTING, value: historyDir, about: "Where the account JWT is saved before each change." },
       { name: "MESH_NATS_ENDPOINTS", value: endpoints, about: "The broker addresses handed to agents with their credentials. Use addresses agents can reach." },
+      { name: "MESH_BRIDGE_NODES", value: users.find((u) => u.name === "a2a-gateway")!.kp.getPublicKey(), about: "The node the gateway runs as, which may speak for callers that hold no mesh key (identity bridges, SPEC §4.15)." },
     ];
 
     return {

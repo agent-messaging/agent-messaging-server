@@ -366,6 +366,8 @@ export class MeshApi {
       }
       if (method === "POST" && path === "/v1/bootstrap") return send(res, await this.doors.bootstrap(await readJson(req), doorRequest(req, this.env)));
       if (method === "POST" && path === "/v1/node-credential") return send(res, await this.doors.nodeCredential(await readJson(req), ip, () => meshInfo(this.env), doorRequest(req, this.env)));
+      // An identity bridge asks about a caller that holds no mesh key (§4.15).
+      if (method === "POST" && path === "/v1/bridged-callers") return send(res, await this.doors.bridgedCaller(await readJson(req)));
       if (method === "POST" && path === "/v1/credential/revoke-own") return send(res, await this.doors.revokeOwnCredential(await readJson(req)));
       if (method === "POST" && path === "/v1/agent-key/revoke-own") return send(res, await this.doors.revokeOwnAgentKey(await readJson(req), ip));
       // Whether an account holds the caller's own agent key (doors.ts keyStanding):

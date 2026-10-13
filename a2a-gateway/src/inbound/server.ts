@@ -70,6 +70,8 @@ import { fromTraceparent, toTraceparent } from "../../../sdk-typescript/src/inte
 import { runWithTrace } from "../../../sdk-typescript/src/internal/trace-ambient.js";
 import type { RequestConfig } from "../../../sdk-typescript/src/types/options.js";
 import { amEnvOptional } from "../am-env.js";
+import { handleHttpsFront, handleMcp, protectedResourceMetadata } from "./fronts.js";
+import { presentedCredential, ProofRefused } from "./proofs.js";
 
 const BODY_LIMIT = 1024 * 1024; // 1 MB
 const SUPPORTED_A2A_VERSIONS = new Set(["1.0", "0.3"]);
@@ -141,16 +143,30 @@ export function startInboundServer(bridge: Bridge, manager?: AttachmentManager, 
 
 /** Resolve, authorize and rate-check the caller. Every mesh-touching route runs
  *  this before doing any work. */
-function admit(
+async function admit(
   bridge: Bridge,
   req: IncomingMessage,
-): { key: string } | { refused: CallerRefused } | { limited: true; retryAfter: number } {
+): Promise<{ key: string } | { refused: CallerRefused } | { limited: true; retryAfter: number }> {
   const client = clientAddress(
     header(req, "x-forwarded-for"),
     req.socket.remoteAddress,
     bridge.trustedProxies,
   );
   const auth = header(req, "authorization");
+  // An outside proof (an OAuth token or a SPIFFE JWT-SVID, SPEC §4.15) is
+  // checked with the key chain; its caller then has a live identity in the pool.
+  const cred = presentedCredential(auth);
+  if (cred.type === "proof" && bridge.config.proofs) {
+    try {
+      const url = new URL(req.url ?? "/", bridge.config.publicBaseUrl);
+      const got = await bridge.proofIdentity(cred, { method: req.method ?? "POST", url: `${bridge.config.publicBaseUrl.replace(/\/$/, "")}${url.pathname}`, ...(header(req, "dpop") ? { dpop: header(req, "dpop") } : {}) });
+      if (!bridge.rateOk(got.key)) return { limited: true, retryAfter: bridge.retryAfterSeconds(got.key) };
+      return { key: got.key };
+    } catch (err) {
+      if (err instanceof ProofRefused) return { refused: { error: "unauthorized", reason: "invalid_key", message: err.message } };
+      throw err;
+    }
+  }
   const apiKey = auth?.startsWith("Bearer ") ? auth.slice(7) : undefined;
 
   const decision = bridge.authorizeCaller(apiKey, client.address);
@@ -192,7 +208,8 @@ async function handle(
   // framing (BRIDGE-A2A.md §14.8).
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, A2A-Version, A2A-Extensions, X-A2A-User-Delegation");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, DPoP, A2A-Version, A2A-Extensions, X-A2A-User-Delegation, MCP-Protocol-Version, Mcp-Session-Id");
+  res.setHeader("Access-Control-Expose-Headers", "WWW-Authenticate, Retry-After");
   if (req.method === "OPTIONS") {
     res.writeHead(204);
     res.end();
@@ -218,10 +235,21 @@ async function handle(
     });
   }
 
+  // RFC 9728: where an MCP client learns which authorization server issues
+  // tokens for this bridge. Open, like the bridge's own description.
+  if (req.method === "GET" && (path === "/.well-known/oauth-protected-resource" || path === "/.well-known/oauth-protected-resource/mcp")) {
+    return json(res, 200, protectedResourceMetadata(bridge));
+  }
+
   // Bound to the port but not yet on the mesh (boot.ts binds first, on purpose).
   if (!bridge.ready) {
     return json(res, 503, { error: "bridge is not connected to the mesh yet" });
   }
+
+  // The identity bridge's two fronts beside A2A (SPEC §4.15): MCP and HTTPS
+  // JSON, for callers that hold no mesh key (fronts.ts).
+  if (path === "/mcp") return handleMcp(bridge, req, res, path);
+  if (path === "/v1/bridge/tools" || path.startsWith("/v1/bridge/tools/")) return handleHttpsFront(bridge, req, res, path);
 
   // The admin surface (attachments CRUD). Localhost-trusted: see adminAllowed
   // for why the check is two-part. No API key applies here on purpose — the
@@ -261,7 +289,7 @@ async function handle(
   if (/^\/a2a(\/|$)/.test(url.pathname)) return bare(res, 404);
 
   if (req.method === "GET" && path === "/agents") {
-    const caller = admit(bridge, req);
+    const caller = await admit(bridge, req);
     if ("refused" in caller) return refuse(res, caller.refused);
     if ("limited" in caller) return throttle(res, caller.retryAfter);
     const agents = await bridge.listExposable();
@@ -278,7 +306,7 @@ async function handle(
 
   const cardMatch = path.match(/^\/agents\/([^/]+)\/\.well-known\/agent-card\.json$/);
   if (req.method === "GET" && cardMatch) {
-    const caller = admit(bridge, req);
+    const caller = await admit(bridge, req);
     if ("refused" in caller) return refuse(res, caller.refused);
     if ("limited" in caller) return throttle(res, caller.retryAfter);
     const manifest = await bridge.exposableManifest(cardMatch[1]);
@@ -356,7 +384,7 @@ async function handleRest(
       // A body that is not JSON. The caller is still admitted first, so a
       // stranger learns nothing from a malformed body that a well-formed one
       // would not have told it.
-      const caller = admit(bridge, req);
+      const caller = await admit(bridge, req);
       if ("refused" in caller) {
         res.setHeader("WWW-Authenticate", 'Bearer realm="agentmesh-bridge-a2a"');
         const g = rpcErrorToRest({ code: RpcCode.INTERNAL_ERROR, message: caller.refused.message, data: { agentmesh_code: "UNAUTHORIZED" } }, 401);
@@ -522,7 +550,7 @@ async function handleRpc(
 
   // Caller identity + rate limit (BRIDGE-A2A.md §9). Fail-closed: no key and no
   // ALLOW_ANONYMOUS means no mesh identity is minted and no mesh work is done.
-  const admitted = admit(bridge, req);
+  const admitted = await admit(bridge, req);
   if ("refused" in admitted) {
     res.writeHead(401, {
       "Content-Type": "application/json",
@@ -1126,8 +1154,10 @@ async function handleAdminKeys(
   path: string,
 ): Promise<void> {
   if (req.method === "POST" && path === "/admin/keys") {
-    const body = (await readJson(req)) as { accountId?: string | null; label?: string };
-    const { record, rawKey } = await keys.mint({ accountId: body?.accountId, label: body?.label });
+    const body = (await readJson(req)) as { accountId?: string | null; label?: string; sandboxDays?: number };
+    // sandboxDays: a sandbox key (caller kind "sandbox"), which stops working after that many days.
+    const days = typeof body?.sandboxDays === "number" && body.sandboxDays > 0 && body.sandboxDays <= 30 ? body.sandboxDays : undefined;
+    const { record, rawKey } = await keys.mint({ accountId: body?.accountId, label: body?.label, ...(days ? { sandboxDays: days } : {}) });
     return json(res, 201, { key: rawKey, record: redactKey(record) });
   }
   if (req.method === "GET" && path === "/admin/keys") {

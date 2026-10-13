@@ -204,6 +204,7 @@ spec:
             - { name: ATTACHMENTS_FILE, value: /config/a2a-gateway/attachments.json }
             - { name: API_KEYS_FILE, value: /config/a2a-gateway/api-keys.json }
             - { name: CALLER_IDS_FILE, value: /config/a2a-gateway/caller-identities.json }
+            - { name: CORE_API_URL, value: "http://server:3005" }
           ports:
             - { name: a2a, containerPort: 8090 }
           readinessProbe:

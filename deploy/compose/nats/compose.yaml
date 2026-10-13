@@ -87,6 +87,8 @@ services:
       PUBLIC_BASE_URL: ${GATEWAY_PUBLIC_URL:-http://localhost:${GATEWAY_PORT:-8090}}
       # key=label pairs for A2A callers; with none, every inbound call is refused.
       API_KEYS: ${GATEWAY_API_KEYS:-}
+      # Where outside proofs (OAuth tokens, SPIFFE JWT-SVIDs) are checked: the server's doors.
+      CORE_API_URL: http://server:3005
       ATTACH: ${GATEWAY_ATTACH:-}
     volumes:
       - config:/config:ro

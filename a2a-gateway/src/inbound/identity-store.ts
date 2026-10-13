@@ -62,8 +62,16 @@ import { dirname } from "node:path";
  *              §14.6). The caller key is `pact:` and the SHA-256 of the
  *              platform's issuer and the person's opaque `sub`; it stands on
  *              no account here.
+ * `oauth`    — an agent that holds no mesh key, presenting an OAuth token from
+ *              an issuer a tenant trusts (SPEC §4.15). The caller key is
+ *              `oauth:` and the SHA-256 of the issuer and the subject, which is
+ *              also its `caller_ref`; it stands on the tenant that trusts the issuer.
+ * `spiffe`   — the same with a SPIFFE JWT-SVID. The caller key is `spiffe:` and
+ *              the SPIFFE ID, which is its `caller_ref`.
+ * `sandbox`  — a sandbox key, minted with an expiry, for a public sandbox. The
+ *              caller key is `sandbox:` and the key record id.
  */
-export type CallerKind = "operator" | "account" | "anonymous" | "pact";
+export type CallerKind = "operator" | "account" | "anonymous" | "pact" | "oauth" | "spiffe" | "sandbox";
 
 export interface CallerIdentityRecord {
   /** Stable opaque reference for this caller. Safe to publish: it names the
@@ -110,6 +118,9 @@ export function callerKindOf(callerKey: string): CallerKind {
   if (callerKey.startsWith("acctkey:")) return "account";
   if (callerKey.startsWith("key:")) return "operator";
   if (callerKey.startsWith("pact:")) return "pact";
+  if (callerKey.startsWith("oauth:")) return "oauth";
+  if (callerKey.startsWith("spiffe:")) return "spiffe";
+  if (callerKey.startsWith("sandbox:")) return "sandbox";
   return "anonymous";
 }
 
@@ -150,10 +161,13 @@ export function newCallerRecord(fields: {
   accountId?: string | null;
   agentId: string;
   identitySeed: string;
+  /** The caller's reference when it has a stable one of its own (an outside
+   *  identity's, from the key chain). Default: a fresh random one. */
+  ref?: string;
 }): CallerIdentityRecord {
   const now = new Date().toISOString();
   return {
-    ref: randomUUID(),
+    ref: fields.ref ?? randomUUID(),
     kind: callerKindOf(fields.callerKey),
     callerKeyHash: callerKeyDigest(fields.callerKey),
     keyRecordId: fields.keyRecordId ?? null,

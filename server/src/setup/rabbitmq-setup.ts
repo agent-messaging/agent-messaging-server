@@ -252,6 +252,7 @@ export const rabbitmqSetup: BrokerSetup = {
       { name: ACCOUNT_SETTING, value: mesh.getPublicKey(), about: "The mesh's account, which every credential is minted under." },
       { name: "ROOMS_MINT_SEED_FILE", value: coreMintFile, about: "The account signing key the server's own credentials are signed with." },
       { name: CUSTOMER_SEED_SETTING, value: customerMintFile, about: "The account signing key every agent credential is signed with." },
+      { name: "MESH_BRIDGE_NODES", value: gateway.getPublicKey(), about: "The node the gateway runs as, which may speak for callers that hold no mesh key (identity bridges, SPEC §4.15)." },
       { name: CUSTOMER_KEY_SETTING, value: customerMint.getPublicKey(), about: "Its public key, which the mesh pause takes out of the account and the resume puts back." },
       { name: JWT_HISTORY_SETTING, value: historyDir, about: "Where the account JWT is saved before each change." },
       { name: "MESH_AMQP_ENDPOINTS", value: endpoints, about: "The broker addresses handed to agents with their credentials. Use addresses agents can reach." },
