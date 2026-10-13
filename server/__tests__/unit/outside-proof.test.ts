@@ -190,8 +190,8 @@ describe("binding", () => {
   });
 
   it("a certificate-bound token enrolls only over mTLS with that certificate", async () => {
-    const leaf = new X509Certificate(readFileSync(join(__dirname, "../fixtures/svid-leaf.pem")));
-    const ca = new X509Certificate(readFileSync(join(__dirname, "../fixtures/svid-ca.pem")));
+    const leaf = new X509Certificate(readFileSync(join(__dirname, "../fixtures/svid-leaf.crt")));
+    const ca = new X509Certificate(readFileSync(join(__dirname, "../fixtures/svid-ca.crt")));
     const t = await token({ iss: ISSUER, aud: AUD, sub: "s", cnf: { "x5t#S256": sha256b64url(leaf.raw) } });
     const d = deps([["acme", oauth()]]);
     expect(await verifyOutsideProof({ kind: "oauth", token: t }, req({ clientCerts: [leaf] }), d)).toMatchObject({ ok: true, proof: { binding: { kind: "mtls" } } });
@@ -223,9 +223,9 @@ describe("SPIFFE", () => {
   });
 
   it("an X.509-SVID over mTLS enrolls when it chains to the bundle, and is refused against another CA", async () => {
-    const leaf = new X509Certificate(readFileSync(join(__dirname, "../fixtures/svid-leaf.pem")));
-    const caPem = readFileSync(join(__dirname, "../fixtures/svid-ca.pem"), "utf8");
-    const otherPem = readFileSync(join(__dirname, "../fixtures/svid-other-ca.pem"), "utf8");
+    const leaf = new X509Certificate(readFileSync(join(__dirname, "../fixtures/svid-leaf.crt")));
+    const caPem = readFileSync(join(__dirname, "../fixtures/svid-ca.crt"), "utf8");
+    const otherPem = readFileSync(join(__dirname, "../fixtures/svid-other-ca.crt"), "utf8");
     const der = (pem: string) => pem.replace(/-----[^-]+-----/g, "").replace(/\s+/g, "");
     const good = deps([["acme", spiffe({ bundle: { keys: [{ kty: "EC", use: "x509-svid", x5c: [der(caPem)] }] } })]]);
     expect(await verifyOutsideProof({ kind: "x509-svid" }, req({ clientCerts: [leaf] }), good)).toMatchObject({ ok: true, proof: { kind: "x509-svid", workload_id: "spiffe://example.org/agents/buyer", binding: { kind: "mtls" } } });
