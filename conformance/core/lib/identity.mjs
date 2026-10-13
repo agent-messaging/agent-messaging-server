@@ -79,7 +79,17 @@ export async function freshTenant(env, tag) {
   const h = { authorization: `Bearer ${env.admin.token}` };
   const r = await call("POST", `${env.admin.url}/admin/v1/tenants`, { body: { id }, headers: h });
   if (r.status !== 200 && r.status !== 201) throw new Error(`could not make a test tenant (${r.status} ${r.text.slice(0, 200)})`); // cut-ok: an error message
-  return { id, remove: () => call("DELETE", `${env.admin.url}/admin/v1/tenants/${id}`, { headers: h }).catch(() => null) };
+  // Trust records go first. A server refuses to delete a tenant that still holds
+  // agents, and an issuer belongs to one account per mesh (§4.14), so a record
+  // left behind would block the next test that trusts the same issuer.
+  const remove = async () => {
+    const list = await call("GET", `${env.admin.url}/admin/v1/tenants/${id}/trust`, { headers: h });
+    for (const t of list.json?.trust ?? []) {
+      if (t?.id) await call("DELETE", `${env.admin.url}/admin/v1/tenants/${id}/trust/${encodeURIComponent(t.id)}`, { headers: h });
+    }
+    await call("DELETE", `${env.admin.url}/admin/v1/tenants/${id}`, { headers: h });
+  };
+  return { id, remove: () => remove().catch(() => null) };
 }
 
 /** Add a trust record (SPEC §4.14) to a tenant through the admin API. */

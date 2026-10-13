@@ -3,7 +3,7 @@
     "Files this repository carries from the private AgentMesh repository, where they are written: the conformance suite's core profile and the specification it tests (SPEC.md, as published at https://agentmessaging.ai), the A2A gateway's normative mapping and the RabbitMQ binding document. Everything else here, the server, the A2A gateway and the SDK among it, is this repository's own.",
     "Written by the AgentMesh repository's tools/server-repo.mjs export, in a pull request here; its check lists every file that differs."
   ],
-  "monorepo_commit": "206a35e4db18c45a12fa5b0d466a4f4f0425a56e",
+  "monorepo_commit": "50589402e1474ed744e11f2d4e3a6c628d249efa",
   "files": [
     "a2a-gateway/MAPPING.md",
     "conformance/SPEC.md",
