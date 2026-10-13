@@ -7,7 +7,7 @@
 //   node tools/identity-profile.mjs nats|rabbitmq [--ci]
 //
 // Each test runs its own OAuth issuer and SPIFFE bundle on this machine, and
-// the server reaches it at host.docker.internal. An issuer belongs to one
+// the server reaches it at issuer.test. An issuer belongs to one
 // tenant on a mesh, and a test tenant that enrolled an agent stays behind, so
 // each test gets an issuer on a port of its own (IDENTITY_ISSUER_LISTEN and
 // IDENTITY_ISSUER_BASE) and the tests never share one.
@@ -23,7 +23,7 @@ if (broker !== "nats" && broker !== "rabbitmq") {
   process.exit(2);
 }
 const ci = rest.includes("--ci");
-const host = process.env.IDENTITY_ISSUER_HOST ?? "host.docker.internal";
+const host = process.env.IDENTITY_ISSUER_HOST ?? "issuer.test";
 const base = Number(process.env.IDENTITY_ISSUER_PORT ?? 47100);
 const tests = readdirSync(join(ROOT, "conformance", "core", "tests"))
   .map((f) => /^(i\d\d)-/.exec(f)?.[1])

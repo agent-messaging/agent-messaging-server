@@ -114,9 +114,10 @@ services:
       # RabbitMQ is another container, so the check listens on the Compose
       # network. It is not published on the host.
       MESH_BROKER_AUTH_HOST: 0.0.0.0
-    # The host machine, for a test issuer the identity tests run on it.
+    # The host machine, as issuer.test, for a test issuer the identity tests
+    # and example 08 run on it (Docker's host-gateway).
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - "issuer.test:host-gateway"
     volumes:
       - config:/config
     ports:

@@ -2,7 +2,7 @@
 // identity provider (Entra, Okta, Auth0 and the like): OpenID metadata and a
 // key set over http on this machine, and ES256 access tokens (RFC 9068).
 //
-// The server reaches it at host.docker.internal (EXAMPLE_ISSUER_HOST to
+// The server reaches it at issuer.test (EXAMPLE_ISSUER_HOST to
 // change that), so the mesh has to be started with MESH_TRUST_ALLOW_HTTP=on,
 // which lets it fetch keys from an http:// issuer. A real identity provider is
 // https and needs no such setting.
@@ -28,7 +28,7 @@ export class ExampleIssuer {
       res.end();
     });
     await new Promise((ok) => this.server.listen(0, "0.0.0.0", ok));
-    this.base = `http://${process.env.EXAMPLE_ISSUER_HOST ?? "host.docker.internal"}:${this.server.address().port}`;
+    this.base = `http://${process.env.EXAMPLE_ISSUER_HOST ?? "issuer.test"}:${this.server.address().port}`;
     return this;
   }
 

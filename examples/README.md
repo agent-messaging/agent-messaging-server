@@ -28,7 +28,7 @@ node run.mjs nats 01 04      # only some of them
 
 Example 07 starts a SPIRE server of its own with Docker. Example 08 runs an
 OAuth issuer over http on this machine, which the server reaches at
-host.docker.internal: start the mesh with `MESH_TRUST_ALLOW_HTTP=on docker
+issuer.test: start the mesh with `MESH_TRUST_ALLOW_HTTP=on docker
 compose up -d` for it, or it is skipped. A real identity provider is https and
 needs no such setting.
 
