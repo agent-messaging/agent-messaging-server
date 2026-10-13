@@ -16,7 +16,9 @@
 //      your own ~/.agentmesh is read.
 //
 // The host ports are the Compose files' settings (SERVER_PORT, NATS_WS_PORT,
-// AMQP_PORT), with the same defaults.
+// AMQP_PORT), with the same defaults. With MESH_KUBE_NAMESPACE set, the files
+// are read from the server's pod in that namespace (deploy/kubernetes) with
+// kubectl instead, and the same ports must reach the cluster's services.
 
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -84,8 +86,16 @@ rmSync(state, { recursive: true, force: true });
 mkdirSync(join(state, "home"), { recursive: true });
 
 const env = { ...process.env, MSYS_NO_PATHCONV: "1" };
+// MESH_KUBE_NAMESPACE: the mesh runs from deploy/kubernetes in that namespace
+// instead, with its ports reachable on this host (the nightly proof on kind).
+const kubeNamespace = process.env.MESH_KUBE_NAMESPACE;
 for (const [from, to] of [["/config/creds/mesh-admin.token", "mesh-admin.token"], ["/config/creds/a2a-gateway.creds", "suite.creds"]]) {
-  execFileSync("docker", [...compose, "cp", `server:${from}`, join(state, to)], { env, stdio: ["ignore", "ignore", "pipe"], timeout: 60_000 });
+  if (kubeNamespace) {
+    const bytes = execFileSync("kubectl", ["-n", kubeNamespace, "exec", "deploy/server", "--", "cat", from], { env, stdio: ["ignore", "pipe", "pipe"], timeout: 60_000 });
+    writeFileSync(join(state, to), bytes, { mode: 0o600 });
+  } else {
+    execFileSync("docker", [...compose, "cp", `server:${from}`, join(state, to)], { env, stdio: ["ignore", "ignore", "pipe"], timeout: 60_000 });
+  }
 }
 
 const serverPort = process.env.SERVER_PORT ?? "3005";

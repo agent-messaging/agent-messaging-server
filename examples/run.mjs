@@ -10,7 +10,7 @@
 // GATEWAY_PORT), with the same defaults.
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -34,11 +34,22 @@ const composeFile = join(ROOT, "deploy", "compose", broker, "compose.yaml");
 const state = join(ROOT, ".state", `examples-${broker}`);
 mkdirSync(state, { recursive: true });
 const tokenFile = join(state, "mesh-admin.token");
-execFileSync("docker", ["compose", "-f", composeFile, "cp", "server:/config/creds/mesh-admin.token", tokenFile], {
-  env: { ...process.env, MSYS_NO_PATHCONV: "1" },
-  stdio: ["ignore", "ignore", "pipe"],
-  timeout: 60_000,
-});
+// MESH_KUBE_NAMESPACE: the mesh runs from deploy/kubernetes in that namespace,
+// with its ports reachable on this host. Example 03 needs the Compose setup.
+const kubeNamespace = process.env.MESH_KUBE_NAMESPACE;
+if (kubeNamespace) {
+  const bytes = execFileSync("kubectl", ["-n", kubeNamespace, "exec", "deploy/server", "--", "cat", "/config/creds/mesh-admin.token"], {
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 60_000,
+  });
+  writeFileSync(tokenFile, bytes, { mode: 0o600 });
+} else {
+  execFileSync("docker", ["compose", "-f", composeFile, "cp", "server:/config/creds/mesh-admin.token", tokenFile], {
+    env: { ...process.env, MSYS_NO_PATHCONV: "1" },
+    stdio: ["ignore", "ignore", "pipe"],
+    timeout: 60_000,
+  });
+}
 
 const env = {
   ...process.env,

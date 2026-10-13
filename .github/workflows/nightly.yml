@@ -1,0 +1,198 @@
+name: Nightly proof
+
+# Every night, for each broker, everything from empty, on images built from
+# main:
+#   Compose     the Compose setup brought up on empty volumes; an agent
+#               enrolled with an enrollment key from mesh-admin; the core
+#               conformance profile; live revocation (c20) on its own; all five
+#               examples
+#   Kubernetes  the manifest applied to a throwaway kind cluster; the same
+#               enrollment, conformance, c20 and examples, except example 03,
+#               which runs its A2A agent in the gateway's Compose network
+# The stages are tools/nightly.sh. A failure opens one issue, "Nightly proof
+# failing", or comments on it when it is already open; the next green run
+# closes it. Nobody is emailed.
+on:
+  schedule:
+    - cron: "23 9 * * *" # 03:23 in Denver (MDT), 02:23 in winter
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "22"
+  MESH_KUBE_NAMESPACE: agent-messaging
+
+jobs:
+  proof:
+    name: proof (${{ matrix.broker }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        broker: [nats, rabbitmq]
+    env:
+      BROKER: ${{ matrix.broker }}
+      COMPOSE_FILE: deploy/compose/${{ matrix.broker }}/compose.yaml
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install the SDK, the suite and the examples
+        run: |
+          (cd sdk-typescript && npm ci --no-audit --no-fund && npm run build)
+          (cd server && npm ci --no-audit --no-fund)
+          node tools/conformance.mjs install
+          (cd examples && npm ci --no-audit --no-fund)
+
+      - name: Build the images
+        run: docker compose build
+
+      # ---- Compose -----------------------------------------------------------
+      - name: "Compose: up from empty"
+        run: |
+          docker compose down -v --remove-orphans
+          docker compose up -d --wait --wait-timeout 300
+          docker compose ps
+          docker compose logs setup > "$RUNNER_TEMP/first-run.log"
+          grep -q "KEEP A COPY OF THE OPERATOR KEY" "$RUNNER_TEMP/first-run.log" || { echo "::error::first-run did not say where the operator key is"; exit 1; }
+          if grep -Eq '(^|[^A-Z2-7])S[OAUNCX][A-Z2-7]{56}([^A-Z2-7]|$)' "$RUNNER_TEMP/first-run.log"; then echo "::error::first-run printed something shaped like a seed"; exit 1; fi
+          tools/nightly.sh compose "$BROKER" status
+
+      - name: "Compose: enroll an agent"
+        run: tools/nightly.sh compose "$BROKER" enroll
+
+      - name: "Compose: core conformance profile"
+        run: tools/nightly.sh compose "$BROKER" conformance
+
+      - name: "Compose: live revocation (c20)"
+        run: tools/nightly.sh compose "$BROKER" revocation
+
+      - name: "Compose: the examples"
+        run: tools/nightly.sh compose "$BROKER" examples
+
+      - name: "Compose: logs, on failure"
+        if: failure()
+        run: docker compose logs --tail 150
+
+      - name: "Compose: stop and delete"
+        if: always()
+        run: docker compose down -v --remove-orphans
+
+      # ---- Kubernetes on kind --------------------------------------------------
+      # The cluster's NodePorts are mapped to the same host ports as Compose
+      # uses, so the addresses first-run puts in every credential (localhost
+      # 3005, 4222, 4443, 5672, 8090, the manifests' defaults) reach it.
+      - name: "Kubernetes: the cluster's settings"
+        run: |
+          cat > "$RUNNER_TEMP/kind.yaml" <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+              extraPortMappings:
+                - { containerPort: 30005, hostPort: 3005, listenAddress: "127.0.0.1" }
+                - { containerPort: 30422, hostPort: 4222, listenAddress: "127.0.0.1" }
+                - { containerPort: 30443, hostPort: 4443, listenAddress: "127.0.0.1" }
+                - { containerPort: 30672, hostPort: 5672, listenAddress: "127.0.0.1" }
+                - { containerPort: 30090, hostPort: 8090, listenAddress: "127.0.0.1" }
+          EOF
+
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: mesh
+          config: ${{ runner.temp }}/kind.yaml
+
+      - name: "Kubernetes: apply the manifest from empty"
+        run: |
+          kind load docker-image agent-messaging-server:local agent-messaging-a2a-gateway:local --name mesh
+          sed -e 's#ghcr.io/jeffrschneider/agent-messaging-server:[0-9.]*#agent-messaging-server:local#' \
+              -e 's#ghcr.io/jeffrschneider/agent-messaging-a2a-gateway:[0-9.]*#agent-messaging-a2a-gateway:local#' \
+              "deploy/kubernetes/$BROKER/mesh.yaml" > "$RUNNER_TEMP/mesh.yaml"
+          kubectl apply -f "$RUNNER_TEMP/mesh.yaml"
+          if [ "$BROKER" = nats ]; then broker_ports='{ name: client, port: 4222, nodePort: 30422 }, { name: websocket, port: 4443, nodePort: 30443 }'; else broker_ports='{ name: amqp, port: 5672, nodePort: 30672 }'; fi
+          cat > "$RUNNER_TEMP/nodeports.yaml" <<EOF
+          apiVersion: v1
+          kind: Service
+          metadata: { name: server-host, namespace: $MESH_KUBE_NAMESPACE }
+          spec: { type: NodePort, selector: { app: server }, ports: [{ name: api, port: 3005, nodePort: 30005 }] }
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: { name: broker-host, namespace: $MESH_KUBE_NAMESPACE }
+          spec: { type: NodePort, selector: { app: $BROKER }, ports: [$broker_ports] }
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: { name: gateway-host, namespace: $MESH_KUBE_NAMESPACE }
+          spec: { type: NodePort, selector: { app: a2a-gateway }, ports: [{ name: a2a, port: 8090, nodePort: 30090 }] }
+          EOF
+          kubectl apply -f "$RUNNER_TEMP/nodeports.yaml"
+          kubectl -n "$MESH_KUBE_NAMESPACE" wait --for=condition=complete job/first-run --timeout=180s
+          kubectl -n "$MESH_KUBE_NAMESPACE" rollout status deploy/server --timeout=300s
+          kubectl -n "$MESH_KUBE_NAMESPACE" rollout status deploy/a2a-gateway --timeout=180s
+          kubectl -n "$MESH_KUBE_NAMESPACE" get pods
+          for i in $(seq 1 30); do curl -fsS --max-time 5 http://127.0.0.1:3005/v1/capabilities > /dev/null && break; sleep 2; done
+          tools/nightly.sh kubernetes "$BROKER" status
+
+      - name: "Kubernetes: enroll an agent"
+        run: tools/nightly.sh kubernetes "$BROKER" enroll
+
+      - name: "Kubernetes: core conformance profile"
+        run: tools/nightly.sh kubernetes "$BROKER" conformance
+
+      - name: "Kubernetes: live revocation (c20)"
+        run: tools/nightly.sh kubernetes "$BROKER" revocation
+
+      - name: "Kubernetes: the examples"
+        run: tools/nightly.sh kubernetes "$BROKER" examples
+
+      - name: "Kubernetes: logs, on failure"
+        if: failure()
+        run: |
+          kubectl -n "$MESH_KUBE_NAMESPACE" get pods -o wide || true
+          for d in job/first-run deploy/server deploy/a2a-gateway "statefulset/$BROKER"; do echo "---- $d"; kubectl -n "$MESH_KUBE_NAMESPACE" logs "$d" --all-containers --tail 120 || true; done
+
+  report:
+    name: report
+    needs: proof
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TITLE: Nightly proof failing
+      RESULT: ${{ needs.proof.result }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Open, update or close the issue
+        run: |
+          open=$(gh issue list --state open --search "\"$TITLE\" in:title" --json number,title --jq ".[] | select(.title == \"$TITLE\") | .number" | head -n 1)
+          when=$(TZ=America/Denver date '+%Y-%m-%d %H:%M %Z')
+          if [ "$RESULT" = success ]; then
+            if [ -n "$open" ]; then
+              gh issue comment "$open" --body "Green again on $when: $RUN_URL"
+              gh issue close "$open"
+            fi
+            echo "The nightly proof passed."
+            exit 0
+          fi
+          body="The nightly proof did not pass on $when ($RESULT): $RUN_URL
+
+          Each broker's job names the stage that failed (Compose or Kubernetes: up from empty, enroll, the core conformance profile, live revocation, the examples). This issue closes itself on the next green run."
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body "$body"
+          else
+            gh issue create --title "$TITLE" --body "$body"
+          fi
