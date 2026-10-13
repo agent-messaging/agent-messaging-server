@@ -35,9 +35,13 @@ import { ADMISSION_ROSTER_SIG_PREFIX, canonicalJSON, signTagged, verifyTagged, t
 /** What the roster says to do with a sender (EXT-6 §5). */
 export type AdmissionStance = "allow" | "hold" | "block";
 
-/** One sender the roster names, by agent id (or handle). */
+/** One sender the roster names, by agent id (or handle), or one source of
+ *  identity (EXT-6 0.5.0): `"oauth:<issuer>"` or `"spiffe://<trust domain>"`. */
 export interface AdmissionRosterEntry {
-  subject: string;
+  subject?: string;
+  /** A source of identity instead of a sender: every agent whose identity
+   *  came from it (§9.7 identity_source), natively or through a bridge. */
+  source?: string;
   stance: AdmissionStance;
   note?: string;
   updated_at: string;
@@ -48,13 +52,93 @@ export interface AdmissionRosterEntry {
 export interface AdmissionRoster {
   admission: "v1";
   owner_key: string;
-  /** Per tier: `registered` (a verified agent unknown to you) and `anonymous`. */
+  /** Per tier: `registered` (a verified agent unknown to you), `bridged` (an
+   *  agent that reaches the mesh through an identity bridge; `hold` when
+   *  unset) and `anonymous`. */
   defaults: Record<string, AdmissionStance>;
   limits?: { per_sender_per_hour?: number; inbound_model_budget_per_day?: number };
   entries: AdmissionRosterEntry[];
   updated_at: string;
   /** Standard base64 of the owner key's signature over the tagged canonical document. */
   sig?: string;
+}
+
+/** What a roster rule knows about a sender beyond its key. */
+export interface SenderFacts {
+  /** It is registered on the mesh (a verified agent). */
+  registered: boolean;
+  /** It reaches the mesh through a bridge (its identity source is
+   *  `bridged`, or its registration carries a bridge marker). */
+  bridged: boolean;
+  /** Where its identity came from (§9.7), when the mesh holds a record. */
+  source?: { kind?: string; issuer?: string; trust_domain?: string } | null;
+}
+
+/** A source entry's meaning, or null when it names no source this rule knows. */
+export function parseRosterSource(source: string): { issuer: string } | { trust_domain: string } | null {
+  if (source.startsWith("oauth:")) {
+    const issuer = source.slice("oauth:".length);
+    try { return new URL(issuer) && issuer ? { issuer } : null; } catch { return null; }
+  }
+  const m = /^spiffe:\/\/([a-z0-9._-]{1,255})$/.exec(source);
+  return m ? { trust_domain: m[1]! } : null;
+}
+
+const STRICTNESS: Record<AdmissionStance, number> = { allow: 0, hold: 1, block: 2 };
+
+/**
+ * The roster's word on a sender (EXT-6 §4, §5; 0.5.0's provenance rules).
+ * Most specific wins: an entry naming the sender, then an entry naming the
+ * source its identity came from (the strictest, when several match), then
+ * the tier: `anonymous`, `bridged` or `registered`. A roster with a source
+ * entry this rule cannot read fails closed: a sender no entry names is
+ * blocked, never let in by a rule nobody can check. Grants and expiry on a
+ * sender's entry are the caller's to apply before asking.
+ */
+export function rosterStance(
+  roster: { defaults?: Record<string, string>; entries?: ReadonlyArray<{ subject?: unknown; source?: unknown; stance?: unknown }> } | null | undefined,
+  from: string,
+  facts: SenderFacts,
+): AdmissionStance {
+  const entries = Array.isArray(roster?.entries) ? roster!.entries : [];
+  const own = entries.find((e) => e.subject === from);
+  if (own && isStance(own.stance)) return own.stance;
+  return sourceStance(entries, facts) ?? tierStance(roster?.defaults, facts);
+}
+
+/** What the roster's source entries say about a sender: the strictest entry
+ *  matching where its identity came from, "block" when the roster has a
+ *  source entry nobody can read (fail closed), or null when none applies. */
+export function sourceStance(
+  entries: ReadonlyArray<{ source?: unknown; stance?: unknown }> | null | undefined,
+  facts: SenderFacts,
+): AdmissionStance | null {
+  let unreadable = false;
+  let matched: AdmissionStance | null = null;
+  for (const e of entries ?? []) {
+    if (typeof e.source !== "string") continue;
+    const stance = e.stance;
+    const want = parseRosterSource(e.source);
+    if (!want || !isStance(stance)) { unreadable = true; continue; }
+    const src = facts.source;
+    const hit = !!src && ("issuer" in want ? src.issuer === want.issuer : src.trust_domain === want.trust_domain);
+    if (hit && (matched === null || STRICTNESS[stance] > STRICTNESS[matched])) matched = stance;
+  }
+  if (matched) return matched;
+  return unreadable ? "block" : null;
+}
+
+/** The tier default for a sender: `anonymous` (block when unset), `bridged`
+ *  (hold when unset) or `registered` (hold when unset). */
+export function tierStance(defaults: Record<string, string> | null | undefined, facts: SenderFacts): AdmissionStance {
+  const tier = !facts.registered ? "anonymous" : facts.bridged ? "bridged" : "registered";
+  const v = (defaults ?? {})[tier];
+  if (isStance(v)) return v;
+  return tier === "anonymous" ? "block" : "hold";
+}
+
+function isStance(v: unknown): v is AdmissionStance {
+  return v === "allow" || v === "hold" || v === "block";
 }
 
 /** A sender waiting at this agent's door: what `contacts.waiting()` lists. */
@@ -144,6 +228,10 @@ export interface AdmissionOptions {
   store?: AdmissionStore;
   /** What a sender the roster does not cover gets. Default: `hold`. */
   registered?: AdmissionStance;
+  /** What a sender that reaches the mesh through an identity bridge gets,
+   *  when the roster does not cover it (EXT-6 0.5.0). Default: `hold`.
+   *  "Native senders only" is `bridged: "block"`. */
+  bridged?: AdmissionStance;
   /** Put messages that arrive for an offering with no handler in the inbox,
    *  answered with the §6.4a queued acknowledgement, instead of refusing them
    *  with OFFERING_NOT_FOUND. Default false. Released held messages always go
@@ -322,7 +410,11 @@ export class AdmissionGate {
     const loaded = opts.store ? await opts.store.load() : null;
     const fresh = (): AdmissionRoster =>
       signAdmissionRoster(
-        { admission: "v1", owner_key: agentId, defaults: { registered: opts.registered ?? "hold", anonymous: "block" }, entries: [], updated_at: now() },
+        {
+          admission: "v1", owner_key: agentId,
+          defaults: { registered: opts.registered ?? "hold", ...(opts.bridged ? { bridged: opts.bridged } : {}), anonymous: "block" },
+          entries: [], updated_at: now(),
+        },
         key,
       );
     const roster = loaded?.roster && loaded.roster.owner_key === agentId && verifyAdmissionRoster(loaded.roster) ? loaded.roster : fresh();
@@ -334,8 +426,11 @@ export class AdmissionGate {
       ...(loaded?.knocks ? { knocks: loaded.knocks } : {}),
     });
     // A default the caller asked for that the stored roster does not have.
-    if (opts.registered && roster.defaults.registered !== opts.registered) {
-      gate.setRoster({ ...roster, defaults: { ...roster.defaults, registered: opts.registered } });
+    if ((opts.registered && roster.defaults.registered !== opts.registered) || (opts.bridged && roster.defaults.bridged !== opts.bridged)) {
+      gate.setRoster({
+        ...roster,
+        defaults: { ...roster.defaults, ...(opts.registered ? { registered: opts.registered } : {}), ...(opts.bridged ? { bridged: opts.bridged } : {}) },
+      });
     }
     return gate;
   }
@@ -360,13 +455,30 @@ export class AdmissionGate {
     return this.state.roster.entries.find((e) => e.subject === sender);
   }
 
-  /** What to do with a message from `from` (EXT-6 §4, §5). */
-  stanceFor(from: string): AdmissionStance {
+  /** What to do with a message from `from` (EXT-6 §4, §5). `facts`: what the
+   *  registry says about the sender, for the source entries and the bridged
+   *  tier; without them the sender is taken as a registered native agent. */
+  stanceFor(from: string, facts?: SenderFacts): AdmissionStance {
     const entry = this.entryFor(from);
     if (entry) return entry.stance;
+    const known = facts ?? { registered: true, bridged: false };
+    // A source entry (or a roster with one nobody can read) decides before an
+    // agent this one wrote to first, which decides before the tier.
+    const bySource = sourceStance(this.state.roster.entries, known);
+    if (bySource) return bySource;
     const at = this.addressed.get(from);
     if (at !== undefined && Date.now() - at < 30 * 24 * 3600_000) return "allow";
-    return this.state.roster.defaults.registered ?? "hold";
+    return tierStance(this.state.roster.defaults, known);
+  }
+
+  /** Set a stance for a whole source of identity: `"oauth:<issuer>"` or
+   *  `"spiffe://<trust domain>"` (EXT-6 0.5.0). */
+  setSourceStance(source: string, stance: AdmissionStance, note?: string): void {
+    if (!parseRosterSource(source)) throw new Error(`${source} is not a source: use oauth:<issuer URL> or spiffe://<trust domain>.`);
+    const r = this.state.roster;
+    const entries = r.entries.filter((e) => e.source !== source);
+    entries.push({ source, stance, ...(note ? { note } : {}), updated_at: now() });
+    this.setRoster({ ...r, entries });
   }
 
   /**

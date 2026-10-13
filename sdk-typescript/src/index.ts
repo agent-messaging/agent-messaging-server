@@ -1014,6 +1014,7 @@ export {
 // waiting list and the inbox (mesh.admission, mesh.contacts, mesh.messages).
 export {
   AdmissionGate, signAdmissionRoster, verifyAdmissionRoster, fileAdmissionStore, readKnockInput, KNOCK_GRANT_NAMES,
+  rosterStance, sourceStance, tierStance, parseRosterSource, type SenderFacts,
   type AdmissionControl, type AdmissionOptions, type AdmissionRoster, type AdmissionRosterEntry, type AdmissionStance,
   type AdmissionState, type AdmissionStore, type WaitingSender, type InboxMessage, type HeldMessage, type DescribeDocument,
 } from "./admission.js";

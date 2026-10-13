@@ -401,3 +401,8 @@ export type {
   TrialShape,
   TrialReason,
 } from "../../sdk-typescript/src/trial.js";
+
+// Admission by source (EXT-6 0.5.0): the same roster rule the SDK's gate applies,
+// so the admission service and an agent's own door never disagree.
+export { rosterStance, sourceStance, tierStance, parseRosterSource } from "../../sdk-typescript/src/admission.js";
+export type { SenderFacts } from "../../sdk-typescript/src/admission.js";

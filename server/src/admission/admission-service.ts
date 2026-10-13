@@ -1,6 +1,7 @@
 import { messagingOf, type MessagingLike } from "../storage/index.js";
 import type { BusMessage, BusSubscription, Messaging } from "../storage/index.js";
 import type { Envelope } from "../sdk.js";
+import { sourceStance, tierStance } from "../sdk.js";
 import {
   decode,
   createEnvelope,
@@ -74,7 +75,7 @@ interface RelayedRequest {
 export class AdmissionService {
   private guards = new Map<string, BusSubscription>();
   private rate = new Map<string, number[]>();
-  private regCache = new Map<string, { at: number; ok: boolean; owner: string | null }>();
+  private regCache = new Map<string, { at: number; ok: boolean; owner: string | null; bridged?: boolean; source?: { kind?: string; issuer?: string; trust_domain?: string } | null }>();
   private ctrl: BusSubscription[] = [];
   private inboxBuffer: InboxBuffer;
   /** The kill switch (docs/kill-switch-plan.md item 3): each stopped agent's
@@ -518,9 +519,12 @@ export class AdmissionService {
       return v.ok === false ? "drop" : "relay";
     }
     if (entry) return "relay";
-    const defaults = (roster?.defaults as Record<string, string>) ?? { registered: "hold", anonymous: "block" };
-    const tier = (await this.manifestInfo(from)).registered ? "registered" : "anonymous";
-    const stance = defaults[tier] ?? (tier === "anonymous" ? "block" : "hold");
+    // Where the sender's identity came from, then its tier (EXT-6 0.5.0):
+    // a source entry, a roster with a source entry nobody can read (fail
+    // closed), then `anonymous`, `bridged` (hold when unset) or `registered`.
+    const info = await this.manifestInfo(from);
+    const facts = { registered: info.registered, bridged: info.bridged, ...(info.source ? { source: info.source } : {}) };
+    const stance = sourceStance(roster?.entries as never, facts) ?? tierStance((roster?.defaults as Record<string, string>) ?? { registered: "hold", anonymous: "block" }, facts);
     return stance === "block" ? "drop" : "relay";
   }
 
@@ -540,10 +544,11 @@ export class AdmissionService {
   private async manifestInfo(
     agentId: string,
     refresh = false,
-  ): Promise<{ registered: boolean; owner: string | null }> {
+  ): Promise<{ registered: boolean; owner: string | null; bridged: boolean; source: { kind?: string; issuer?: string; trust_domain?: string } | null }> {
     const hit = refresh ? undefined : this.regCache.get(agentId);
-    if (hit && Date.now() - hit.at < 300_000) return { registered: hit.ok, owner: hit.owner ?? null };
-    let ok = false, owner: string | null = null;
+    if (hit && Date.now() - hit.at < 300_000) return { registered: hit.ok, owner: hit.owner ?? null, bridged: !!hit.bridged, source: hit.source ?? null };
+    let ok = false, owner: string | null = null, bridged = false;
+    let source: { kind?: string; issuer?: string; trust_domain?: string } | null = null;
     try {
       // Must be a valid SIGNED envelope: the registry decodes and verifies
       // before the handler runs, so an empty body fails validation and every
@@ -552,12 +557,17 @@ export class AdmissionService {
       // rosters). Found by conformance c07.
       const q = sealEnvelope(createEnvelope({ type: "discover", from: idOf(this.kp), payload: { agent_id: agentId } }), this.kp);
       const resp = await this.nc.request(Subjects.registryGet(agentId), q, { timeout: 2000 });
-      const env = decode(resp.data) as { error?: unknown; payload?: { owner?: string } };
+      const env = decode(resp.data) as { error?: unknown; payload?: { owner?: string; identity_source?: { kind?: string; issuer?: string; trust_domain?: string }; extensions?: Array<{ uri?: unknown }> } };
       ok = !env.error && !!env.payload;
       owner = (env.payload?.owner as string) ?? null;
+      // Where its identity came from (§9.7), as the registry joins it, and
+      // whether it reaches the mesh through a bridge (§4.15).
+      source = env.payload?.identity_source ?? null;
+      const exts = Array.isArray(env.payload?.extensions) ? env.payload!.extensions!.map((e) => e?.uri) : [];
+      bridged = source?.kind === "bridged" || exts.includes("mesh://extensions/identity-bridge/v1") || exts.includes("mesh://extensions/a2a-bridge/v1");
     } catch { ok = false; }
-    this.regCache.set(agentId, { at: Date.now(), ok, owner });
-    return { registered: ok, owner };
+    this.regCache.set(agentId, { at: Date.now(), ok, owner, bridged, source });
+    return { registered: ok, owner, bridged, source };
   }
 
   /**

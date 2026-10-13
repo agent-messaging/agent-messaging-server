@@ -211,7 +211,7 @@ import {
   sealPayloadTo,
 } from "./internal/sealed.js";
 import { derivedSealing } from "./internal/sealing-posture.js";
-import { AdmissionGate, readKnockInput, textOfInput, type AdmissionControl, type AdmissionOptions, type DescribeDocument } from "./admission.js";
+import { AdmissionGate, readKnockInput, textOfInput, type AdmissionControl, type AdmissionOptions, type DescribeDocument, type SenderFacts } from "./admission.js";
 import { describeDocumentOf } from "./interview.js";
 import { registrarNameLookup } from "./naming-gate.js";
 import {
@@ -3864,6 +3864,31 @@ export class AgentMesh {
     return handle;
   }
 
+  /** sender agent id → what the registry says about it, for admission (10 minutes). */
+  private senderFactsCache = new Map<string, { at: number; facts: SenderFacts }>();
+
+  /** What the registry says about a sender, for the roster's source entries
+   *  and the `bridged` tier (EXT-6 0.5.0): whether it is registered, whether
+   *  it reaches the mesh through a bridge, and where its identity came from.
+   *  A lookup that fails is read as a registered native agent, as before. */
+  private async senderFacts(agentId: string): Promise<SenderFacts> {
+    const hit = this.senderFactsCache.get(agentId);
+    if (hit && Date.now() - hit.at < 600_000) return hit.facts;
+    let facts: SenderFacts;
+    try {
+      const m = (await this.getManifest(agentId)) as Manifest & { identity_source?: { kind?: string; issuer?: string; trust_domain?: string } };
+      const exts = Array.isArray(m.extensions) ? m.extensions.map((e) => (e as { uri?: unknown })?.uri) : [];
+      const bridged = m.identity_source?.kind === "bridged" || exts.includes("mesh://extensions/identity-bridge/v1") || exts.includes("mesh://extensions/a2a-bridge/v1");
+      facts = { registered: true, bridged, ...(m.identity_source ? { source: m.identity_source } : {}) };
+    } catch (err) {
+      const code = (err as { code?: unknown })?.code;
+      facts = code === ErrorCode.AGENT_UNAVAILABLE ? { registered: false, bridged: false } : { registered: true, bridged: false };
+    }
+    this.senderFactsCache.set(agentId, { at: Date.now(), facts });
+    if (this.senderFactsCache.size > 2000) this.senderFactsCache.delete(this.senderFactsCache.keys().next().value!);
+    return facts;
+  }
+
   /** A terminal answer to a request, with no task and no accept before it. */
   private answerDirect(msg: Msg, env: Envelope, output: unknown, viaReply: boolean, error?: ErrorObject): void {
     const out = this.newEnvelope({
@@ -3935,7 +3960,7 @@ export class AgentMesh {
    *  blocked, or put in the inbox) and must go no further. */
   private async admissionDoor(msg: Msg, env: Envelope, reqPayload: RequestPayload, viaReply: boolean): Promise<boolean> {
     const gate = this.admissionGate!;
-    const stance = gate.stanceFor(env.from);
+    const stance = gate.stanceFor(env.from, await this.senderFacts(env.from));
     if (stance === "block") {
       this.answerQueued(msg, env, viaReply, false);
       return true;
