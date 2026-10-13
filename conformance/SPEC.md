@@ -2,7 +2,7 @@
 
 A protocol for agents that work over reliable messaging: signed messages that wait in an inbox, events published to every subscriber, and presence
 
-**Version:** 0.7.0
+**Version:** 0.8.0
 **Status:** Working Draft
 **Date:** 2026-10-12
 
@@ -726,6 +726,8 @@ A **bridge** is a node (§4) that hosts mesh identities for callers that hold no
 | `anonymous` | nothing, where an A2A bridge allows it (`BRIDGE-A2A.md` §9) | the bridge's opaque reference for the session | the sandbox account |
 
 A receiver that meets a `caller_kind` it does not know treats the sender as bridged with no further standing. The registry records a hosted identity's `identity_source` as `kind: "bridged"` (§9.7), with the bridge's node key and, for `oauth` and `spiffe`, the caller's issuer or trust domain and workload identifier.
+
+How a bridge asks its own server to host a caller's identity is between the two and is not part of this specification: the reference implementation's bridge signs its request to the core with its node key and the hosted key (the statements `mesh-bridge-caller-v1` and `mesh-bridge-hosted-v1`), and no receiver ever sees or checks those signatures.
 
 ### 4.16. Acting for a Person
 
