@@ -81,7 +81,10 @@ export interface OutsideProofResult extends BootstrapResult {
 /** The mesh refused an outside proof: `code` says why (proof_wrong_audience,
  *  proof_expired, dpop_required, proof_issuer_untrusted, and the rest). */
 export class ProofRefusedError extends Error {
-  constructor(message: string, readonly status: number, readonly code: string | null) {
+  /** `reason` is the specification's word for it (§4.14): issuer_not_trusted,
+   *  proof_invalid, proof_expired, audience_mismatch, algorithm_refused,
+   *  binding_required or binding_mismatch. */
+  constructor(message: string, readonly status: number, readonly code: string | null, readonly reason: string | null = null) {
     super(message);
     this.name = "ProofRefusedError";
   }
@@ -113,7 +116,9 @@ export async function exchangeOutsideProof(
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ agent_id: agentPublicKey, ...(await proofMembers(proof, "POST", url)) }),
   });
-  const data = (await res.json().catch(() => ({}))) as OutsideProofResult & { error?: string; code?: string };
-  if (!res.ok) throw new ProofRefusedError(data.error ?? `enrollment failed: HTTP ${res.status}`, res.status, typeof data.code === "string" ? data.code : null);
+  const data = (await res.json().catch(() => ({}))) as OutsideProofResult & { error?: string; code?: string; details?: { reason?: string } };
+  if (!res.ok) {
+    throw new ProofRefusedError(data.error ?? `enrollment failed: HTTP ${res.status}`, res.status, typeof data.code === "string" ? data.code : null, typeof data.details?.reason === "string" ? data.details.reason : null);
+  }
   return data;
 }

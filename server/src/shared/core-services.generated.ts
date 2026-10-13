@@ -2,7 +2,7 @@
 // Change a definition and run the generator; CI (tools/ci/check-service-doors.mjs) compares.
 
 /** The Agent Messaging version these definitions go with (SPEC.md). */
-export const AGENT_MESSAGING_VERSION = "0.7.0";
+export const AGENT_MESSAGING_VERSION = "0.8.0";
 
 /** The requests every Agent Messaging server offers, by service: the
  *  definitions whose tier is core. The AgentMesh platform adds its own

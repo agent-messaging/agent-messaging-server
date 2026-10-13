@@ -3878,13 +3878,19 @@ export class AgentMesh {
     if (hit && Date.now() - hit.at < 600_000) return hit.facts;
     let facts: SenderFacts;
     try {
-      const m = (await this.getManifest(agentId)) as Manifest & { identity_source?: { kind?: string; issuer?: string; trust_domain?: string } };
+      // Two seconds at most: a registry that does not answer leaves the sender
+      // read as before, a registered native agent, and the answer is not kept.
+      const m = (await Promise.race([
+        this.getManifest(agentId),
+        new Promise<never>((_, no) => { const t = setTimeout(() => no(new Error("registry slow")), 2000); (t as { unref?: () => void }).unref?.(); }),
+      ])) as Manifest & { identity_source?: { kind?: string; issuer?: string; trust_domain?: string } };
       const exts = Array.isArray(m.extensions) ? m.extensions.map((e) => (e as { uri?: unknown })?.uri) : [];
       const bridged = m.identity_source?.kind === "bridged" || exts.includes("mesh://extensions/identity-bridge/v1") || exts.includes("mesh://extensions/a2a-bridge/v1");
       facts = { registered: true, bridged, ...(m.identity_source ? { source: m.identity_source } : {}) };
     } catch (err) {
       const code = (err as { code?: unknown })?.code;
-      facts = code === ErrorCode.AGENT_UNAVAILABLE ? { registered: false, bridged: false } : { registered: true, bridged: false };
+      if (code !== ErrorCode.AGENT_UNAVAILABLE) return { registered: true, bridged: false };
+      facts = { registered: false, bridged: false };
     }
     this.senderFactsCache.set(agentId, { at: Date.now(), facts });
     if (this.senderFactsCache.size > 2000) this.senderFactsCache.delete(this.senderFactsCache.keys().next().value!);
@@ -4013,9 +4019,14 @@ export class AgentMesh {
     // mesh's attested record, read from the registry beside the agent's own
     // answer. Whatever the agent says about it is dropped: an agent does not
     // get to describe its own provenance.
-    const [res, registered] = await Promise.all([
-      this.requestWith(agentId, "describe", {}, { timeout_ms: opts.timeout_ms ?? 15_000 }, { preAdmission: true }),
-      this.getManifest(agentId).catch(() => null),
+    // The registry is asked beside the agent, and never holds the card up for
+    // long: a registry that has not answered half a second after the agent
+    // did leaves the record out.
+    const lookup = this.getManifest(agentId).catch(() => null);
+    const res = await this.requestWith(agentId, "describe", {}, { timeout_ms: opts.timeout_ms ?? 15_000 }, { preAdmission: true });
+    const registered = await Promise.race([
+      lookup,
+      new Promise<null>((ok) => { const t = setTimeout(() => ok(null), 500); (t as { unref?: () => void }).unref?.(); }),
     ]);
     const out = (res.payload as { output?: unknown } | undefined)?.output ?? res.payload;
     if (!out || typeof out !== "object") throw new MeshError(ErrorCode.INVALID_ENVELOPE, `${target} answered describe with no document.`, { retryable: false });
