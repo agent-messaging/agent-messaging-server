@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.58.2 (2026-10-13)
+
+- On an AMQP mesh, `register()` resolves once the agent's inbox is in place:
+  the consumer on its mailbox queue (`MESH_INBOX_<agent>`) attached, or, when
+  there is no mailbox (a sandbox agent), the live subscription on its inbox
+  subject bound. Before, it resolved as soon as the registry answered, and a
+  request sent at that moment could sit in the mailbox with nobody reading it
+  until the next mailbox pass a minute later, and time out. A server from
+  release 0.1.2 makes the mailbox before it answers a registration, so the
+  consumer attaches at once. Nothing changes on a NATS mesh.
+
 ## 0.58.1 (2026-10-13)
 
 - The default addresses can be set from the environment. When a caller gives

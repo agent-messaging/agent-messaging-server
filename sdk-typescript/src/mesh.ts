@@ -1171,7 +1171,15 @@ export class AgentMesh {
     // credential can't reach the JetStream API. Re-run on every reconnect and
     // on an interval thereafter, because a single bounded pass leaves the tail
     // unacked and replayed on the next restart (see startOfflineDrain).
-    this.startOfflineDrain();
+    const firstPass = this.startOfflineDrain();
+    // On the RabbitMQ binding nothing keeps a message on the inbox subject but
+    // a queue bound to it, so register() resolves only once the inbox is in
+    // place: the mailbox consumer attached, or, with no mailbox, the live
+    // subscription bound. A caller that is sent a request the moment this
+    // returns then has it handed over at once (binding document §6.1). On
+    // NATS the mailbox stream captures the subject, and the pass (which may be
+    // draining a backlog) is not waited for.
+    if (this.conn.binding === "amqp") await this.amqpInboxReady(firstPass);
     // Node-hosted agents don't heartbeat individually — one heartbeat from the
     // node covers all its agents (§9.6); MeshNode owns that loop. Same split for
     // vouch renewal: the node re-vouches every agent it holds (§4.4), so a
@@ -5146,13 +5154,12 @@ export class AgentMesh {
    * DEFAULT_MAILBOX_DRAIN_INTERVAL_MS for why that bound is the dedup memory's
    * size and why 60s clears it by two orders of magnitude.
    */
-  private startOfflineDrain(): void {
+  private startOfflineDrain(): Promise<void> {
     if (this.offlineDrainActive) {
       // A second register() on an agent that is already draining. The triggers
       // are already armed; just take a pass now (the in-flight guard makes that
       // a no-op if one is running).
-      void this.drainMailboxOnce();
-      return;
+      return this.drainMailboxOnce();
     }
     this.offlineDrainActive = true;
     // Unref'd: a housekeeping loop must never be the reason a script hangs.
@@ -5169,7 +5176,22 @@ export class AgentMesh {
         if (this.offlineDrainActive && !this.isClosed) void this.drainMailboxOnce();
       });
     }
-    void this.drainMailboxOnce();
+    return this.drainMailboxOnce();
+  }
+
+  /**
+   * On an AMQP mesh: wait until this agent's inbox is in place. `firstPass` is
+   * the mailbox pass register() started, which attaches the consumer when the
+   * registry has made the mailbox (it answers a registration once it has).
+   * Then everything asked of the connection so far is waited for, which binds
+   * the live subscription when there is no mailbox (a sandbox agent, or a
+   * mailbox the registry could not make in time). Neither ever throws: an
+   * inbox that could not be set up now is set up by the next pass, as before.
+   */
+  private async amqpInboxReady(firstPass: Promise<void>): Promise<void> {
+    await firstPass.catch(() => undefined);
+    const conn = this.conn as unknown as { flush?: () => Promise<void> };
+    if (typeof conn.flush === "function") await conn.flush().catch(() => undefined);
   }
 
   /** §16.4 offline delivery, receiving half: bind a durable consumer on the
