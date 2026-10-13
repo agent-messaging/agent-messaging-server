@@ -161,7 +161,7 @@ describe("the SDK's side (sdk-typescript/src/outside-proof.ts)", () => {
     // The door's address is https://api.test/; the fake fetch hands each request to the door.
     const fetchImpl = (async (url: string, init: { body: string; headers?: Record<string, string> }) => {
       const body = JSON.parse(init.body);
-      const out = url.endsWith("/v1/bootstrap") ? await r.doors.bootstrap(body) : await r.doors.nodeCredential(body, "1.2.3.4", () => ({}));
+      const out = url.endsWith("/v1/bootstrap") ? await r.doors.bootstrap(body) : await r.doors.nodeCredential(body, "192.0.2.1", () => ({}));
       return { ok: out.status < 300, status: out.status, json: async () => out.body };
     }) as unknown as typeof fetch;
     const dpop = await generateDpopKey();
@@ -266,11 +266,11 @@ describe("renewal of an agent that enrolled with an outside proof", () => {
     const r = await rig();
     const agent = nkeys.createUser();
     expect((await r.doors.bootstrap({ agent_id: agent.getPublicKey(), proof: { kind: "oauth", token: await tok("buyer") } })).status).toBe(200);
-    const bare = await r.doors.nodeCredential(renewal(agent), "1.2.3.4", () => ({}));
+    const bare = await r.doors.nodeCredential(renewal(agent), "192.0.2.1", () => ({}));
     expect(bare).toMatchObject({ status: 401, body: { code: "fresh_proof_required" } });
-    const other = await r.doors.nodeCredential(renewal(agent, { proof: { kind: "oauth", token: await tok("someone-else") } }), "1.2.3.4", () => ({}));
+    const other = await r.doors.nodeCredential(renewal(agent, { proof: { kind: "oauth", token: await tok("someone-else") } }), "192.0.2.1", () => ({}));
     expect(other).toMatchObject({ status: 401, body: { code: "fresh_proof_mismatch" } });
-    const fresh = await r.doors.nodeCredential(renewal(agent, { proof: { kind: "oauth", token: await tok("buyer") } }), "1.2.3.4", () => ({}));
+    const fresh = await r.doors.nodeCredential(renewal(agent, { proof: { kind: "oauth", token: await tok("buyer") } }), "192.0.2.1", () => ({}));
     expect(fresh).toMatchObject({ status: 200, body: { ok: true, agents: [agent.getPublicKey()] } });
   });
 
@@ -279,7 +279,7 @@ describe("renewal of an agent that enrolled with an outside proof", () => {
     const agent = nkeys.createUser();
     await r.doors.bootstrap({ agent_id: agent.getPublicKey(), proof: { kind: "oauth", token: await tok("buyer") } });
     await r.trust.remove("acme", "o1");
-    const out = await r.doors.nodeCredential(renewal(agent, { proof: { kind: "oauth", token: await tok("buyer") } }), "1.2.3.4", () => ({}));
+    const out = await r.doors.nodeCredential(renewal(agent, { proof: { kind: "oauth", token: await tok("buyer") } }), "192.0.2.1", () => ({}));
     expect(out).toMatchObject({ status: 401, body: { code: "proof_issuer_untrusted" } });
   });
 
@@ -287,7 +287,7 @@ describe("renewal of an agent that enrolled with an outside proof", () => {
     const r = await rig();
     const agent = nkeys.createUser();
     await r.owners.putAgent({ key: agent.getPublicKey(), account: "acme", org: null, home_org: null, person: "acme", category: "account", listed: true, label: null, custody: null, payer: "acme", updated_at: "x" });
-    const out = await r.doors.nodeCredential(renewal(agent), "1.2.3.4", () => ({}));
+    const out = await r.doors.nodeCredential(renewal(agent), "192.0.2.1", () => ({}));
     expect(out.status).toBe(200);
   });
 });
