@@ -9,7 +9,8 @@ name: Nightly proof
 #   Kubernetes  the manifest applied to a throwaway kind cluster; the same
 #               enrollment, conformance, c20 and examples, except example 03,
 #               which runs its A2A agent in the gateway's Compose network
-# The stages are tools/nightly.sh. A failure opens one issue, "Nightly proof
+# The stages are tools/nightly.sh; each runs even when an earlier one failed,
+# as long as its mesh came up. A failure opens one issue, "Nightly proof
 # failing", or comments on it when it is already open; the next green run
 # closes it. Nobody is emailed.
 on:
@@ -54,10 +55,12 @@ jobs:
           (cd examples && npm ci --no-audit --no-fund)
 
       - name: Build the images
+        id: build
         run: docker compose build
 
       # ---- Compose -----------------------------------------------------------
       - name: "Compose: up from empty"
+        id: compose
         run: |
           docker compose down -v --remove-orphans
           docker compose up -d --wait --wait-timeout 300
@@ -68,15 +71,19 @@ jobs:
           tools/nightly.sh compose "$BROKER" status
 
       - name: "Compose: enroll an agent"
+        if: ${{ !cancelled() && steps.compose.outcome == 'success' }}
         run: tools/nightly.sh compose "$BROKER" enroll
 
       - name: "Compose: core conformance profile"
+        if: ${{ !cancelled() && steps.compose.outcome == 'success' }}
         run: tools/nightly.sh compose "$BROKER" conformance
 
       - name: "Compose: live revocation (c20)"
+        if: ${{ !cancelled() && steps.compose.outcome == 'success' }}
         run: tools/nightly.sh compose "$BROKER" revocation
 
       - name: "Compose: the examples"
+        if: ${{ !cancelled() && steps.compose.outcome == 'success' }}
         run: tools/nightly.sh compose "$BROKER" examples
 
       - name: "Compose: logs, on failure"
@@ -92,6 +99,7 @@ jobs:
       # uses, so the addresses first-run puts in every credential (localhost
       # 3005, 4222, 4443, 5672, 8090, the manifests' defaults) reach it.
       - name: "Kubernetes: the cluster's settings"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           cat > "$RUNNER_TEMP/kind.yaml" <<'EOF'
           kind: Cluster
@@ -107,11 +115,14 @@ jobs:
           EOF
 
       - uses: helm/kind-action@v1
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         with:
           cluster_name: mesh
           config: ${{ runner.temp }}/kind.yaml
 
       - name: "Kubernetes: apply the manifest from empty"
+        id: kube
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           kind load docker-image agent-messaging-server:local agent-messaging-a2a-gateway:local --name mesh
           sed -e 's#ghcr.io/jeffrschneider/agent-messaging-server:[0-9.]*#agent-messaging-server:local#' \
@@ -144,19 +155,23 @@ jobs:
           tools/nightly.sh kubernetes "$BROKER" status
 
       - name: "Kubernetes: enroll an agent"
+        if: ${{ !cancelled() && steps.kube.outcome == 'success' }}
         run: tools/nightly.sh kubernetes "$BROKER" enroll
 
       - name: "Kubernetes: core conformance profile"
+        if: ${{ !cancelled() && steps.kube.outcome == 'success' }}
         run: tools/nightly.sh kubernetes "$BROKER" conformance
 
       - name: "Kubernetes: live revocation (c20)"
+        if: ${{ !cancelled() && steps.kube.outcome == 'success' }}
         run: tools/nightly.sh kubernetes "$BROKER" revocation
 
       - name: "Kubernetes: the examples"
+        if: ${{ !cancelled() && steps.kube.outcome == 'success' }}
         run: tools/nightly.sh kubernetes "$BROKER" examples
 
       - name: "Kubernetes: logs, on failure"
-        if: failure()
+        if: ${{ failure() && steps.kube.outcome != 'skipped' }}
         run: |
           kubectl -n "$MESH_KUBE_NAMESPACE" get pods -o wide || true
           for d in job/first-run deploy/server deploy/a2a-gateway "statefulset/$BROKER"; do echo "---- $d"; kubectl -n "$MESH_KUBE_NAMESPACE" logs "$d" --all-containers --tail 120 || true; done
