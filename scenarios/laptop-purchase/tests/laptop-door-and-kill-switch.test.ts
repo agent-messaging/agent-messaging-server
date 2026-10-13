@@ -92,15 +92,19 @@ describe("the kill switch", () => {
     expect([200, 201, 202]).toContain(r.status);
     await sleep(3000);
 
-    // The revoked agent is cut off: a request to it is held in its mailbox
-    // on the mesh rather than answered, and the caller is told so.
-    await expect(s.approver.orderStatus(first.order_id!, 3000)).rejects.toThrow(/queued|revoked|timed? ?out/i);
+    // The operator's revoke is a pause (SPEC §4.12): the agent is cut off, a
+    // request to it waits in its mailbox, and the caller is told it is paused
+    // (server 0.2.1, SDK 0.61.1: REQUEST_QUEUED with details.paused).
+    await expect(s.approver.orderStatus(first.order_id!, 3000)).rejects.toMatchObject({
+      code: "REQUEST_QUEUED",
+      details: { paused: true, reason: "agent_paused" },
+    });
 
     const ordersBefore = s.backend.orders.size;
     const again = await s.requester.getQuote(s.ids.pricing.id, s.cfg.requirements);
     const second = await s.requester.approval(again.output.quote!, s.cfg.requirements, 60_000);
     expect(second).toMatchObject({ decision: "approved", ordered: false });
-    expect(second.order_error).toMatch(/queued|revoked|timed? ?out/i);
+    expect(second.order_error).toMatch(/is paused/i);
     expect(s.backend.orders.size).toBe(ordersBefore);
 
     // And the revoked credential cannot come back on.
