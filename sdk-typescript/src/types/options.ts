@@ -147,6 +147,11 @@ export interface ConnectOptions {
     /** Where the fresh credential goes. Called before the SDK adopts it, so a
      *  throw here is reported as a renewal failure and retried. */
     onRenewed?: (c: { jwt: string; node_id: string; agents: string[]; expires_at: string | null }) => void | Promise<void>;
+    /** For an agent that enrolled with an outside proof (Agent Messaging 0.8,
+     *  §4.14): a fresh proof of the same identity for each renewal, such as a
+     *  new token from the identity provider. The mesh renews such an agent
+     *  only with one. */
+    proof?: import("../outside-proof.js").OutsideProofSource;
   };
   /** Whether inbound sender text is wrapped in a provenance frame, with the
    *  text fenced so it cannot forge that frame, before any `onRequest`,
@@ -387,6 +392,11 @@ export interface RequestConfig {
   accepted_output?: string[];
   context_id?: string;
   meta?: Record<string, unknown>;
+  /** Evidence that this request acts for a person (Agent Messaging 0.8,
+   *  §4.16): a token-exchange token, an ID-JAG, a transaction token, a CIBA
+   *  approval or a PACT delegation, with its issuer. Carried in
+   *  `meta.on_behalf_of`; the receiver checks it with `verifyOnBehalfOf`. */
+  on_behalf_of?: import("../on-behalf-of.js").OnBehalfOf;
   /** Override the §8.9 seal decision for this one request.
    *
    *  Left alone, the SDK seals when the recipient's manifest asks it to and a

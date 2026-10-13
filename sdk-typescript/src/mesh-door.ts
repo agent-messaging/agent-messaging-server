@@ -60,10 +60,13 @@ export interface MessagesInboxRequests {
 }
 
 export interface ContactsWaitingResult { senders: WaitingSender[] }
-export interface ContactsAdmitInput { sender: string; note?: string }
+/** `sender`: one agent, by name or id. `source` instead: every agent whose
+ *  identity came from one source (EXT-6 0.5.0), `oauth:<issuer>` or
+ *  `spiffe://<trust domain>`. */
+export interface ContactsAdmitInput { sender?: string; source?: string; note?: string }
 export interface ContactsAdmitResult { name: string; released: number }
 export type ContactsAdmitRefusal = "NOT_WAITING" | "INPUT_INVALID" | "NOT_RUNNING";
-export interface ContactsBlockInput { sender: string; note?: string }
+export interface ContactsBlockInput { sender?: string; source?: string; note?: string }
 export interface ContactsBlockResult { name: string; dropped: number }
 export type ContactsBlockRefusal = "NOT_WAITING" | "INPUT_INVALID" | "NOT_RUNNING";
 /** `mesh.contacts`: knocking, presence, and the agent's own door. */
@@ -304,6 +307,12 @@ export class ContactsDoor implements ContactsRequests, ContactsAdmissionRequests
   async admit(input: ContactsAdmitInput): Promise<ContactsAdmitResult> {
     const no = refusal<ContactsAdmitRefusal>("contacts.admit");
     const gate = this.gate("contacts.admit");
+    const source = str(input?.source);
+    if (source) {
+      try { gate.setSourceStance(source, "allow", str(input?.note) || undefined); } catch (e) { return no("INPUT_INVALID", (e as Error).message); }
+      await this.ctx.syncRoster();
+      return { name: source, released: 0 };
+    }
     const sender = str(input?.sender);
     if (!sender) no("INPUT_INVALID", "Say who: their name as waiting() gave it, or an agent id.");
     const id = gate.resolve(sender);
@@ -319,6 +328,12 @@ export class ContactsDoor implements ContactsRequests, ContactsAdmissionRequests
   async block(input: ContactsBlockInput): Promise<ContactsBlockResult> {
     const no = refusal<ContactsBlockRefusal>("contacts.block");
     const gate = this.gate("contacts.block");
+    const source = str(input?.source);
+    if (source) {
+      try { gate.setSourceStance(source, "block", str(input?.note) || undefined); } catch (e) { return no("INPUT_INVALID", (e as Error).message); }
+      await this.ctx.syncRoster();
+      return { name: source, dropped: 0 };
+    }
     const sender = str(input?.sender);
     if (!sender) no("INPUT_INVALID", "Say who: their name as waiting() gave it, or an agent id.");
     const id = gate.resolve(sender);

@@ -33,6 +33,11 @@
  *
  *   GET    /admin/v1/audit?agent=&tenant=&limit=&verify=1
  *
+ *   GET    /admin/v1/trust, GET|POST /admin/v1/tenants/:id/trust,
+ *   DELETE /admin/v1/tenants/:id/trust/:trustId, GET /admin/v1/agents/:key/identity
+ *                                                the identity systems a tenant trusts and
+ *                                                where an agent's identity came from (admin-trust.ts)
+ *
  * And the read routes in admin-reads.ts and the operator views in
  * admin-views.ts (step 10a): what the core holds, for
  * its operator and for a platform running beside it.
@@ -80,6 +85,7 @@ import type { AdminCredentials } from "./admin-credentials.js";
 import type { AdminKeychain } from "./admin-keychain.js";
 import type { AdminUsage } from "./admin-usage.js";
 import type { AdminStreams } from "./admin-streams.js";
+import type { AdminTrust } from "./admin-trust.js";
 
 const NKEY = /^U[A-Z2-7]{55}$/;
 const TENANT_ID = /^[A-Za-z0-9][A-Za-z0-9_.=-]{0,127}$/;
@@ -145,6 +151,8 @@ export interface AdminDeps {
   usageRoutes?: AdminUsage;
   /** The event streams by sequence, and the core scheduler's run records (admin-streams.ts). */
   streamRoutes?: AdminStreams;
+  /** The trust records and identity sources (admin-trust.ts). */
+  trustRoutes?: AdminTrust;
   now?: () => number;
 }
 
@@ -175,7 +183,7 @@ function credView(c: TrackedCred): Record<string, unknown> {
 }
 
 function agentView(r: AgentOwnerRecord): Record<string, unknown> {
-  return { key: r.key, tenant: r.account, org: r.org, label: r.label, listed: r.listed, category: r.category, updated_at: r.updated_at };
+  return { key: r.key, tenant: r.account, account: r.account, org: r.org, label: r.label, listed: r.listed, category: r.category, updated_at: r.updated_at };
 }
 
 export function adminApi(deps: AdminDeps) {
@@ -722,7 +730,8 @@ export function adminApi(deps: AdminDeps) {
         ?? (deps.credentialRoutes ? await deps.credentialRoutes.handle(req) : null)
         ?? (deps.keychainRoutes ? await deps.keychainRoutes.handle(req) : null)
         ?? (deps.usageRoutes ? await deps.usageRoutes.handle(req) : null)
-        ?? (deps.streamRoutes ? await deps.streamRoutes.handle(req) : null);
+        ?? (deps.streamRoutes ? await deps.streamRoutes.handle(req) : null)
+        ?? (deps.trustRoutes ? await deps.trustRoutes.handle(req) : null);
       if (read) return read;
 
       if (seg[0] === "tenants") {

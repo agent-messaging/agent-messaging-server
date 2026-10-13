@@ -102,11 +102,22 @@ services:
         required: false
     environment:
       MESH_AMQP_URL: amqp://rabbitmq:5672/mesh
+      # Bring your own identity (SPEC §4.14 to §4.16): the bridge fronts the
+      # capabilities answer names, the other address this host reaches the
+      # server at, and MESH_TRUST_ALLOW_HTTP=on only for a test issuer over http.
+      MESH_BRIDGE_HTTPS_URL: ${GATEWAY_PUBLIC_URL:-http://localhost:${GATEWAY_PORT:-8090}}/v1/bridge/tools
+      MESH_BRIDGE_MCP_URL: ${GATEWAY_PUBLIC_URL:-http://localhost:${GATEWAY_PORT:-8090}}/mcp
+      MESH_PUBLIC_ORIGINS: http://127.0.0.1:${SERVER_PORT:-3005}
+      MESH_TRUST_ALLOW_HTTP: ${MESH_TRUST_ALLOW_HTTP:-off}
       MESH_RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
       MESH_POSTGRES_URL: postgres://mesh@postgres:5432/mesh
       # RabbitMQ is another container, so the check listens on the Compose
       # network. It is not published on the host.
       MESH_BROKER_AUTH_HOST: 0.0.0.0
+    # The host machine, as issuer.test, for a test issuer the identity tests
+    # and example 08 run on it (Docker's host-gateway).
+    extra_hosts:
+      - "issuer.test:host-gateway"
     volumes:
       - config:/config
     ports:
@@ -132,6 +143,8 @@ services:
       PUBLIC_BASE_URL: ${GATEWAY_PUBLIC_URL:-http://localhost:${GATEWAY_PORT:-8090}}
       # key=label pairs for A2A callers; with none, every inbound call is refused.
       API_KEYS: ${GATEWAY_API_KEYS:-}
+      # Where outside proofs (OAuth tokens, SPIFFE JWT-SVIDs) are checked: the server's doors.
+      CORE_API_URL: http://server:3005
       ATTACH: ${GATEWAY_ATTACH:-}
     volumes:
       - config:/config:ro

@@ -63,6 +63,32 @@ export function coreCapabilities(env: NodeJS.ProcessEnv = process.env): Capabili
     naming: false,
     services: Object.fromEntries(Object.entries(CORE_REQUESTS).map(([s, reqs]) => [s, [...reqs]])),
     ...(release ? { server: release } : {}),
+    identity: identityCapabilities(env),
+  };
+}
+
+/** What a mesh home is: its public address, as the doors and the proofs name it. */
+export function meshHome(env: NodeJS.ProcessEnv = process.env): string {
+  return (env.MESH_PUBLIC_URL ?? env.API_BASE_URL ?? `http://localhost:${env.MESH_API_PORT ?? 3005}`).trim().replace(/\/$/, "");
+}
+
+/**
+ * The bring-your-own-identity parts this server offers (SPEC §1.6, all
+ * deployment-defined): the outside proofs its enrollment door takes (§4.14),
+ * the fronts of the identity bridge beside it when one is named
+ * (MESH_BRIDGE_HTTPS_URL, MESH_BRIDGE_MCP_URL; §4.15), admission by source
+ * (EXT-6 0.5.0), and where stop signals are pushed (§4.12, RFC 8935). A mesh
+ * with no trust records offers the same and enrolls nobody this way.
+ */
+export function identityCapabilities(env: NodeJS.ProcessEnv = process.env): Record<string, unknown> {
+  const home = meshHome(env);
+  const https = env.MESH_BRIDGE_HTTPS_URL?.trim();
+  const mcp = env.MESH_BRIDGE_MCP_URL?.trim();
+  return {
+    enroll: ["oauth", "jwt-svid", ...(Number(env.MESH_MTLS_PORT ?? 0) > 0 || env.MESH_CLIENT_CERT_HEADER ? ["x509-svid"] : [])],
+    ...(https || mcp ? { bridge: { ...(https ? { https } : {}), ...(mcp ? { mcp } : {}) } } : {}),
+    admission_by_source: true,
+    stop_signals: { push: `${home}/v1/signals/{tenant}`, audience: (env.MESH_SIGNALS_AUDIENCE ?? home).trim() },
   };
 }
 

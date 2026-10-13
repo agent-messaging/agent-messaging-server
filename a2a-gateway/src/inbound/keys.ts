@@ -32,6 +32,11 @@ export interface ApiKeyRecord {
   prefix: string;
   createdAt: string;
   revokedAt: string | null;
+  /** "sandbox": a key for a public sandbox, which expires (SPEC §4.15 caller
+   *  kind `sandbox`). Absent: an ordinary key, which does not. */
+  kind?: "sandbox";
+  /** When a sandbox key stops working, ISO-8601. */
+  expiresAt?: string | null;
 }
 
 /** What listings and API responses carry: no hash — a hash is not a secret,
@@ -72,9 +77,10 @@ export class FileKeyStore {
   }
 
   /** Mint a key. The ONLY place the raw key ever exists is this return value. */
-  async mint(fields: { accountId?: string | null; label?: string }): Promise<{ record: ApiKeyRecord; rawKey: string }> {
+  async mint(fields: { accountId?: string | null; label?: string; sandboxDays?: number }): Promise<{ record: ApiKeyRecord; rawKey: string }> {
     await this.load();
-    const rawKey = `amk_${randomBytes(KEY_BYTES).toString("hex")}`;
+    const sandbox = typeof fields.sandboxDays === "number" && fields.sandboxDays > 0;
+    const rawKey = `${sandbox ? "sbx_" : "amk_"}${randomBytes(KEY_BYTES).toString("hex")}`;
     const record: ApiKeyRecord = {
       id: randomUUID(),
       accountId: fields.accountId ?? null,
@@ -83,6 +89,7 @@ export class FileKeyStore {
       prefix: rawKey.slice(0, PREFIX_LEN),
       createdAt: new Date().toISOString(),
       revokedAt: null,
+      ...(sandbox ? { kind: "sandbox" as const, expiresAt: new Date(Date.now() + fields.sandboxDays! * 86_400_000).toISOString() } : {}),
     };
     this.records.set(record.id, record);
     this.byHash.set(record.sha256, record);
@@ -92,8 +99,11 @@ export class FileKeyStore {
 
   /** The record a presented raw key stands for, or null. Synchronous on
    *  purpose: admission runs on every request and the index is in memory. */
-  verify(rawKey: string): ApiKeyRecord | null {
-    return this.byHash.get(hash(rawKey)) ?? null;
+  verify(rawKey: string, now = Date.now()): ApiKeyRecord | null {
+    const rec = this.byHash.get(hash(rawKey)) ?? null;
+    // A sandbox key that has expired is a key that no longer exists.
+    if (rec?.expiresAt && Date.parse(rec.expiresAt) <= now) return null;
+    return rec;
   }
 
   /** True when at least one live key exists — feeds the bridge's "are keys

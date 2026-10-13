@@ -1,6 +1,6 @@
 # Examples
 
-Six examples, each a working program that runs on either broker with the
+Eight examples, each a working program that runs on either broker with the
 same code:
 
 | | |
@@ -11,6 +11,8 @@ same code:
 | [04-kill-switch](04-kill-switch) | Revoke an agent and watch it get cut off live. |
 | [05-room](05-room) | Three agents share files and work on one task in a room. |
 | [06-knock-and-admit](06-knock-and-admit) | An agent keeps a door: a stranger reads its card, knocks and is let in; a blocked agent is stopped on the mesh. |
+| [07-spiffe-jwt-svid](07-spiffe-jwt-svid) | An agent enrolls with the JWT-SVID SPIRE gave it, in place of an enrollment key, and the mesh records where its identity came from. |
+| [08-oauth-native-and-bridged](08-oauth-native-and-bridged) | One identity provider, two ways in: an agent enrolls with a DPoP-bound token, and an assistant with no mesh key uses every tool of the bridge's MCP front. |
 
 ## Running them
 
@@ -23,6 +25,12 @@ npm ci
 node run.mjs nats            # or: node run.mjs rabbitmq
 node run.mjs nats 01 04      # only some of them
 ```
+
+Example 07 starts a SPIRE server of its own with Docker. Example 08 runs an
+OAuth issuer over http on this machine, which the server reaches at
+issuer.test: start the mesh with `MESH_TRUST_ALLOW_HTTP=on docker
+compose up -d` for it, or it is skipped. A real identity provider is https and
+needs no such setting.
 
 `run.mjs` copies the admin token out of the Compose volume into `.state/` (it
 never prints it), runs each example and says which passed. Each example makes

@@ -54,6 +54,11 @@ export const KEYED_STORES = {
   mesh_cred_renewal_watch: { history: 1 },
   mesh_agent_key_revocations: { history: 1 },
   mesh_agent_status: { history: 1 },
+  // Bring your own identity: the identity systems each tenant trusts, where
+  // each agent's identity came from, and which agent holds each outside identity.
+  mesh_trust_anchors: { history: 1 },
+  mesh_identity_sources: { history: 1 },
+  mesh_workload_ids: { history: 1 },
   // Tasks.
   mesh_tasks: { history: 10, ttlMs: 7 * DAY_MS },
   // Rooms: records, the work board and notes.

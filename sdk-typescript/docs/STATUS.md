@@ -1,6 +1,6 @@
 # TypeScript SDK status
 
-Status as of 2026-10-13, version 0.60.0.
+Status as of 2026-10-13, version 0.61.0.
 
 ## What it covers
 

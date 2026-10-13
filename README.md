@@ -29,6 +29,15 @@ sponsored by [AgentMesh](https://agentmesh.ai).
   broker cuts its connections within seconds, without a restart.
 - **An A2A gateway**, so an existing A2A agent joins the mesh unchanged and a
   mesh agent can be called from any A2A client.
+- **Bring your own identity.** An agent whose company already gives it an
+  identity (an OAuth token from Entra, Okta, Auth0 or any OpenID provider, or
+  a SPIFFE identity from SPIRE) can enroll with it instead of an enrollment
+  key, then signs with its own key as any agent does. An agent that holds no
+  mesh key reaches the mesh through the gateway's identity bridge, over A2A,
+  HTTPS or MCP, with its token. The mesh records where each agent's identity
+  came from, an agent's door can admit by that source, and the identity
+  provider can stop an agent with a Shared Signals event. All of it is off
+  until the operator trusts an identity system for a tenant.
 - **A headless admin API and a command line, `mesh-admin`,** for tenants,
   agents, credentials, admission policy, limits and the audit log. The server
   manages agents, not people: who may hold an admin token is your identity
@@ -48,9 +57,12 @@ tasks, rooms and files. Each one works on either broker.
 | | `exchangeBootstrapToken(url, key, publicKey)` | Trades a one-time enrollment key from the operator for a connection credential. | §4.8, §18.10 |
 | | `AgentMesh.connect(servers, options)` | Connects the agent, and renews its credential before it lapses. | §4.8, §18 |
 | | `mesh.identity.me()` | Says who this agent is on this server. | §4.3 |
-| | `mesh.capabilities()` | Says what this server offers: its profile, its broker, and its requests. | §1.6 |
+| | `mesh.capabilities()` | Says what this server offers: its profile, its broker, its requests, and the identity parts it offers. | §1.6 |
+| | `exchangeOutsideProof(url, publicKey, proof)` | Enrolls with an identity the company already gave the agent: an OAuth token (DPoP-bound when `dpopKey` is given) or a SPIFFE JWT-SVID, in place of an enrollment key. | §4.14 |
+| | `generateDpopKey()`, `createDpopProof(...)` | Makes the key a bound token names, and the proof for one request. | §4.14, RFC 9449 |
+| | `AgentMesh.connect(..., { credentialRenewal: { proof } })` | Renews a credential enrolled that way, with a fresh proof each time. | §4.8, §4.14 |
 | **Finding agents** | `mesh.register({ name, offerings })` | Says "I exist" and what the agent offers. | `register`, §6.2 |
-| | `mesh.discover(query)` | Finds agents by what they offer, or by whether they are online. | `discover`, §6.3 |
+| | `mesh.discover(query)` | Finds agents by what they offer, by whether they are online, or by where their identity came from (`identity_source`). | `discover`, §6.3, §9.7 |
 | | `mesh.getManifest(agentId)` | Reads one agent's manifest. | §8, §9 |
 | | `mesh.registry.list()` | Lists the agents this agent can see. | §9 |
 | | `mesh.deregister()` | Takes the agent off the registry. | §9 |
@@ -62,12 +74,14 @@ tasks, rooms and files. Each one works on either broker.
 | | `mesh.admission.start(options)` | Gives the agent a door: a signed roster, a waiting list for senders it does not know, and an inbox. A stranger's message is held until the agent lets it in. | EXT-6 §7 |
 | | `mesh.contacts.waiting()` | Lists who is waiting at the door: who knocked, and who sent a message that is held. | EXT-6 §9 |
 | | `mesh.contacts.admit({ sender })`, `mesh.contacts.block({ sender })` | Lets a sender in, which moves what it sent into the inbox, or keeps it out. | EXT-6 §5 |
+| | `mesh.contacts.admit({ source })`, `admission.start({ bridged })` | Lets in, or keeps out, every agent whose identity came from one source (`oauth:<issuer>`, `spiffe://<trust domain>`), and decides what bridged senders get. | EXT-6 0.5.0 |
 | | `mesh.register({ guarded: true, ... })` | Puts the agent's inbox behind the server's admission service, which drops what the roster blocks before it is delivered. | EXT-6 §7 |
 | **Inbox messaging** | `mesh.request(agentId, offering, input)` | Asks an agent something and waits for the answer. A request to an agent that is away waits in its mailbox. | `request`, §6.4 |
 | | `mesh.requestStream(...)` | The same, with the answer streamed back in parts. | §11.3 |
 | | `mesh.onRequest(offering, handler)` | Answers requests for one offering. `onStreamRequest` streams the answer, and `onDefault` takes everything else. | `respond`, §6.5 |
 | | `mesh.messages.send({ to, text })` | Sends a plain text message to an agent's `chat` offering. If the agent is busy or away, the mailbox holds it and any reply comes later. | §6.4, §16.4 |
 | | `mesh.messages.inbox()`, `.reply({ inbox_id, text })`, `.dismiss({ inbox_ids })` | Reads the inbox an agent with admission keeps, answers a message in it, and clears what is done. | §6.4a, EXT-6 |
+| | `mesh.request(..., { on_behalf_of })`, `verifyOnBehalfOf(envelope, options)` | Carries evidence that a request acts for a person (a token-exchange token, an ID-JAG, a transaction token), and checks it on arrival: verified, refused or unverifiable. | §4.16 |
 | **Tasks** | `mesh.awaitTask(taskId)`, `mesh.getTask(taskId)`, `mesh.onTaskUpdate(fn)` | Follows work that takes longer than one reply. | §7 |
 | | `mesh.cancel(taskId, reason)`, `mesh.failTask(taskId, reason)` | Stops work, from either side, with a reason. | §7.3, §10.8 |
 | | `mesh.reviseBudget(...)` | Changes a task's budget while it runs. | §7.7 |
@@ -82,6 +96,14 @@ tasks, rooms and files. Each one works on either broker.
 | **Files** | `mesh.putArtifact(...)`, `mesh.fetchArtifact(ref)` | Stores a file and reads it back by its reference. | §7.5 |
 | | `mesh.artifactLink(ref)`, `mesh.statArtifact(ref)`, `mesh.removeArtifact(ref)`, `mesh.artifactUsage()` | Makes a signed link for a large file, checks it, removes it, and shows the space used. | §7.5 |
 | **Many agents** | `MeshNode.connect(...)` | Runs many agents on one connection, each with its own key. | §4.2, §4.4 |
+
+An agent that holds no mesh key uses the same verbs through the gateway's
+identity bridge: an MCP server at `/mcp` and HTTPS JSON at
+`/v1/bridge/tools`, with sixteen tools (`whoami`, `find_agents`,
+`describe_agent`, `is_online`, `knock`, `review_knocks`, `send`,
+`check_inbox`, `reply`, `task_status`, `publish`, `follow`, `open_room`,
+`invite_to_room`, `post_to_room`, `read_room`). Its credential goes in the
+HTTP request, never in a tool's arguments.
 
 Every message is signed by the agent that sends it and checked before the
 receiving agent sees it. The operator's side (tenants, enrollment keys,
@@ -154,7 +176,7 @@ down in [docs/rabbitmq-binding.md](docs/rabbitmq-binding.md).
 | `deploy/compose/` | Docker Compose for NATS, and for RabbitMQ with Postgres. |
 | `deploy/kubernetes/` | Kubernetes manifests for both, on one node. |
 | `docs/` | The [operator handbook](docs/operator-handbook.md), the [sizing guide](docs/sizing.md), the RabbitMQ binding, and [changes and releases](docs/releasing.md). |
-| `examples/` | Six examples, each runnable on either broker. |
+| `examples/` | Eight examples, each runnable on either broker. |
 | `tools/` | The conformance runner for a Compose setup, the secret check and the boundary check. |
 
 ## The examples
@@ -171,6 +193,11 @@ down in [docs/rabbitmq-binding.md](docs/rabbitmq-binding.md).
 6. [Knock, admit and block](examples/06-knock-and-admit): an agent keeps a
    door. A stranger reads its card and knocks, is let in, and gets an answer;
    a blocked agent is stopped on the mesh.
+7. [A SPIFFE identity](examples/07-spiffe-jwt-svid): an agent enrolls with the
+   JWT-SVID SPIRE gave it, and the mesh records where its identity came from.
+8. [One identity provider, two ways in](examples/08-oauth-native-and-bridged):
+   an agent enrolls with a DPoP-bound OAuth token, and an assistant with no
+   mesh key uses every tool of the identity bridge's MCP front.
 
 ## Conformance
 
@@ -182,7 +209,15 @@ node tools/conformance.mjs install
 node tools/conformance.mjs nats        # or rabbitmq
 ```
 
-CI runs it against both brokers, from empty, on every change.
+It also offers the `identity` profile's parts (bring your own identity,
+§4.12 to §4.16 and EXT-6 0.5.0), which run with a test issuer on this
+machine, against a mesh started with `MESH_TRUST_ALLOW_HTTP=on`:
+
+```sh
+node tools/identity-profile.mjs nats   # or rabbitmq
+```
+
+CI runs both against both brokers, from empty, on every change.
 
 ## Development
 

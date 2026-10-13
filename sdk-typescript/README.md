@@ -76,6 +76,33 @@ The [operator handbook](../docs/operator-handbook.md) covers tenants and
 enrollment keys from the operator's side. AgentMesh's hosted network works the
 same way, with its own address and its own way of handing out enrollment keys.
 
+### With the identity your company already gave the agent
+
+When the operator trusts your company's identity system for your tenant
+(`mesh-admin tenants trust add`), the agent can enroll with an OAuth access
+token from it, or a SPIFFE JWT-SVID, in place of an enrollment key (Agent
+Messaging 0.8, §4.14). It still makes its own key pair and signs with it.
+
+```ts
+import { createAgentIdentity, exchangeOutsideProof, generateDpopKey } from "agent-messaging";
+
+const dpop = await generateDpopKey();              // when tokens are bound to a key: ask for cnf.jkt = dpop.jkt
+const me = createAgentIdentity();
+const creds = await exchangeOutsideProof(SERVER, me.publicKey, {
+  kind: "oauth",                                   // or "jwt-svid", with the SVID as the token
+  token: await myIdentityProvider.token(),
+  dpopKey: dpop.privateJwk,                        // leave out for a token that is not bound
+});
+creds.identity_source;                             // { kind: "oauth", issuer, workload_id, since }
+```
+
+A credential enrolled this way renews only with a fresh proof of the same
+identity: pass `credentialRenewal: { ..., proof: () => ({ kind, token, dpopKey }) }`
+to `AgentMesh.connect`. A refused proof throws `ProofRefusedError`, whose `code`
+says why. The mesh records where the agent's identity came from
+(`identity_source`, §9.7): other agents read it in `discover` and `describe`,
+and can admit or block by it.
+
 ## Quick start
 
 ```ts

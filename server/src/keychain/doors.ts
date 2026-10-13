@@ -25,6 +25,7 @@
  *
  * Each door answers { status, body } and never throws.
  */
+import { createHash, type X509Certificate } from "node:crypto";
 import { nkeys } from "../sdk.js";
 import { verifyAgentSig } from "../admission/held-store.js";
 import { metrics } from "../shared/ops-events.js";
@@ -47,6 +48,8 @@ import { customerMintSeed } from "./split-keys.js";
 import { mintRefusal, partitionRoster, stopFor, stopsForKeys, type AgentOwnership, type StopFinding } from "./stop-rules.js";
 import type { StopList } from "./stop-store.js";
 import type { TenantLimitList } from "./tenant-limits.js";
+import { identitySourceOf, reasonOf, verifyOutsideProof, type IdentitySource, type ProofDeps, type ProofInput, type VerifiedProof } from "./outside-proof.js";
+import { workloadKey, type IdentitySourceList, type WorkloadBindingList } from "./identity-records.js";
 
 export interface DoorAnswer {
   status: number;
@@ -128,6 +131,24 @@ export interface DoorDeps {
   /** The `mesh` object of SPEC §18.10 for the bootstrap door's answer.
    *  Default: mesh-object.ts from `env`. */
   meshInfo?: () => Record<string, unknown>;
+  /** Outside proofs (SPEC §4.14): enrolling with a proof from an identity
+   *  system a tenant trusts. Absent: the bootstrap door refuses every proof. */
+  proofs?: ProofDeps | null;
+  /** Where each agent's identity came from (identity-records.ts). Absent: not recorded. */
+  identitySources?: IdentitySourceList | null;
+  /** Which agent holds each outside identity (identity-records.ts). */
+  workloads?: WorkloadBindingList | null;
+  /** Sign an identity source as a portable trust attestation (§9.7). Absent
+   *  or null: the record is kept without one. */
+  attest?: (agent: string, source: IdentitySource) => Record<string, unknown> | null;
+}
+
+/** What a door can read from the request itself, beyond its body. */
+export interface DoorRequest {
+  /** The DPoP proof from the `DPoP` header (RFC 9449). */
+  dpop?: string;
+  /** The client certificate chain, leaf first, when the request came over mTLS. */
+  clientCerts?: X509Certificate[];
 }
 
 const NKEY = /^U[A-Z2-7]{55}$/;
@@ -187,8 +208,26 @@ export function credentialDoors(deps: DoorDeps) {
 
   // ── POST /v1/bootstrap ───────────────────────────────────────────────
 
-  async function bootstrap(b: { token?: string; agent_id?: string } | null): Promise<DoorAnswer> {
+  /** The addresses a door may be said to be at, for a DPoP proof's `htu`:
+   *  its public address, and any others this mesh answers on
+   *  (MESH_PUBLIC_ORIGINS, comma-separated origins). */
+  const doorUrls = (path: string): string[] => {
+    const bases = [deps.baseUrl, ...(env.MESH_PUBLIC_ORIGINS ?? "").split(",")].map((x) => x.trim().replace(/\/$/, "")).filter(Boolean);
+    return [...new Set(bases.map((b) => `${b}${path}`))];
+  };
+
+  /** Write where an agent's identity came from, signed when the mesh can sign.
+   *  Best effort for the default enrollment; an outside proof's record is
+   *  written before the door answers. */
+  const recordSource = async (agent: string, tenant: string | null, source: IdentitySource): Promise<void> => {
+    if (!deps.identitySources) return;
+    const attestation = deps.attest ? deps.attest(agent, source) : null;
+    await deps.identitySources.put({ agent, tenant, identity_source: source, ...(attestation ? { attestation } : {}) });
+  };
+
+  async function bootstrap(b: { token?: string; agent_id?: string; proof?: unknown; dpop?: unknown } | null, req: DoorRequest = {}): Promise<DoorAnswer> {
     const reply = (status: number, body: Record<string, unknown>): DoorAnswer => ({ status, body });
+    if (b && b.proof !== undefined && b.token === undefined) return bootstrapWithProof(b, req);
     if (!b?.token || !b?.agent_id) return reply(400, { error: "token and agent_id required" });
     if (!NKEY.test(b.agent_id)) return reply(400, { error: "agent_id must be a user public nkey (U…)" });
     // A customer credential: signed by the customer signing key once the keys
@@ -332,6 +371,9 @@ export function credentialDoors(deps: DoorDeps) {
       org: data.org ?? homeOrg ?? null,
     });
     console.log(`${log} bootstrap: agent ${agentId.slice(0, 12)}… ("${data.label}"${handle ? ` -> ${handle}` : ""}) joined ${accountEmail ?? data.accountId} with durable creds (expires ${minted.expiresAt ?? "never"})`);
+    // Its identity came from this mesh's own enrollment (§9.7 identity_source).
+    await recordSource(agentId, data.accountId, { kind: "mesh", since: new Date().toISOString() })
+      .catch((err) => console.warn(`${log} bootstrap: the identity source of ${agentId.slice(0, 12)}… was not recorded: ${(err as Error).message}`));
     return reply(200, {
       ok: true,
       jwt: minted.jwt,
@@ -348,12 +390,357 @@ export function credentialDoors(deps: DoorDeps) {
     });
   }
 
+  // ── POST /v1/bootstrap with an outside proof (SPEC §4.14) ───────────
+
+  /**
+   * Enroll with a proof from an identity system a tenant trusts, in place of
+   * the operator's one-time key: `{ agent_id, proof: { kind, token }, dpop? }`,
+   * or an X.509-SVID over mTLS with `proof: { kind: "x509-svid" }`. The proof
+   * names its tenant through the trust record that accepts it. Then the same
+   * checks as the one-time key (the tenant's standing, a revoked signing key,
+   * the stop list, a key another tenant holds, the tenant's agent limit), the
+   * same credential, and two records: where the agent's identity came from,
+   * and which agent holds the outside identity now. A second agent key
+   * enrolling with the same outside identity replaces the first, whose key is
+   * revoked (§4.10).
+   */
+  async function bootstrapWithProof(b: { agent_id?: string; proof?: unknown; dpop?: unknown }, req: DoorRequest): Promise<DoorAnswer> {
+    const reply = (status: number, body: Record<string, unknown>): DoorAnswer => ({ status, body });
+    const refused = (status: number, code: string, error: string) => {
+      metrics.event({ kind: "node_credential_refused", actor: b.agent_id ?? "", meta: { door: "bootstrap-proof", reason: code } });
+      return reply(status, { error, code });
+    };
+    if (!deps.proofs) return reply(403, { error: "This mesh accepts no outside proofs. Enroll with an enrollment key from its operator.", code: "proofs_not_offered" });
+    if (!b.agent_id) return reply(400, { error: "agent_id and proof required" });
+    if (!NKEY.test(b.agent_id)) return reply(400, { error: "agent_id must be a user public nkey (U…)" });
+    const proof = b.proof as ProofInput | null;
+    if (!proof || typeof proof !== "object" || typeof proof.kind !== "string") return reply(400, { error: 'proof must be { "kind": "oauth" | "jwt-svid", "token": "…" }, or { "kind": "x509-svid" } over mTLS.' });
+    if (b.dpop !== undefined && typeof b.dpop !== "string") return reply(400, { error: "dpop, when given, must be the DPoP proof JWT." });
+    const seedRead = customerMintSeed(env);
+    if (!seedRead.ok) return reply(seedRead.status, { error: seedRead.error });
+
+    const v = await verifyOutsideProof(proof, {
+      method: "POST",
+      urls: doorUrls("/v1/bootstrap"),
+      ...(typeof b.dpop === "string" ? { dpop: b.dpop } : req.dpop ? { dpop: req.dpop } : {}),
+      ...(req.clientCerts ? { clientCerts: req.clientCerts } : {}),
+    }, deps.proofs);
+    if (!v.ok) {
+      console.log(`${log} bootstrap: an outside proof was refused for ${b.agent_id.slice(0, 12)}…: ${v.code}`);
+      metrics.event({ kind: "node_credential_refused", actor: b.agent_id, meta: { door: "bootstrap-proof", reason: v.code } });
+      return reply(v.status, { error: v.error, code: v.code, details: { reason: reasonOf(v.code) } });
+    }
+    const p = v.proof;
+    const agentId = b.agent_id;
+    const tenant = p.tenant;
+
+    // The tenant's standing: the platform's word when it is here, else the tenant record.
+    let homeOrg: string | null = null;
+    if (deps.platform.enrollCheck) {
+      let c: Awaited<ReturnType<NonNullable<PlatformSteps["enrollCheck"]>>>;
+      try { c = await deps.platform.enrollCheck(tenant, agentId); } catch {
+        return reply(503, { error: "Could not check this account right now, so no credential was issued. Try again shortly." });
+      }
+      if (!c.found) return refused(404, "account_not_found", "The tenant that trusts this proof's issuer was not found.");
+      if (c.disabled) return refused(403, "account_disabled", "This account is disabled.");
+      if (c.capBlocked) return refused(403, "agent_cap", c.capBlocked.error);
+      homeOrg = c.homeOrg ?? null;
+    } else {
+      const t = deps.owners ? await deps.owners.tenant(tenant).catch(() => null) : null;
+      if (!t) return refused(404, "account_not_found", "The tenant that trusts this proof's issuer was not found.");
+      if (t.disabled) return refused(403, "account_disabled", "This account is disabled.");
+      homeOrg = t.home_org;
+    }
+    if (await deps.keyRevocations?.get(agentId).catch(() => null)) {
+      return refused(403, "agent_key_revoked", "This signing key has been revoked. Make a new key pair, then enroll again with it.");
+    }
+    {
+      let found: StopFinding | undefined;
+      try {
+        found = (await stopsFor([agentId])).get(agentId);
+        if (!found) {
+          const active = deps.stops ? await deps.stops.active() : [];
+          const f = active.length ? stopFor(active, { key: agentId, person: tenant, org: orgsOn() ? homeOrg : null }) : null;
+          if (f) found = f;
+        }
+      } catch {
+        return reply(503, { error: "Could not check whether this agent is stopped, so no credential was issued. Try again shortly." });
+      }
+      if (found) {
+        const r = mintRefusal(found, agentId);
+        metrics.event({ kind: "node_credential_refused", actor: agentId, meta: { door: "bootstrap-proof", reason: r.body.code } });
+        return reply(r.status, r.body);
+      }
+    }
+    let holder: Holder | null;
+    try { holder = await holderOf(agentId); } catch {
+      return reply(503, { error: "Could not check who holds this agent right now, so no credential was issued. Try again shortly." });
+    }
+    if (holder && holder.id !== tenant) return refused(409, "held_elsewhere", EXCLUSIVITY_ERROR);
+    {
+      const refusal = await agentLimitRefusal(deps, tenant, agentId).catch(() => "unread" as const);
+      if (refusal === "unread") return reply(503, { error: "Could not check this tenant's agent limit right now, so no credential was issued. Try again shortly." });
+      if (refusal) return reply(403, refusal);
+    }
+    // Which agent holds this outside identity now. Read before the mint, so a
+    // store that cannot be read refuses rather than letting two keys hold one identity.
+    const scope = p.kind === "oauth" ? p.issuer! : "spiffe";
+    const wKey = workloadKey(p.kind === "oauth" ? "oauth" : "spiffe", scope, p.workload_id);
+    let prior: Awaited<ReturnType<WorkloadBindingList["get"]>> = null;
+    if (deps.workloads) {
+      try { prior = await deps.workloads.get(wKey); } catch {
+        return reply(503, { error: "Could not check which agent holds this identity right now, so no credential was issued. Try again shortly." });
+      }
+    }
+
+    const ukp = nkeys.createUser();
+    const minted = await mintNodeCredential({
+      subject: ukp,
+      agentIds: [agentId],
+      mintSeed: seedRead.seed,
+      issuerAccount: env.ROOMS_MINT_ISSUER_ACCOUNT,
+      namePrefix: "agent",
+    });
+    const seed = new TextDecoder().decode(ukp.getSeed());
+    const label = p.workload_id.length > 120 ? `${p.workload_id.slice(0, 117)}...` : p.workload_id; // cut-ok: a display label; the whole id is in the identity source
+
+    let handle: string | null = null;
+    let naming: { name_at: string } | null = null;
+    if (deps.platform.enrolled) {
+      try {
+        const e = await deps.platform.enrolled({ accountId: tenant, agentId, label, deferName: true });
+        if (e.cap) return reply(403, { error: e.cap });
+        handle = e.handle;
+        naming = e.naming;
+      } catch (err) {
+        console.error(`${log} bootstrap: the agent could not be linked to its account: ${(err as Error).message}`);
+        return reply(503, { error: "The agent could not be linked to its account just now. Try again shortly." });
+      }
+    } else if (deps.owners) {
+      const now = new Date().toISOString();
+      const old = await deps.owners.agent(agentId).catch(() => null);
+      await deps.owners.putAgent({
+        key: agentId, account: tenant, org: null, home_org: homeOrg,
+        person: tenant, category: "account", listed: old?.listed ?? true, label,
+        custody: null, payer: tenant, updated_at: now,
+      });
+    }
+    const since = new Date().toISOString();
+    const source = identitySourceOf(p, since);
+    try {
+      await recordSource(agentId, tenant, source);
+      await deps.workloads?.put(wKey, {
+        agent: agentId, tenant, kind: p.kind === "oauth" ? "oauth" : "spiffe", workload_id: p.workload_id,
+        ...(p.issuer ? { issuer: p.issuer } : {}), ...(p.trust_domain ? { trust_domain: p.trust_domain } : {}),
+        since: prior?.agent === agentId ? prior.since : since, updated_at: since,
+      });
+    } catch (err) {
+      console.error(`${log} bootstrap: the identity records for ${agentId.slice(0, 12)}… could not be written: ${(err as Error).message}`);
+      return reply(503, { error: "This enrollment could not be recorded right now, so no credential was issued. Try again shortly." });
+    }
+    // One outside identity, one agent: the key that held it before is revoked (§4.10).
+    if (prior && prior.agent !== agentId) {
+      await revokeAgentKeyAction(prior.agent, `its outside identity ${p.workload_id} enrolled a new key`, "keychain", agentId)
+        .catch((err) => console.error(`${log} bootstrap: the key that held ${p.workload_id} before (${prior!.agent.slice(0, 12)}…) could not be revoked: ${(err as Error).message}`));
+    }
+    await deps.tombstones?.clear(agentId).catch(() => undefined);
+    await deps.mintLog?.recordMint({ key: minted.subject, agents: [agentId], label, expiresAt: minted.expiresAt, door: "bootstrap", account: tenant, org: homeOrg });
+    metrics.event({ kind: "node_credential", actor: agentId, meta: { door: "bootstrap-proof", proof: p.kind, binding: p.binding?.kind ?? "none" } });
+    console.log(`${log} bootstrap: agent ${agentId.slice(0, 12)}… joined ${tenant} with a ${p.kind} proof for ${p.workload_id}${prior && prior.agent !== agentId ? ` (replacing ${prior.agent.slice(0, 12)}…)` : ""}, expires ${minted.expiresAt ?? "never"}`);
+    return reply(200, {
+      ok: true,
+      jwt: minted.jwt,
+      seed,
+      creds: credsFileText(minted.jwt, seed),
+      label,
+      handle,
+      ...(naming ? { naming } : {}),
+      account_email: null,
+      expires_at: minted.expiresAt,
+      renew_url: `${deps.baseUrl.replace(/\/$/, "")}/v1/node-credential`,
+      identity_source: source,
+      ...(prior && prior.agent !== agentId ? { replaced: prior.agent } : {}),
+      mesh: deps.meshInfo ? deps.meshInfo() : meshInfo(env),
+    });
+  }
+
+  // ── POST /v1/bridged-callers (SPEC §4.15) ───────────────────────────
+
+  /**
+   * An identity bridge asks the key chain about a caller that holds no mesh
+   * key: `{ node_id, ts, node_sig, caller_id, caller_sig, proof, binding? }`.
+   * The bridge is a node this mesh names as one (MESH_BRIDGE_NODES); it signs
+   * the request with its node key, and the caller's hosted identity signs too,
+   * so the bridge proves it holds the key it speaks for. The proof is checked
+   * as at enrollment, with the binding the bridge checked on the caller's own
+   * request (its DPoP key's thumbprint, or its certificate's hash) in place of
+   * one this door can check itself.
+   *
+   * A caller that passes belongs to the tenant whose trust record accepted its
+   * proof: the hosted identity is recorded as that tenant's, unlisted, with an
+   * identity source of kind "bridged". The bridge asks again whenever a token
+   * is new and at least once a minute, so a stop, a revoked key or a removed
+   * trust record reaches a bridged caller within a minute.
+   */
+  async function bridgedCaller(b: {
+    node_id?: string; ts?: number; node_sig?: string; caller_id?: string; caller_sig?: string;
+    proof?: unknown; binding?: { jkt?: unknown; x5t?: unknown }; audiences?: unknown;
+  } | null): Promise<DoorAnswer> {
+    const reply = (status: number, body: Record<string, unknown>): DoorAnswer => ({ status, body });
+    if (!deps.proofs) return reply(403, { error: "This mesh accepts no outside proofs.", code: "proofs_not_offered" });
+    if (!b?.node_id || !b.ts || !b.node_sig || !b.caller_id || !b.caller_sig) return reply(400, { error: "node_id, ts, node_sig, caller_id, caller_sig and proof are required" });
+    if (!NKEY.test(b.node_id) || !NKEY.test(b.caller_id)) return reply(400, { error: "node_id and caller_id must be user public nkeys (U…)" });
+    const bridges = new Set((env.MESH_BRIDGE_NODES ?? "").split(",").map((x) => x.trim()).filter(Boolean));
+    if (!bridges.has(b.node_id)) return reply(403, { error: "This node is not one this mesh names as an identity bridge (MESH_BRIDGE_NODES).", code: "not_a_bridge" });
+    if (Math.abs(Date.now() / 1000 - b.ts) > 600) return reply(401, { error: "stale timestamp, re-sign with the current time" });
+    if (!verifyAgentSig(b.node_id, bridgedCallerStatement(b.ts, b.node_id, b.caller_id), b.node_sig)) return reply(401, { error: "node_sig does not verify against node_id" });
+    if (!verifyAgentSig(b.caller_id, bridgedHostedStatement(b.ts, b.node_id, b.caller_id), b.caller_sig)) return reply(401, { error: "caller_sig does not verify against caller_id" });
+    const proof = b.proof as ProofInput | null;
+    if (!proof || typeof proof !== "object" || (proof.kind !== "oauth" && proof.kind !== "jwt-svid")) return reply(400, { error: 'proof must be { "kind": "oauth" | "jwt-svid", "token": "…" }' });
+    const bound = b.binding && typeof b.binding === "object" ? b.binding : null;
+    const v = await verifyOutsideProof(proof, {
+      method: "POST",
+      urls: [],
+      // The front the caller called (RFC 8707): a token may name it in aud.
+      ...(Array.isArray(b.audiences) ? { extraAudiences: (b.audiences as unknown[]).filter((x): x is string => typeof x === "string" && /^https?:\/\//.test(x)).slice(0, 4) } : {}),
+      ...(bound ? { verifiedBinding: { ...(typeof bound.jkt === "string" ? { jkt: bound.jkt } : {}), ...(typeof bound.x5t === "string" ? { x5t: bound.x5t } : {}) } } : {}),
+    }, deps.proofs);
+    if (!v.ok) return reply(v.status, { error: v.error, code: v.code, details: { reason: reasonOf(v.code) } });
+    const p = v.proof;
+    const caller = b.caller_id;
+    const tenant = p.tenant;
+
+    let homeOrg: string | null = null;
+    if (deps.platform.enrollCheck) {
+      const c = await deps.platform.enrollCheck(tenant, caller).catch(() => null);
+      if (!c) return reply(503, { error: "Could not check this account right now. Try again shortly." });
+      if (!c.found) return reply(404, { error: "The tenant that trusts this proof's issuer was not found.", code: "account_not_found" });
+      if (c.disabled) return reply(403, { error: "This account is disabled.", code: "account_disabled" });
+      homeOrg = c.homeOrg ?? null;
+    } else {
+      const t = deps.owners ? await deps.owners.tenant(tenant).catch(() => null) : null;
+      if (!t) return reply(404, { error: "The tenant that trusts this proof's issuer was not found.", code: "account_not_found" });
+      if (t.disabled) return reply(403, { error: "This account is disabled.", code: "account_disabled" });
+      homeOrg = t.home_org;
+    }
+    if (await deps.keyRevocations?.get(caller).catch(() => null)) return reply(403, { error: "This caller's hosted key has been revoked.", code: "agent_key_revoked" });
+    try {
+      let found = (await stopsFor([caller])).get(caller);
+      if (!found) {
+        const active = deps.stops ? await deps.stops.active() : [];
+        found = active.length ? stopFor(active, { key: caller, person: tenant, org: orgsOn() ? homeOrg : null }) ?? undefined : undefined;
+      }
+      if (found) {
+        const r = mintRefusal(found, caller);
+        return reply(r.status, r.body);
+      }
+    } catch {
+      return reply(503, { error: "Could not check whether this caller is stopped. Try again shortly." });
+    }
+    let holder: Holder | null;
+    try { holder = await holderOf(caller); } catch { return reply(503, { error: "Could not check who holds this caller right now. Try again shortly." }); }
+    if (holder && holder.id !== tenant) return reply(409, { error: EXCLUSIVITY_ERROR, code: "held_elsewhere" });
+
+    const scope = p.kind === "oauth" ? p.issuer! : "spiffe";
+    const callerRef = p.kind === "oauth" ? createHash("sha256").update(`${p.issuer}\n${p.workload_id}`).digest("hex") : p.workload_id;
+    const prior = await deps.identitySources?.get(caller).catch(() => null);
+    const same = prior?.identity_source.kind === "bridged" && prior.identity_source.bridge === b.node_id && prior.identity_source.workload_id === p.workload_id;
+    const source: IdentitySource = same ? prior!.identity_source : identitySourceOf(p, new Date().toISOString(), b.node_id);
+    if (!same) {
+      try {
+        if (!holder) {
+          const label = `bridged ${p.workload_id}`.slice(0, 120); // cut-ok: a display label; the whole id is in the identity source
+          if (deps.platform.enrolled) await deps.platform.enrolled({ accountId: tenant, agentId: caller, label, deferName: true });
+          else if (deps.owners) {
+            await deps.owners.putAgent({
+              key: caller, account: tenant, org: null, home_org: homeOrg, person: tenant, category: "account",
+              listed: false, label, custody: null, payer: tenant, updated_at: new Date().toISOString(),
+            });
+          }
+        }
+        await recordSource(caller, tenant, source);
+        await deps.workloads?.put(workloadKey(p.kind === "oauth" ? "oauth" : "spiffe", `bridged:${scope}`, p.workload_id), {
+          agent: caller, tenant, kind: p.kind === "oauth" ? "oauth" : "spiffe", workload_id: p.workload_id,
+          ...(p.issuer ? { issuer: p.issuer } : {}), ...(p.trust_domain ? { trust_domain: p.trust_domain } : {}),
+          bridge: b.node_id, since: source.since, updated_at: new Date().toISOString(),
+        });
+      } catch (err) {
+        console.error(`${log} bridged-callers: the records for ${caller.slice(0, 12)}… could not be written: ${(err as Error).message}`);
+        return reply(503, { error: "This caller could not be recorded right now. Try again shortly." });
+      }
+      console.log(`${log} bridged-callers: ${b.node_id.slice(0, 12)}… bridges ${caller.slice(0, 12)}… for ${p.workload_id} (tenant ${tenant})`);
+    }
+    return reply(200, {
+      ok: true,
+      tenant,
+      caller_id: caller,
+      caller_kind: p.kind === "oauth" ? "oauth" : "spiffe",
+      caller_ref: callerRef,
+      workload_id: p.workload_id,
+      ...(p.issuer ? { issuer: p.issuer } : {}),
+      ...(p.trust_domain ? { trust_domain: p.trust_domain } : {}),
+      binding: p.binding?.kind ?? null,
+      expires_at: p.expires_at,
+      identity_source: source,
+    });
+  }
+
+  /**
+   * The fresh-proof rule at renewal (SPEC §4.8, §4.14): an agent that enrolled
+   * with an outside proof renews only with a fresh proof of the same identity,
+   * so an agent its company has turned off cannot renew. Answers, for each
+   * agent on the roster, whether it passes; an agent enrolled any other way
+   * passes without one.
+   */
+  async function freshProofCheck(
+    agents: { id?: string; proof?: unknown; dpop?: unknown }[],
+    req: DoorRequest,
+  ): Promise<{ passed: string[]; refused: { id: string; code: string; error: string }[] } | "unread"> {
+    const passed: string[] = [];
+    const out: { id: string; code: string; error: string }[] = [];
+    for (const a of agents) {
+      const id = a.id!;
+      let rec: Awaited<ReturnType<IdentitySourceList["get"]>> = null;
+      if (deps.identitySources) {
+        try { rec = await deps.identitySources.get(id); } catch { return "unread"; }
+      }
+      const kind = rec?.identity_source.kind;
+      if (kind !== "oauth" && kind !== "spiffe" && kind !== "wimse") { passed.push(id); continue; }
+      const proof = a.proof as ProofInput | undefined;
+      if (!proof || typeof proof !== "object" || !deps.proofs) {
+        out.push({ id, code: "fresh_proof_required", error: "This agent enrolled with an outside proof, so it renews only with a fresh proof of the same identity." });
+        continue;
+      }
+      const v = await verifyOutsideProof(proof, {
+        method: "POST",
+        urls: doorUrls("/v1/node-credential"),
+        ...(typeof a.dpop === "string" ? { dpop: a.dpop } : req.dpop && agents.length === 1 ? { dpop: req.dpop } : {}),
+        ...(req.clientCerts ? { clientCerts: req.clientCerts } : {}),
+      }, deps.proofs);
+      if (!v.ok) { out.push({ id, code: v.code, error: v.error }); continue; }
+      if (v.proof.tenant !== rec!.tenant || v.proof.workload_id !== rec!.identity_source.workload_id) {
+        out.push({ id, code: "fresh_proof_mismatch", error: "The fresh proof is for a different identity from the one this agent enrolled with." });
+        continue;
+      }
+      const scope = v.proof.kind === "oauth" ? v.proof.issuer! : "spiffe";
+      const bound = deps.workloads ? await deps.workloads.get(workloadKey(v.proof.kind === "oauth" ? "oauth" : "spiffe", scope, v.proof.workload_id)).catch(() => "unread" as const) : null;
+      if (bound === "unread") return "unread";
+      if (bound && bound.agent !== id) {
+        out.push({ id, code: "identity_moved", error: "This outside identity now belongs to another agent key, so this one does not renew." });
+        continue;
+      }
+      passed.push(id);
+    }
+    return { passed, refused: out };
+  }
+
   // ── POST /v1/node-credential ─────────────────────────────────────────
 
   async function nodeCredential(
-    b: { node_id?: string; ts?: number; node_sig?: string; agents?: { id?: string; sig?: string }[] } | null,
+    b: { node_id?: string; ts?: number; node_sig?: string; agents?: { id?: string; sig?: string; proof?: unknown; dpop?: unknown }[] } | null,
     ip: string,
     meshInfo: () => Record<string, unknown>,
+    req: DoorRequest = {},
   ): Promise<DoorAnswer> {
     const reply = (status: number, body: Record<string, unknown>): DoorAnswer => ({ status, body });
     if (!b?.node_id || !b?.ts || !b?.node_sig || !Array.isArray(b.agents) || b.agents.length === 0) {
@@ -379,6 +766,25 @@ export function credentialDoors(deps: DoorDeps) {
       if (!verifyAgentSig(a.id!, `mesh-node-agent-v1:${b.ts}:${b.node_id}:${a.id}`, a.sig!)) {
         return reply(401, { error: `agent signature does not verify for ${a.id!.slice(0, 12)}…` });
       }
+    }
+
+    // An agent that enrolled with an outside proof renews only with a fresh
+    // one (§4.8, §4.14); it is left off the credential without one.
+    const fresh = await freshProofCheck(b.agents, req);
+    if (fresh === "unread") {
+      return reply(503, { error: "Could not check how these agents enrolled right now, so no credential was issued. Retry; your current credential is unaffected." });
+    }
+    const proofRefused = fresh.refused;
+    if (proofRefused.length) {
+      if (!fresh.passed.length) {
+        const first = proofRefused[0]!;
+        console.log(`${log} node-credential REFUSED for ${b.node_id.slice(0, 12)}…: ${first.code} (${ip})`);
+        metrics.event({ kind: "node_credential_refused", actor: b.node_id, meta: { agents: ids.length, reason: first.code } });
+        return reply(401, { error: first.error, code: first.code, details: { reason: reasonOf(first.code) }, refused: proofRefused.map(({ id, code }) => ({ id, code })) });
+      }
+      const off = new Set(proofRefused.map((r) => r.id));
+      ids.splice(0, ids.length, ...ids.filter((k) => !off.has(k)));
+      console.log(`${log} node-credential: ${b.node_id.slice(0, 12)}… left ${proofRefused.length} agent(s) off for want of a fresh proof (${ip})`);
     }
 
     // The standing question, after proof-of-possession and before the mint:
@@ -529,6 +935,8 @@ export function credentialDoors(deps: DoorDeps) {
       ...(leftOff.some((l) => l.reason === "retired") ? { retired: leftOff.filter((l) => l.reason === "retired").map((l) => l.id) } : {}),
       // Left off because no tenant holds them (above).
       ...(unowned.length ? { unowned } : {}),
+      // Left off because they enrolled with an outside proof and sent no fresh one.
+      ...(proofRefused.length ? { refused: proofRefused.map(({ id, code }) => ({ id, code })) } : {}),
       expires_at: minted.expiresAt,
       mesh: meshInfo(),
     });
@@ -640,7 +1048,7 @@ export function credentialDoors(deps: DoorDeps) {
     return { status: 200, body: { agent_key: key, enrolled: !!holder && !holder.disabled, ...(holder?.disabled ? { account_disabled: true } : {}) } };
   }
 
-  return { bootstrap, nodeCredential, revokeOwnCredential, revokeOwnAgentKey, revokeAgentKeyAction, keyCheck, keyStanding, stopsFor, holderOf };
+  return { bootstrap, bridgedCaller, nodeCredential, revokeOwnCredential, revokeOwnAgentKey, revokeAgentKeyAction, keyCheck, keyStanding, stopsFor, holderOf };
 }
 
 export type CredentialDoors = ReturnType<typeof credentialDoors>;
@@ -668,6 +1076,16 @@ export async function agentLimitRefusal(
     code: "tenant_agent_limit",
     limit: max,
   };
+}
+
+/** What an identity bridge signs with its node key to ask about a caller (§4.15). */
+export function bridgedCallerStatement(ts: number, node: string, caller: string): string {
+  return `mesh-bridge-caller-v1:${ts}:${node}:${caller}`;
+}
+
+/** What the caller's hosted identity signs beside it: the bridge holds this key. */
+export function bridgedHostedStatement(ts: number, node: string, caller: string): string {
+  return `mesh-bridge-hosted-v1:${ts}:${node}:${caller}`;
 }
 
 /** The statement an agent signs to ask the key-standing door about itself. */

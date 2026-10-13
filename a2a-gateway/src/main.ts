@@ -28,6 +28,12 @@
  *   TRUSTED_PROXIES  comma-separated IPs/CIDRs (or `loopback`) whose
  *                    X-Forwarded-For may be believed (default: believe nobody)
  *   RATE_PER_MINUTE  inbound requests per minute per caller (default 30)
+ *   CORE_API_URL     the server's credential doors (its mesh API), e.g.
+ *                    http://server:3005: outside proofs (OAuth tokens and SPIFFE
+ *                    JWT-SVIDs) are checked there, and hosted identities store
+ *                    their rosters there. Unset: outside proofs are refused.
+ *   BRIDGE_AUTHORIZATION_SERVERS  comma-separated authorization server URLs the
+ *                    RFC 9728 metadata names for MCP clients (optional)
  *   FORWARD_ROUTES   path prefixes a front end beside the gateway answers,
  *                    "prefix=url,..." (inbound/relay.ts); admin prefixes are
  *                    forwarded only after the local-only admin gate
@@ -41,6 +47,7 @@ import { FileKeyStore } from "./inbound/keys.js";
 import { FileCallerIdentityStore } from "./inbound/identity-store.js";
 import { loadCreds } from "./creds.js";
 import { parseForwardRoutes } from "./inbound/relay.js";
+import { ProofGate } from "./inbound/proofs.js";
 
 const PORT = Number(process.env.PORT ?? 8090);
 
@@ -100,11 +107,22 @@ async function main(): Promise<void> {
   );
   await callerStore.load();
 
+  // Outside proofs (SPEC §4.15): callers that present an OAuth token or a
+  // SPIFFE JWT-SVID, checked with the server's key chain at CORE_API_URL.
+  // Needs the node credential (the node key signs each question) and the
+  // server naming this node in MESH_BRIDGE_NODES.
+  const creds = process.env.CREDS_FILE ? loadCreds(process.env.CREDS_FILE) : undefined;
+  const coreUrl = process.env.CORE_API_URL?.trim() || undefined;
+  const proofs = coreUrl && creds ? new ProofGate({ coreUrl, nodeSeed: creds.seed }) : undefined;
+  if (proofs) console.log(`[bridge] outside proofs are checked with the key chain at ${coreUrl} (this node: ${proofs.nodeId}; the server must name it in MESH_BRIDGE_NODES)`);
+
   const bridge = new Bridge({
     meshUrl: process.env.MESH_URL ?? "ws://localhost:4443",
+    ...(proofs ? { proofs } : {}),
+    ...(coreUrl ? { coreUrl } : {}),
     publicBaseUrl: process.env.PUBLIC_BASE_URL ?? `http://localhost:${PORT}`,
     port: PORT,
-    creds: process.env.CREDS_FILE ? loadCreds(process.env.CREDS_FILE) : undefined,
+    creds,
     apiKeys: parseApiKeys(),
     keyStore,
     callerStore,

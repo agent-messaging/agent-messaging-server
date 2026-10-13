@@ -211,7 +211,7 @@ import {
   sealPayloadTo,
 } from "./internal/sealed.js";
 import { derivedSealing } from "./internal/sealing-posture.js";
-import { AdmissionGate, readKnockInput, textOfInput, type AdmissionControl, type AdmissionOptions, type DescribeDocument } from "./admission.js";
+import { AdmissionGate, readKnockInput, textOfInput, type AdmissionControl, type AdmissionOptions, type DescribeDocument, type SenderFacts } from "./admission.js";
 import { describeDocumentOf } from "./interview.js";
 import { registrarNameLookup } from "./naming-gate.js";
 import {
@@ -967,7 +967,7 @@ export class AgentMesh {
         apiBase: cr.apiBase,
         jwt: opts.jwt,
         nodeSeed: credSeed,
-        agents: [{ id: agentId, seed: kp.getSeed() }],
+        agents: [{ id: agentId, seed: kp.getSeed(), ...(cr.proof ? { proof: cr.proof } : {}) }],
         onRenewed: cr.onRenewed,
         onWarning: (w) => mesh.onSecurityWarning?.(w as SecurityWarning),
       });
@@ -2440,7 +2440,8 @@ export class AgentMesh {
       trace: config?.trace ? childSpan(config.trace) : undefined,
       budget: config?.budget,
       payload: reqPayload,
-      meta: config?.meta,
+      // Evidence of acting for a person (§4.16) rides in meta, under the envelope signature.
+      meta: config?.on_behalf_of ? { ...(config.meta ?? {}), on_behalf_of: config.on_behalf_of } : config?.meta,
     });
 
     // §6.4b envelope-size check: the serialized envelope against the
@@ -2637,7 +2638,8 @@ export class AgentMesh {
       trace: config?.trace ? childSpan(config.trace) : undefined,
       budget: config?.budget,
       payload: reqPayload,
-      meta: config?.meta,
+      // Evidence of acting for a person (§4.16) rides in meta, under the envelope signature.
+      meta: config?.on_behalf_of ? { ...(config.meta ?? {}), on_behalf_of: config.on_behalf_of } : config?.meta,
     });
 
     const bytes = encode(envelope);
@@ -3864,6 +3866,37 @@ export class AgentMesh {
     return handle;
   }
 
+  /** sender agent id → what the registry says about it, for admission (10 minutes). */
+  private senderFactsCache = new Map<string, { at: number; facts: SenderFacts }>();
+
+  /** What the registry says about a sender, for the roster's source entries
+   *  and the `bridged` tier (EXT-6 0.5.0): whether it is registered, whether
+   *  it reaches the mesh through a bridge, and where its identity came from.
+   *  A lookup that fails is read as a registered native agent, as before. */
+  private async senderFacts(agentId: string): Promise<SenderFacts> {
+    const hit = this.senderFactsCache.get(agentId);
+    if (hit && Date.now() - hit.at < 600_000) return hit.facts;
+    let facts: SenderFacts;
+    try {
+      // Two seconds at most: a registry that does not answer leaves the sender
+      // read as before, a registered native agent, and the answer is not kept.
+      const m = (await Promise.race([
+        this.getManifest(agentId),
+        new Promise<never>((_, no) => { const t = setTimeout(() => no(new Error("registry slow")), 2000); (t as { unref?: () => void }).unref?.(); }),
+      ])) as Manifest & { identity_source?: { kind?: string; issuer?: string; trust_domain?: string } };
+      const exts = Array.isArray(m.extensions) ? m.extensions.map((e) => (e as { uri?: unknown })?.uri) : [];
+      const bridged = m.identity_source?.kind === "bridged" || exts.includes("mesh://extensions/identity-bridge/v1") || exts.includes("mesh://extensions/a2a-bridge/v1");
+      facts = { registered: true, bridged, ...(m.identity_source ? { source: m.identity_source } : {}) };
+    } catch (err) {
+      const code = (err as { code?: unknown })?.code;
+      if (code !== ErrorCode.AGENT_UNAVAILABLE) return { registered: true, bridged: false };
+      facts = { registered: false, bridged: false };
+    }
+    this.senderFactsCache.set(agentId, { at: Date.now(), facts });
+    if (this.senderFactsCache.size > 2000) this.senderFactsCache.delete(this.senderFactsCache.keys().next().value!);
+    return facts;
+  }
+
   /** A terminal answer to a request, with no task and no accept before it. */
   private answerDirect(msg: Msg, env: Envelope, output: unknown, viaReply: boolean, error?: ErrorObject): void {
     const out = this.newEnvelope({
@@ -3935,7 +3968,7 @@ export class AgentMesh {
    *  blocked, or put in the inbox) and must go no further. */
   private async admissionDoor(msg: Msg, env: Envelope, reqPayload: RequestPayload, viaReply: boolean): Promise<boolean> {
     const gate = this.admissionGate!;
-    const stance = gate.stanceFor(env.from);
+    const stance = gate.stanceFor(env.from, await this.senderFacts(env.from));
     if (stance === "block") {
       this.answerQueued(msg, env, viaReply, false);
       return true;
@@ -3982,10 +4015,27 @@ export class AgentMesh {
       }
       agentId = r.agentId;
     }
+    // Where the agent's identity came from (§9.7 identity_source) is the
+    // mesh's attested record, read from the registry beside the agent's own
+    // answer. Whatever the agent says about it is dropped: an agent does not
+    // get to describe its own provenance.
+    // The registry is asked beside the agent, and never holds the card up for
+    // long: a registry that has not answered half a second after the agent
+    // did leaves the record out.
+    const lookup = this.getManifest(agentId).catch(() => null);
     const res = await this.requestWith(agentId, "describe", {}, { timeout_ms: opts.timeout_ms ?? 15_000 }, { preAdmission: true });
+    const registered = await Promise.race([
+      lookup,
+      new Promise<null>((ok) => { const t = setTimeout(() => ok(null), 500); (t as { unref?: () => void }).unref?.(); }),
+    ]);
     const out = (res.payload as { output?: unknown } | undefined)?.output ?? res.payload;
     if (!out || typeof out !== "object") throw new MeshError(ErrorCode.INVALID_ENVELOPE, `${target} answered describe with no document.`, { retryable: false });
-    return out as DescribeDocument;
+    const { identity_source: _claimed, ...doc } = out as DescribeDocument;
+    const { identity_source_attestation: _claimedAtt, ...rest } = doc as DescribeDocument & { identity_source_attestation?: unknown };
+    const reg = registered as (typeof registered & { identity_source_attestation?: Record<string, unknown> }) | null;
+    return (reg?.identity_source
+      ? { ...rest, identity_source: reg.identity_source, ...(reg.identity_source_attestation ? { identity_source_attestation: reg.identity_source_attestation } : {}) }
+      : rest) as DescribeDocument;
   }
 
   // ── the mesh's own requests (platform-services/*.json, "part": "mesh") ──

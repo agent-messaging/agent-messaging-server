@@ -55,6 +55,33 @@ export function inboundCallerMarker(fields: {
   };
 }
 
+/** The general identity-bridge marker (SPEC §4.15): which bridge signs for a
+ *  caller that holds no mesh key, the caller's stable opaque reference, how
+ *  it was admitted, and which front it came in by. Every envelope the bridge
+ *  sends for a caller carries it in `meta.identity_bridge`; A2A traffic
+ *  carries `meta.a2a_bridge` beside it, unchanged. */
+export const IDENTITY_BRIDGE_URI = "mesh://extensions/identity-bridge/v1";
+export const IDENTITY_BRIDGE_DESCRIPTION =
+  "This agent reaches the mesh through an identity bridge; mesh signatures on its traffic are the bridge node's vouch, not the caller's own.";
+
+export type BridgeFront = "a2a" | "https" | "mcp";
+
+export interface IdentityBridgeMarker {
+  bridge: string;
+  caller_ref: string;
+  caller_kind: CallerKind;
+  front?: BridgeFront;
+}
+
+export function identityBridgeMarker(fields: { node: string; ref: string; kind: CallerKind; front?: BridgeFront }): IdentityBridgeMarker {
+  return { bridge: fields.node, caller_ref: fields.ref, caller_kind: fields.kind, ...(fields.front ? { front: fields.front } : {}) };
+}
+
+/** Whether a caller came in by A2A (and so its traffic also carries the A2A marker). */
+export function isA2aKind(kind: CallerKind): boolean {
+  return kind === "operator" || kind === "account" || kind === "anonymous" || kind === "pact";
+}
+
 /** The manifest a hosted inbound caller identity registers (§2.1 rule 2).
  *
  *  `unlisted`, and with no offerings: this identity answers nothing, so it must
@@ -70,20 +97,27 @@ export function inboundCallerManifest(marker: InboundCallerMarker): {
   visibility: "unlisted";
   interaction: "service";
   extensions: Array<{ uri: string; description: string }>;
-  meta: { a2a_bridge: InboundCallerMarker };
+  meta: { a2a_bridge?: InboundCallerMarker; identity_bridge: IdentityBridgeMarker };
 } {
+  const bridged = identityBridgeMarker({ node: marker.node, ref: marker.caller_ref, kind: marker.caller_kind });
+  const a2a = isA2aKind(marker.caller_kind);
   return {
-    name: `A2A caller ${marker.caller_ref.slice(0, 8)}`,
-    description:
-      "An external A2A client reaching this mesh through the AgentMesh A2A bridge. " +
-      "It serves no offerings; mesh signatures on its traffic are the bridge node's vouch, not the caller's own.",
+    name: `${a2a ? "A2A" : "Bridged"} caller ${marker.caller_ref.slice(0, 8)}`,
+    description: a2a
+      ? "An external A2A client reaching this mesh through the A2A gateway. " +
+        "It serves no offerings; mesh signatures on its traffic are the bridge node's vouch, not the caller's own."
+      : "An agent that holds no mesh key, reaching this mesh through an identity bridge with its own identity system's credential. " +
+        "Mesh signatures on its traffic are the bridge node's vouch, not the caller's own.",
     version: "1.0.0",
     capabilities: [],
     offerings: [],
     visibility: "unlisted",
     interaction: "service",
-    extensions: [{ uri: BRIDGE_EXTENSION_URI, description: BRIDGE_EXTENSION_DESCRIPTION }],
-    meta: { a2a_bridge: marker },
+    extensions: [
+      ...(a2a ? [{ uri: BRIDGE_EXTENSION_URI, description: BRIDGE_EXTENSION_DESCRIPTION }] : []),
+      { uri: IDENTITY_BRIDGE_URI, description: IDENTITY_BRIDGE_DESCRIPTION },
+    ],
+    meta: { ...(a2a ? { a2a_bridge: marker } : {}), identity_bridge: bridged },
   };
 }
 

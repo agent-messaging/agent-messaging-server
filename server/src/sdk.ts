@@ -35,6 +35,9 @@ export type {
   NodeDeclaredProfile,
   TrustTier,
   NodeRole,
+  IdentitySource,
+  IdentitySourceKind,
+  TrustAttestation,
   AvailabilityClass,
   Reachability,
 } from "../../sdk-typescript/src/types/manifest.js";
@@ -87,6 +90,10 @@ export {
   // base64url — the SDK-object signature encoding (EXT-8 allowance `sig`).
   toB64Url,
   fromB64Url,
+  // The portable trust attestation (§9.7): the key chain signs an agent's
+  // identity source as one.
+  createTrustAttestation,
+  verifyTrustAttestation,
 } from "../../sdk-typescript/src/internal/identity.js";
 // nats's nkeys with native Ed25519 (sdk-typescript/src/internal/fast-nkeys.ts):
 // tweetnacl cost 23 ms a verify on the platform VM, node:crypto 0.25 ms.
@@ -394,3 +401,8 @@ export type {
   TrialShape,
   TrialReason,
 } from "../../sdk-typescript/src/trial.js";
+
+// Admission by source (EXT-6 0.5.0): the same roster rule the SDK's gate applies,
+// so the admission service and an agent's own door never disagree.
+export { rosterStance, sourceStance, tierStance, parseRosterSource } from "../../sdk-typescript/src/admission.js";
+export type { SenderFacts } from "../../sdk-typescript/src/admission.js";

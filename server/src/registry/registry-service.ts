@@ -13,6 +13,7 @@ import { handleRegister } from "./handlers/register.js";
 import { handleDeregister, removeRegistration } from "./handlers/deregister.js";
 import { handleDiscover } from "./handlers/discover.js";
 import { handleGet } from "./handlers/get.js";
+import { IdentitySourceView } from "./identity-source-view.js";
 import { handleNodesList } from "./handlers/nodes.js";
 import { ADMIN_DEREGISTER, ADMIN_FORGET_DESCRIPTOR, ADMIN_LISTING, PRESENCE_FEED_KEY, PRESENCE_GET, handleAdminDeregister, handleAdminForgetDescriptor, handleAdminListing, handlePresenceFeedKey, handlePresenceGet } from "./handlers/admin.js";
 import { coreUnlistedResolver, setUnlistedResolver } from "./unlisted.js";
@@ -122,6 +123,9 @@ export class RegistryService {
    *  Attested attributes (trust_tier, role) seed from operator config: the
    *  NODE_ATTESTATIONS env var maps node public keys to attested attributes. */
   private profiles = new NodeProfileStore();
+  /** Where each agent's identity came from (§9.7 identity_source), from the
+   *  key chain's record, joined into discovery and get. */
+  private identitySources = new IdentitySourceView(null);
   /** Retention policy (§9.2): reclaims long-dead registrations. */
   private reaper: Reaper;
   /** State feeds (§6.6a): the durable writer + `mesh.feed.get` responder.
@@ -309,6 +313,12 @@ export class RegistryService {
     // opens (manifest-watch.ts).
     await svc.seedCache();
     await svc.seedAttestedProfiles();
+    try {
+      svc.identitySources = new IdentitySourceView(await storage.keyed("mesh_identity_sources"));
+    } catch (err) {
+      if (isStoreSettingError(err)) throw err;
+      console.error(`[registry] identity sources are not available, so discovery carries none: ${(err as Error).message}`);
+    }
     // Which agents discover never lists, from the core's own stores (the
     // ownership record and the key chain's tombstones, unlisted.ts). Never
     // fatal: without them discover drops nothing, as it did with no resolver.
@@ -334,6 +344,7 @@ export class RegistryService {
     // consumer would be the load-balanced case, and would leave whichever
     // instance lost each message serving a directory missing that agent.
     await this.manifestWatch.start();
+    await this.identitySources.start();
 
     // §13.1.1 span buffer. Idempotent and no-ops unless TRACE_STREAM_ENABLED,
     // so every instance can call it and a deployment nobody asked for spans in
@@ -447,7 +458,7 @@ export class RegistryService {
         this.nc,
         Subjects.REGISTRY_DISCOVER,
         this.kp,
-        (env) => handleDiscover(env, this.SERVICE_ID, this.cache, this.presence, this.profiles),
+        (env) => handleDiscover(env, this.SERVICE_ID, this.cache, this.presence, this.profiles, this.identitySources),
         undefined,
         undefined,
         serviceQueue(Subjects.REGISTRY_DISCOVER),
@@ -460,7 +471,7 @@ export class RegistryService {
         this.nc,
         "mesh.registry.get.*",
         this.kp,
-        (env, msg) => handleGet(env, msg, this.kv, this.SERVICE_ID, this.cache, this.keyRevocations, this.agentStatus),
+        (env, msg) => handleGet(env, msg, this.kv, this.SERVICE_ID, this.cache, this.keyRevocations, this.agentStatus, this.identitySources),
         undefined,
         undefined,
         serviceQueue("mesh.registry.get.*"),
@@ -682,6 +693,7 @@ export class RegistryService {
       sub.unsubscribe();
     }
     this.manifestWatch.stop();
+    this.identitySources.stop();
     this.heartbeatMonitor.stop();
     this.reaper.stop();
     await this.feedState?.stop();

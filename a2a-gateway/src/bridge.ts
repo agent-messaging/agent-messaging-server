@@ -4,8 +4,9 @@
  * owns the node, the inbound caller-identity pool, the exposure policy, and
  * the bridge-local task store.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
-import { createUser } from "nkeys.js";
+import { createUser, fromSeed } from "nkeys.js";
 import { MeshNode } from "../../sdk-typescript/src/node.js";
 import { AgentMesh } from "../../sdk-typescript/src/mesh.js";
 import type { Manifest } from "../../sdk-typescript/src/types/manifest.js";
@@ -15,7 +16,17 @@ import { MeshError, ErrorCode } from "../../sdk-typescript/src/types/errors.js";
 import type { RequestContext } from "../../sdk-typescript/src/internal/offering-router.js";
 import { BucketPool } from "./core/ratelimit.js";
 import { meshAddress } from "./mesh-address.js";
-import { BRIDGE_EXTENSION_URI, inboundCallerManifest, inboundCallerMarker, type InboundCallerMarker } from "./core/card.js";
+import {
+  BRIDGE_EXTENSION_URI,
+  identityBridgeMarker,
+  inboundCallerManifest,
+  inboundCallerMarker,
+  isA2aKind,
+  type BridgeFront,
+  type IdentityBridgeMarker,
+  type InboundCallerMarker,
+} from "./core/card.js";
+import { ProofRefused, type BridgedCaller, type PresentedCredential, type ProofGate } from "./inbound/proofs.js";
 import { parseTrustedProxies, type ProxySet } from "./inbound/client-address.js";
 import type { FileKeyStore } from "./inbound/keys.js";
 import {
@@ -63,6 +74,23 @@ export interface BridgeConfig {
   guestIdentityTtlMs?: number;
   /** Requests per minute per caller identity. Default 30. */
   ratePerMinute?: number;
+  /** Outside proofs (inbound/proofs.ts, SPEC §4.15): callers that present an
+   *  OAuth token or a SPIFFE JWT-SVID, checked with the server's key chain.
+   *  Absent: such a credential is refused like an unknown key. */
+  proofs?: ProofGate;
+  /** The server's credential doors (its mesh API), handed to hosted
+   *  identities as their platform address, so an agent's own admission can
+   *  store its roster there. */
+  coreUrl?: string;
+}
+
+/** The front the current call came in by, read when an envelope is signed,
+ *  so every envelope a hosted identity sends carries the right marker. */
+const frontOfCall = new AsyncLocalStorage<BridgeFront>();
+
+/** Run `fn` as a call that came in by `front`. */
+export function inFront<T>(front: BridgeFront, fn: () => T): T {
+  return frontOfCall.run(front, fn);
 }
 
 interface HostedIdentity {
@@ -76,6 +104,14 @@ interface HostedIdentity {
   /** True once the §2.1 rule 2 manifest has been registered for this identity,
    *  so a re-use does not re-register on every request. */
   markerRegistered: boolean;
+  /** The identity's seed, when the bridge holds it here: what signs the
+   *  questions to the key chain for a caller with an outside proof. */
+  seed?: string;
+  /** What the key chain last said about a caller with an outside proof. */
+  bridged?: BridgedCaller;
+  /** Whether this identity keeps an inbox (admission started), as the HTTPS
+   *  and MCP fronts need. */
+  inboxStarted?: boolean;
 }
 
 interface TaskRecord {
@@ -233,6 +269,8 @@ export class Bridge {
     this.node = await MeshNode.connect(servers, {
       jwt: this.config.creds?.jwt,
       nodeSeed: this.config.creds?.seed,
+      // Hosted identities ask the server's doors (rosters, and the like) here.
+      ...(this.config.coreUrl ? { platformApi: this.config.coreUrl } : {}),
       // §9.2 retention: durability is declared. The bridge is a supervised
       // service, so its hosted attachments earn the full vouch; undeclared
       // they would ride the short ephemeral lease meant for dev spawns.
@@ -350,7 +388,8 @@ export class Bridge {
       // the raw key string never keys any map.
       const minted = this.config.keyStore?.verify(apiKey);
       if (minted) {
-        return { key: `acctkey:${minted.id}` };
+        // A sandbox key is its own kind of caller (SPEC §4.15).
+        return { key: minted.kind === "sandbox" ? `sandbox:${minted.id}` : `acctkey:${minted.id}` };
       }
       return {
         error: "unauthorized",
@@ -411,6 +450,8 @@ export class Bridge {
     // down must not turn into a 500 for a caller whose actual work — the mesh
     // request — is about to go through fine. It is retried on the next use.
     if (!entry.markerRegistered) await this.registerCallerMarker(entry);
+    // A caller that is not an A2A client (a sandbox key) keeps an inbox, as the HTTPS and MCP fronts read it.
+    if (!isA2aKind(entry.kind)) await this.ensureInbox(key).catch(() => undefined);
     return entry.agent;
   }
 
@@ -423,7 +464,7 @@ export class Bridge {
     const existing = store?.byCallerKey(key);
     if (existing) {
       const agent = this.node!.addAgent({ nkeySeed: existing.identitySeed });
-      this.listenForLateReplies(agent);
+      if (isA2aKind(existing.kind)) this.listenForLateReplies(agent);
       // The seed IS the id, so these agree unless the file was edited by hand.
       // If they ever disagree, believe the seed and re-index — `put` keeps the
       // superseded agent id resolvable, which is the property audit rows need.
@@ -436,7 +477,9 @@ export class Bridge {
       console.log(
         `[bridge] restored hosted identity for caller ${existing.ref.slice(0, 8)}: ${agent.id.slice(0, 12)}...`,
       );
-      return { agent, lastUsed: Date.now(), ref: existing.ref, kind: existing.kind, markerRegistered: false };
+      const revived: HostedIdentity = { agent, lastUsed: Date.now(), ref: existing.ref, kind: existing.kind, markerRegistered: false, seed: existing.identitySeed };
+      this.stampMarker(revived);
+      return revived;
     }
 
     const kind = callerKindOf(key);
@@ -444,7 +487,7 @@ export class Bridge {
     // can bring it back. One we will not (anonymous) is minted the old way.
     const seed = persistable(key) ? mintSeed() : undefined;
     const agent = this.node!.addAgent(seed ? { nkeySeed: seed } : undefined);
-    this.listenForLateReplies(agent);
+    if (isA2aKind(kind)) this.listenForLateReplies(agent);
     let ref: string;
     if (store && seed) {
       const record = newCallerRecord({
@@ -464,7 +507,93 @@ export class Bridge {
     console.log(
       `[bridge] minted hosted identity for ${kind} caller ${ref.slice(0, 8)}: ${agent.id.slice(0, 12)}...`,
     );
-    return { agent, lastUsed: Date.now(), ref, kind, markerRegistered: false };
+    const minted: HostedIdentity = { agent, lastUsed: Date.now(), ref, kind, markerRegistered: false, ...(seed ? { seed } : {}) };
+    this.stampMarker(minted);
+    return minted;
+  }
+
+  /** Every envelope a hosted identity signs carries the identity-bridge
+   *  marker (SPEC §4.15), with the front the current call came in by. A2A
+   *  calls also pass `meta.a2a_bridge` themselves (attributionMeta). */
+  private stampMarker(entry: HostedIdentity): void {
+    const agent = entry.agent as { setOutgoingMeta?: (fn: (() => Record<string, unknown> | undefined) | null) => void };
+    if (typeof agent.setOutgoingMeta !== "function") return;
+    agent.setOutgoingMeta(() => ({
+      identity_bridge: identityBridgeMarker({ node: this.node?.id ?? "", ref: entry.ref, kind: entry.kind, front: frontOfCall.getStore() ?? "a2a" }),
+    }));
+  }
+
+  /**
+   * The hosted identity for a caller presenting an outside proof (SPEC
+   * §4.15): an OAuth token or a SPIFFE JWT-SVID. The key chain checks the
+   * proof (inbound/proofs.ts) before the identity is written down, so a
+   * refused token leaves nothing behind. One lasting identity per issuer and
+   * subject, or per SPIFFE ID: the same caller gets the same mesh key on
+   * every call and after every restart.
+   */
+  async proofIdentity(
+    cred: Extract<PresentedCredential, { type: "proof" }>,
+    req: { method: string; url: string; dpop?: string },
+  ): Promise<{ agent: AgentMesh; key: string; caller: BridgedCaller }> {
+    const gate = this.config.proofs;
+    if (!gate) throw new ProofRefused("This bridge does not accept outside proofs. Use an API key.", 401, "proofs_not_offered");
+    if (!this.node) throw new Error("bridge is not connected to the mesh yet");
+    const key = gate.callerKeyOf(cred);
+    const signWith = (seed: string) => (message: string) =>
+      Buffer.from(fromSeed(new TextEncoder().encode(seed)).sign(new TextEncoder().encode(message))).toString("base64");
+
+    let entry = this.identities.get(key);
+    if (entry?.seed) {
+      entry.bridged = await gate.check(cred, req, entry.agent.id, signWith(entry.seed));
+    } else {
+      // Not in the live pool: from the record, else a fresh key kept only in
+      // memory until the key chain says yes.
+      const existing = this.config.callerStore?.byCallerKey(key);
+      const seed = existing?.identitySeed ?? mintSeed();
+      const probe = fromSeed(new TextEncoder().encode(seed)).getPublicKey();
+      const bridged = await gate.check(cred, req, probe, signWith(seed));
+      entry = this.identities.get(key);
+      if (!entry) {
+        if (this.identities.size >= IDENTITY_MAX) this.evictOldestIdentity();
+        const agent = this.node.addAgent({ nkeySeed: seed });
+        if (!existing && this.config.callerStore) {
+          await this.config.callerStore.put(newCallerRecord({ callerKey: key, accountId: bridged.tenant, agentId: agent.id, identitySeed: seed, ref: bridged.caller_ref }));
+        }
+        entry = { agent, lastUsed: Date.now(), ref: existing?.ref ?? bridged.caller_ref, kind: callerKindOf(key), markerRegistered: false, seed };
+        this.stampMarker(entry);
+        this.identities.set(key, entry);
+        console.log(`[bridge] ${existing ? "restored" : "minted"} hosted identity for ${entry.kind} caller ${bridged.workload_id}: ${agent.id.slice(0, 12)}...`);
+      }
+      entry.bridged = bridged;
+    }
+    entry.lastUsed = Date.now();
+    this.config.callerStore?.touch(key);
+    if (!entry.markerRegistered) await this.registerCallerMarker(entry);
+    // Its inbox from the first call, so what other agents send it waits there.
+    await this.ensureInbox(key).catch((err) => console.warn(`[bridge] the inbox of caller ${entry!.ref.slice(0, 8)} did not start: ${(err as Error).message}`));
+    return { agent: entry.agent, key, caller: entry.bridged! };
+  }
+
+  /**
+   * Make sure a hosted identity keeps an inbox (SPEC EXT-6 §7: the agent's
+   * own admission, with every message for an offering nothing handles kept),
+   * which is how a caller on the HTTPS and MCP fronts reads what arrives for
+   * it. Once per identity per process.
+   */
+  async ensureInbox(key: string): Promise<void> {
+    const entry = this.identities.get(key);
+    if (!entry || entry.inboxStarted) return;
+    const agent = entry.agent as AgentMesh & { admission?: { start(o: Record<string, unknown>): Promise<void> } };
+    if (!agent.admission) return;
+    await agent.admission.start({ inbox: true });
+    entry.inboxStarted = true;
+  }
+
+  /** What the key chain said about a caller with an outside proof, and the
+   *  live identity's kind and reference, for whoami. */
+  callerInfo(key: string): { kind: CallerKind; ref: string; agent_id: string; bridged?: BridgedCaller } | null {
+    const e = this.identities.get(key);
+    return e ? { kind: e.kind, ref: e.ref, agent_id: e.agent.id, ...(e.bridged ? { bridged: e.bridged } : {}) } : null;
   }
 
   /**
@@ -506,9 +635,14 @@ export class Bridge {
    * Returns undefined for a caller with no live identity — there is nothing
    * truthful to say about a caller the bridge has not minted for.
    */
-  attributionMeta(callerKey: string): { a2a_bridge: InboundCallerMarker } | undefined {
+  attributionMeta(callerKey: string): { a2a_bridge: InboundCallerMarker; identity_bridge: IdentityBridgeMarker } | undefined;
+  attributionMeta(callerKey: string, front: BridgeFront): { a2a_bridge?: InboundCallerMarker; identity_bridge: IdentityBridgeMarker } | undefined;
+  attributionMeta(callerKey: string, front: BridgeFront = "a2a"): { a2a_bridge?: InboundCallerMarker; identity_bridge: IdentityBridgeMarker } | undefined {
     const entry = this.identities.get(callerKey);
-    return entry ? { a2a_bridge: this.markerFor(entry) } : undefined;
+    if (!entry) return undefined;
+    const general = identityBridgeMarker({ node: this.node?.id ?? "", ref: entry.ref, kind: entry.kind, front });
+    // A2A traffic carries the A2A marker as well, unchanged (BRIDGE-A2A.md §8.3).
+    return front === "a2a" ? { a2a_bridge: this.markerFor(entry), identity_bridge: general } : { identity_bridge: general };
   }
 
   /** Token-bucket rate check for a caller key. Buckets are keyed independently

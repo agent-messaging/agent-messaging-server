@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.61.0 (2026-10-13)
+
+Bring your own identity (Agent Messaging 0.8, §4.12 to §4.16 and EXT-6 0.5.0).
+
+- **Enroll with an outside proof (§4.14).** `exchangeOutsideProof(url,
+  publicKey, { kind: "oauth" | "jwt-svid", token, dpopKey? })` enrolls with an
+  OAuth access token or a SPIFFE JWT-SVID from an identity system the tenant
+  trusts, in place of an enrollment key. `generateDpopKey()` and
+  `createDpopProof(...)` make a DPoP key and the proof for one request (RFC
+  9449). A refusal throws `ProofRefusedError` with the specification's reason.
+  A credential enrolled this way renews only with a fresh proof:
+  `credentialRenewal.proof` on `AgentMesh.connect`, or `proof` on a
+  `RenewalAgent`.
+- **Where an identity came from (§9.7).** `discover({ identity_source: { kind,
+  issuer, trust_domain } })` filters on it (`kind` may be a list), and
+  `describe` returns the mesh's record in `identity_source` with its signed
+  attestation in `identity_source_attestation`, never the agent's own claim.
+  The `IdentitySource` type is exported.
+- **Admission by source (EXT-6 0.5.0).** `admission.start({ bridged })` sets
+  what a sender that reaches the mesh through an identity bridge gets (`hold`
+  by default). `contacts.admit({ source })` and `contacts.block({ source })`
+  take `oauth:<issuer>` or `spiffe://<trust domain>`. A sender entry beats a
+  source entry, which beats the tier; a roster with a source nobody can read
+  fails closed. The rule is exported as `rosterStance`, `sourceStance` and
+  `tierStance`.
+- **Acting for a person (§4.16).** `request(..., { on_behalf_of })` carries the
+  evidence in `meta.on_behalf_of`, under the envelope signature;
+  `verifyOnBehalfOf(envelope, { audience, trustedIssuers })` answers
+  `"verified"`, `"refused"` or `"unverifiable"`, fetching nothing.
+
 ## 0.60.0 (2026-10-13)
 
 - **Admission on the agent's own side (EXT-6).** `await mesh.admission.start()`

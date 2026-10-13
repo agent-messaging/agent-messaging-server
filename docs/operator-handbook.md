@@ -25,6 +25,7 @@ run the same command with `kubectl -n agent-messaging exec deploy/server --`.
 12. Kubernetes
 13. Limits, and where they are set
 14. When something is wrong
+15. Bring your own identity
 
 ## 1. What runs, and on which ports
 
@@ -580,3 +581,69 @@ and the gateway's log.
 **A port is already taken on the host.** Set the matching `*_PORT` setting
 (section 1). If you change it after first-run, also change the address agents
 are handed in `server.env`.
+
+## 15. Bring your own identity
+
+A tenant whose agents already have identities in its own system can let them
+enroll with those instead of an enrollment key (SPEC §4.14), reach the mesh
+through the gateway's identity bridge without a mesh key (§4.15), and stop one
+of them from its identity provider (§4.12). Nothing changes until you trust an
+identity system for a tenant.
+
+**Trust an identity system.** An issuer, or a trust domain, belongs to one
+tenant on a mesh, so a token always names one tenant.
+
+```
+mesh-admin tenants trust add acme --oauth https://login.acme.example --audience https://mesh.example.com
+mesh-admin tenants trust add acme --oauth https://login.acme.example --audience https://mesh.example.com --require-binding
+mesh-admin tenants trust add acme --spiffe acme.example --bundle-endpoint https://spire.acme.example/bundle
+mesh-admin tenants trust add acme --spiffe acme.example --bundle bundle.json --require-mtls
+mesh-admin tenants trust list [acme]
+mesh-admin tenants trust remove acme <ID>
+mesh-admin agents identity <AGENT>
+```
+
+The OAuth audience is what Acme's identity provider puts in `aud` for tokens
+meant for this mesh, usually the mesh's address. `--require-binding` takes only
+tokens bound to a key the caller proves it holds (DPoP, or a certificate-bound
+token). The server finds the issuer's keys through its OpenID or OAuth
+metadata and fetches them over https. It refuses an http issuer unless
+`MESH_TRUST_ALLOW_HTTP=on`, which is for test issuers only. Removing a record
+stops new enrollments through it, and renewals of the agents that enrolled
+through it, because they renew only with a fresh proof.
+
+**What an agent sends.** `POST /v1/bootstrap` with
+`{ agent_id, proof: { kind: "oauth" | "jwt-svid", token } }`, and the DPoP
+proof in the `DPoP` header (or the body's `dpop`) for a bound token. The SDK's
+`exchangeOutsideProof` does it. A JWT-SVID's audience is the mesh's address.
+One outside identity holds one agent: enrolling a new key with it revokes the
+old key.
+
+**Settings, on the server:**
+
+| Setting | What it does |
+|---|---|
+| `MESH_PUBLIC_URL` | The mesh's address: the audience a JWT-SVID names, and the address a DPoP proof names. |
+| `MESH_PUBLIC_ORIGINS` | Other addresses the server is reached at (comma-separated), accepted as well. |
+| `MESH_PROOF_AUDIENCE` | A JWT-SVID audience other than the mesh's address. |
+| `MESH_MTLS_PORT`, `MESH_MTLS_CERT_FILE`, `MESH_MTLS_KEY_FILE` | An mTLS listener for X.509-SVIDs and certificate-bound tokens. Behind a proxy that ends TLS, set `MESH_CLIENT_CERT_HEADER` instead to the header it passes the client certificate in; it is believed only from the server's own host. |
+| `MESH_BRIDGE_NODES` | The gateway's node key, which may speak for callers that hold no mesh key. First-run writes it. A mesh set up before 0.2.0 needs it added to `server.env`: the public key of `creds/a2a-gateway.creds`. |
+| `MESH_BRIDGE_HTTPS_URL`, `MESH_BRIDGE_MCP_URL` | The gateway's fronts, as the capabilities answer names them. |
+| `MESH_SIGNALS_AUDIENCE` | The audience a stop signal names. Default: the mesh's address. |
+
+**On the gateway:** `CORE_API_URL` is where it asks the server about a token
+(Compose: `http://server:3005`), and `BRIDGE_AUTHORIZATION_SERVERS` lists the
+authorization servers its resource metadata names for MCP clients. A caller
+calls `/mcp` (MCP) or `/v1/bridge/tools` (HTTPS JSON) with `Authorization:
+Bearer <token>`, or `Authorization: DPoP <token>` and a `DPoP` header. The
+token's audience may be the front's own address. Each caller gets one lasting
+mesh identity, recorded as the tenant's and marked bridged on every message it
+sends. `POST /admin/keys` with `sandboxDays` makes a sandbox key that stops
+working after that many days.
+
+**Stop signals.** The identity provider pushes Security Event Tokens (RFC
+8935) to `<mesh address>/v1/signals/<tenant>`. A CAEP `session-revoked` or
+`credential-change` event, or a RISC `account-disabled` or `identifier-changed`
+event, signed by an issuer the tenant trusts and naming a workload, pauses
+every agent of the tenant holding that identity and cuts its connections.
+`credentials restore --agent <AGENT>` lifts it, as for any stop.

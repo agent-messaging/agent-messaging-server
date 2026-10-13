@@ -276,6 +276,8 @@ export type {
   PublicAccessScheme,
   AdmissionPolicy,
   TrustAttestation,
+  IdentitySource,
+  IdentitySourceKind,
   Availability,
   OfferingExample,
   NodeProfile,
@@ -909,6 +911,17 @@ export type { OtlpOptions } from "./internal/otlp.js";
 export { runWithTrace, currentTrace } from "./internal/trace-ambient.js";
 
 export { exchangeBootstrapToken } from "./bootstrap.js";
+// Enrolling with an identity the company already gave the agent (§4.14).
+export {
+  exchangeOutsideProof,
+  createDpopProof,
+  generateDpopKey,
+  ProofRefusedError,
+} from "./outside-proof.js";
+export type { OutsideProof, OutsideProofSource, OutsideProofResult } from "./outside-proof.js";
+// Acting for a person (§4.16): evidence in meta.on_behalf_of, checked by the receiver.
+export { verifyOnBehalfOf, onBehalfOfOf } from "./on-behalf-of.js";
+export type { OnBehalfOf, OnBehalfOfKind, OnBehalfOfResult, VerifyOnBehalfOfOptions } from "./on-behalf-of.js";
 export type { BootstrapResult } from "./bootstrap.js";
 export { bindingOfUrl, connectTransport, transportFromMesh } from "./transport.js";
 export type { Binding, MeshObject } from "./transport.js";
@@ -1004,6 +1017,7 @@ export {
 // waiting list and the inbox (mesh.admission, mesh.contacts, mesh.messages).
 export {
   AdmissionGate, signAdmissionRoster, verifyAdmissionRoster, fileAdmissionStore, readKnockInput, KNOCK_GRANT_NAMES,
+  rosterStance, sourceStance, tierStance, parseRosterSource, type SenderFacts,
   type AdmissionControl, type AdmissionOptions, type AdmissionRoster, type AdmissionRosterEntry, type AdmissionStance,
   type AdmissionState, type AdmissionStore, type WaitingSender, type InboxMessage, type HeldMessage, type DescribeDocument,
 } from "./admission.js";
