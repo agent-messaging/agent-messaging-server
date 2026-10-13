@@ -82,6 +82,8 @@ import { HttpProofKeys } from "./proof-keys.js";
 import { ReplayCache } from "./outside-proof.js";
 import { IdentitySourceStore, WorkloadBindingStore } from "./identity-records.js";
 import { adminTrust } from "../admin/admin-trust.js";
+import { stopSignals, type StopSignalReceiver } from "./stop-signals.js";
+import { meshHome } from "../shared/capabilities.js";
 import { registryDocuments, registryDocumentRoute, type RawAnswer, type RegistryDocuments } from "../registry/documents-http.js";
 import { adminUsage } from "../admin/admin-usage.js";
 import { adminStreams } from "../admin/admin-streams.js";
@@ -284,6 +286,17 @@ export class MeshApi {
     const api = new MeshApi(doors, platform, opts.port ?? Number(env.MESH_API_PORT ?? 3005), opts.host ?? env.MESH_API_HOST ?? "127.0.0.1", env, admin, auth, docs);
     api.storage = js;
     api.rosters = rosterDoor(admissionStore);
+    // Stop signals (§4.12, RFC 8935): a tenant's identity provider stops one of its workloads.
+    api.signals = stopSignals({
+      anchors: () => trust.all(),
+      keys: proofKeys,
+      workloads,
+      stops,
+      agentStatus,
+      cut,
+      audience: (env.MESH_SIGNALS_AUDIENCE ?? meshHome(env)).trim(),
+      replay: new ReplayCache(),
+    });
     api.closeUsage = async () => { await streamRoutes.close(); if (usageStore) await usageStore.close(); };
     return api;
   }
@@ -333,6 +346,8 @@ export class MeshApi {
   private brokerAuth: { close(): void } | null = null;
   private mtls: TlsServer | null = null;
   private storage: StorageLike | null = null;
+  /** The stop signal receiver (keychain/stop-signals.ts). */
+  private signals: StopSignalReceiver | null = null;
   /** The admission roster's own door (admission/roster-door.ts). */
   private rosters: RosterDoor | null = null;
   /** Writes the usage store's last batch, when the Monitor routes opened it. */
@@ -375,6 +390,14 @@ export class MeshApi {
       if (method === "POST" && path === "/v1/key-standing") return send(res, await this.doors.keyStanding(await readJson(req), ip));
       const m = /^\/v1\/key-check\/([^/]+)$/.exec(path);
       if (method === "GET" && m) return send(res, await this.doors.keyCheck(decodeURIComponent(m[1]!)));
+      const sig = /^\/v1\/signals\/([^/]+)$/.exec(path);
+      if (sig && this.signals) {
+        if (method !== "POST") return send(res, { status: 405, body: { error: "Stop signals are pushed with POST (RFC 8935)." } });
+        const raw = await readRaw(req);
+        if (raw === "too large") return send(res, { status: 413, body: { err: "invalid_request", description: "The token is too large." } });
+        const ct = req.headers["content-type"];
+        return send(res, await this.signals(decodeURIComponent(sig[1]!), typeof ct === "string" ? ct : undefined, raw));
+      }
       if (this.rosters && path.startsWith("/v1/rosters/")) {
         const answer = await this.rosters(method, path, () => readJson(req));
         if (answer) return send(res, answer);

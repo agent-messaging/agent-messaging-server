@@ -225,6 +225,42 @@ describe("an identity bridge asking about a caller (POST /v1/bridged-callers, §
   });
 });
 
+describe("stop signals (§4.12, RFC 8935)", () => {
+  const SESSION_REVOKED = "https://schemas.openid.net/secevent/caep/event-type/session-revoked";
+  const set = (claims: Record<string, unknown>) =>
+    new SignJWT({ iss: ISSUER, aud: "https://api.test", jti: crypto.randomUUID(), ...claims }).setProtectedHeader({ alg: "ES256", kid: "k1", typ: "secevent+jwt" }).setIssuedAt().sign(key);
+
+  it("a session-revoked event from the tenant's issuer pauses the agent holding that workload and cuts it; others are left alone", async () => {
+    const { stopSignals } = await import("../../src/keychain/stop-signals.js");
+    const r = await rig();
+    const agent = nkeys.createUser().getPublicKey();
+    await r.doors.bootstrap({ agent_id: agent, proof: { kind: "oauth", token: await tok("buyer") } });
+    const stops = new MemoryStopStore();
+    const status = new MemoryAgentStatus();
+    const cut: string[][] = [];
+    const receive = stopSignals({
+      anchors: () => r.trust.all(),
+      keys: { oauthKeys: async () => ({ keys: [jwk as Record<string, unknown>] }), spiffeBundle: async () => ({ keys: [] }) },
+      workloads: r.workloads, stops, agentStatus: status,
+      cut: async (keys) => { cut.push(keys); return { mode: "live", user_keys: 1, shared: 0, note: "cut" }; },
+      audience: "https://api.test", replay: new ReplayCache(),
+    });
+    const t = await set({ events: { [SESSION_REVOKED]: { subject: { format: "opaque", id: "buyer" } } } });
+    const out = await receive("acme", "application/secevent+jwt", t);
+    expect(out).toMatchObject({ status: 202, body: { stopped: [agent] } });
+    expect((await stops.active())[0]).toMatchObject({ scope: "agent", target: agent, action: "pause", by: { authority: "owner", account: "acme" } });
+    expect(await status.get(agent)).toMatchObject({ status: "paused" });
+    expect(cut).toEqual([[agent]]);
+    // The same token again changes nothing; another tenant's address knows no such issuer; a bad audience is refused.
+    expect(await receive("acme", "application/secevent+jwt", t)).toMatchObject({ status: 202, body: { duplicate: true } });
+    expect(await receive("other", "application/secevent+jwt", await set({ events: {} }))).toMatchObject({ status: 400, body: { err: "invalid_issuer" } });
+    expect(await receive("acme", "application/secevent+jwt", await set({ aud: "https://elsewhere", events: {} }))).toMatchObject({ status: 400, body: { err: "invalid_audience" } });
+    // A fresh proof no longer gets a credential.
+    const again = credentialDoors({ owners: r.owners, bootTokens: null, tombstones: null, keyRevocations: null, agentStatus: status, stops, mintLog: null, revokeCredential: async () => ({}) as never, platform: {}, baseUrl: "https://api.test/", env, proofs: { anchors: () => r.trust.all(), keys: { oauthKeys: async () => ({ keys: [jwk as Record<string, unknown>] }), spiffeBundle: async () => ({ keys: [] }) }, defaultAudience: AUD, replay: new ReplayCache() } });
+    expect((await again.bootstrap({ agent_id: agent, proof: { kind: "oauth", token: await tok("buyer") } })).status).toBeGreaterThanOrEqual(400);
+  });
+});
+
 describe("renewal of an agent that enrolled with an outside proof", () => {
   it("needs a fresh proof of the same identity (i09); one for another identity, or none, leaves it off", async () => {
     const r = await rig();

@@ -183,7 +183,7 @@ function credView(c: TrackedCred): Record<string, unknown> {
 }
 
 function agentView(r: AgentOwnerRecord): Record<string, unknown> {
-  return { key: r.key, tenant: r.account, org: r.org, label: r.label, listed: r.listed, category: r.category, updated_at: r.updated_at };
+  return { key: r.key, tenant: r.account, account: r.account, org: r.org, label: r.label, listed: r.listed, category: r.category, updated_at: r.updated_at };
 }
 
 export function adminApi(deps: AdminDeps) {
