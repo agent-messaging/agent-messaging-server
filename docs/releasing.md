@@ -37,8 +37,10 @@ without the other.
    `ghcr.io/agent-messaging/agent-messaging-a2a-gateway:<version>` (the owner is
    the repository's organization, `github.repository_owner`).
    A published tag is never replaced.
-4. Make sure both packages are public: `gh api orgs/agent-messaging/packages?package_type=container`
-   lists them with `visibility: public`. A new package in an organization starts
+4. Make sure both packages are public. Signed out of ghcr.io, `docker pull
+   ghcr.io/agent-messaging/agent-messaging-server:<version>` (and the gateway) must
+   work; or `gh api "orgs/agent-messaging/packages?package_type=container"` (a token
+   with `read:packages`) lists them with `visibility: public`. A new package in an organization starts
    private; change it under the package's settings, or it can't be pulled
    without signing in.
 5. Write the GitHub release for the tag, then move the image pins in
