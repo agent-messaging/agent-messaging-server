@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.59.0 (2026-10-13)
+
+- The package is renamed from `agentmesh` to `agent-messaging`, after the
+  standard it implements. Nothing else changes: the exports, the class names
+  (`AgentMesh`, `MeshNode`), the behaviour and the wire are the same as 0.58.2.
+  Install it from `agent-messaging-0.59.0.tgz` and import it as
+  `"agent-messaging"`. Releases up to 0.58.2 stay where they are, under the old
+  name.
+
 ## 0.58.2 (2026-10-13)
 
 - On an AMQP mesh, `register()` resolves once the agent's inbox is in place:

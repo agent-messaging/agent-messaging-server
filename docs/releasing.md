@@ -50,14 +50,14 @@ act on.
 2. When it is merged, tag that commit `sdk-v<version>` and push the tag.
 3. `.github/workflows/release-sdk.yml` tests and builds the SDK, packs it,
    installs the tarball in an empty project, and attaches
-   `agentmesh-<version>.tgz` and its SHA-256 to the GitHub release
+   `agent-messaging-<version>.tgz` and its SHA-256 to the GitHub release
    `sdk-v<version>`. A released version is never replaced.
 4. Move the install lines (`sdk-typescript/README.md`, `examples/README.md`)
    and the peering suite's pin to the new version once the tarball is at the
    address below.
 
 The same tarball is also served at
-`https://storage.googleapis.com/agentmesh-releases/agentmesh-<version>.tgz`,
+`https://storage.googleapis.com/agentmesh-releases/agent-messaging-<version>.tgz`,
 copied byte for byte from the GitHub release by the maintainers after it is
 checked against the SHA-256 the release carries. Either address installs with
 `npm install <url>`, without the npm registry.

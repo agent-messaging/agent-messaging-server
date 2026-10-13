@@ -41,7 +41,7 @@ const ADAPTER_HOME = join(ROOT, ".state", "reference-adapter");
 const ADAPTER_MJS = join(ADAPTER_HOME, "node_modules", "mesh-adapter", "mesh-adapter.mjs");
 
 /** The released reference adapter (conformance/reference-adapter.json), checked
- *  by its SHA-256, installed with this repository's SDK as its `agentmesh`. */
+ *  by its SHA-256, installed with this repository's SDK in place of its own. */
 async function installAdapter() {
   const pin = JSON.parse(readFileSync(join(ROOT, "conformance", "reference-adapter.json"), "utf8"));
   const res = await fetch(pin.url);
@@ -55,8 +55,12 @@ async function installAdapter() {
   writeFileSync(tgz, bytes);
   writeFileSync(join(ADAPTER_HOME, "package.json"), JSON.stringify({ name: "reference-adapter-install", private: true }));
   run(npm, ["install", "--no-audit", "--no-fund", tgz], { cwd: ADAPTER_HOME });
-  // The SDK under test is this repository's, for the adapter too.
-  const link = join(ADAPTER_HOME, "node_modules", "agentmesh");
+  // The SDK under test is this repository's, for the adapter too, under the
+  // name the adapter imports it by: `agent-messaging` from adapter 0.99.3,
+  // `agentmesh` before it (the package's name up to SDK 0.58.2).
+  const adapterPkg = JSON.parse(readFileSync(join(ADAPTER_HOME, "node_modules", "mesh-adapter", "package.json"), "utf8"));
+  const sdkName = ["agent-messaging", "agentmesh"].find((n) => adapterPkg.dependencies?.[n]) ?? "agent-messaging";
+  const link = join(ADAPTER_HOME, "node_modules", sdkName);
   let isLink = false;
   try { isLink = lstatSync(link).isSymbolicLink(); } catch { /* not there */ }
   if (isLink) unlinkSync(link);
