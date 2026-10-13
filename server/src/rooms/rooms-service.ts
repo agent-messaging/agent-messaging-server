@@ -122,8 +122,9 @@ interface RoomsConfig {
   /** A durable room idle this long is reclaimed (record + drive deleted). */
   idleExpiryMs: number;
   sweepIntervalMs: number;
-  /** PAN registrar used to reverse-resolve creator → operator. */
-  registrar: string;
+  /** PAN registrar used to reverse-resolve creator → operator; none on a
+   *  server with no naming service, where the custody record decides alone. */
+  registrar: string | undefined;
   /** Require an owning account or a PAN-registered operator to provision
    *  (a core server without either can turn it off). */
   requireOperator: boolean;
@@ -500,7 +501,7 @@ export class RoomsService {
     const hit = this.operatorCache.get(agentId);
     if (hit && Date.now() - hit.at < 300_000) return hit.operator;
     let operator: string | null = null;
-    try {
+    if (CONFIG.registrar) try {
       const res = await fetch(
         `${CONFIG.registrar}/api/resolve?agent_id=${encodeURIComponent(agentId)}`,
         { signal: AbortSignal.timeout(8000) },

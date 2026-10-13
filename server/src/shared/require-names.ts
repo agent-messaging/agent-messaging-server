@@ -58,8 +58,8 @@ export type NameAnswer =
 
 /** The naming service's base URL: PAN_URL or PAN_REGISTRAR, read by exact
  *  name, as the api service reads it. */
-export function panBase(env: NodeJS.ProcessEnv = process.env): string {
-  return (env.PAN_URL ?? env.PAN_REGISTRAR ?? namingUrl()).replace(/\/$/, "");
+export function panBase(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  return (env.PAN_URL ?? env.PAN_REGISTRAR ?? namingUrl())?.replace(/\/$/, "");
 }
 
 export interface NameLookupOptions {
@@ -105,6 +105,9 @@ export function makeNameLookup(opts: NameLookupOptions = {}): NameLookup {
     let answer: NameAnswer;
     try {
       const base = opts.base ?? panBase();
+      // No naming service: nobody can be found named. The rule that asks
+      // (MESH_REQUIRE_NAMES) is off on a server that offers no naming.
+      if (!base) return { status: "unreachable" };
       const r = await fetchImpl(`${base}/api/resolve?agent_id=${encodeURIComponent(agentKey)}`, {
         signal: AbortSignal.timeout(opts.timeoutMs ?? 6000),
       });
