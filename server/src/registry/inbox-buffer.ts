@@ -209,9 +209,10 @@ export class InboxBuffer {
     try {
       const box = this.boxes.member(agentId);
       let info: StreamState | null = null;
-      // The registry creates the mailbox fire-and-forget, so on guard (which
-      // arrives right after register) the stream may not exist yet. Wait
-      // briefly for it — but never create one here: a sandbox agent has no
+      // The registry answers a registration once the mailbox is made, but only
+      // up to a bound (handlers/register.ts, MAILBOX_WAIT_MS), so on guard
+      // (which arrives right after register) the stream may still not exist.
+      // Wait briefly for it — but never create one here: a sandbox agent has no
       // mailbox by design, and after the wait a genuine absence is a no-op.
       for (let i = 0; i < 12; i++) {
         try {

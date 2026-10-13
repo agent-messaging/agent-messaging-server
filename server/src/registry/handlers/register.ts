@@ -52,6 +52,32 @@ export interface RegisterNaming {
   lookup?: NameLookup;
 }
 
+/**
+ * How long a registration's answer waits for the agent's mailbox to be made.
+ * Making one is a few round trips to the broker and the database; this bound
+ * is for a broker that is down or stalled, and stays well inside the SDK's
+ * five-second register timeout so the answer still arrives.
+ */
+export const MAILBOX_WAIT_MS = 2000;
+
+/** Wait for the mailbox, up to MAILBOX_WAIT_MS. Past that the registration is
+ *  answered anyway and the mailbox is finished in the background; the agent's
+ *  node finds it on its next pass. */
+async function mailboxMade(making: Promise<void>, agentId: string): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<"late">((resolve) => {
+    timer = setTimeout(() => resolve("late"), MAILBOX_WAIT_MS);
+  });
+  const outcome = await Promise.race([making.then(() => "made" as const), late]);
+  clearTimeout(timer);
+  if (outcome === "late") {
+    console.error(
+      `[registry] the mailbox for ${agentId.slice(0, 12)}… was not made within ${MAILBOX_WAIT_MS} ms; ` +
+        `the registration is answered and the mailbox is still being made`,
+    );
+  }
+}
+
 export async function handleRegister(
   env: Envelope,
   kv: KeyedStore,
@@ -403,11 +429,17 @@ export async function handleRegister(
   cache.set(manifest.id, manifest);
 
   // Offline-delivery buffer (§16.4): a registered agent gets a mailbox;
-  // sandbox agents deliberately do not (live-only contract). Fire-and-forget:
-  // registration never fails because the buffer tier is down.
+  // sandbox agents deliberately do not (live-only contract). The answer waits
+  // for the mailbox, because once an agent is told it is registered, a message
+  // to it must be kept. On JetStream the mailbox stream is what captures the
+  // inbox subject; on RabbitMQ it is the only queue bound to it besides the
+  // node's live subscription, and a message published while neither exists is
+  // dropped by the exchange (binding document §6.1). The wait is bounded, and
+  // `ensure` never throws, so registration still never fails or hangs because
+  // the buffer tier is down.
   if (inboxBuffer) {
     if (manifest.sandbox) void inboxBuffer.remove(manifest.id);
-    else void inboxBuffer.ensure(manifest.id);
+    else await mailboxMade(inboxBuffer.ensure(manifest.id), manifest.id);
   }
 
   // Seed presence for the hosting node (liveness lives in the presence store).
