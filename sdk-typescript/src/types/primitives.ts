@@ -32,7 +32,7 @@ export interface DiscoverQuery {
   /** Where the agent's identity came from (§9.7 `identity_source`): every
    *  member given must match. Agents with no recorded source are excluded
    *  whenever this is set. */
-  identity_source?: { kind?: IdentitySourceKind; issuer?: string; trust_domain?: string };
+  identity_source?: { kind?: IdentitySourceKind | IdentitySourceKind[]; issuer?: string; trust_domain?: string };
   version?: string;
   limit?: number;
   /** Only these agents, by agent ID (§9.3). Naming is not browsing: an

@@ -277,6 +277,8 @@ export interface DescribeDocument {
   /** Where the agent's identity came from (§9.7): the mesh's attested
    *  record, read from the registry, never the agent's own word. */
   identity_source?: import("./types/manifest.js").IdentitySource;
+  /** The mesh's signed portable attestation that carries it (§9.7), to check offline. */
+  identity_source_attestation?: Record<string, unknown>;
   [extra: string]: unknown;
 }
 

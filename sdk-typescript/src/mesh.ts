@@ -4018,7 +4018,11 @@ export class AgentMesh {
     const out = (res.payload as { output?: unknown } | undefined)?.output ?? res.payload;
     if (!out || typeof out !== "object") throw new MeshError(ErrorCode.INVALID_ENVELOPE, `${target} answered describe with no document.`, { retryable: false });
     const { identity_source: _claimed, ...doc } = out as DescribeDocument;
-    return (registered?.identity_source ? { ...doc, identity_source: registered.identity_source } : doc) as DescribeDocument;
+    const { identity_source_attestation: _claimedAtt, ...rest } = doc as DescribeDocument & { identity_source_attestation?: unknown };
+    const reg = registered as (typeof registered & { identity_source_attestation?: Record<string, unknown> }) | null;
+    return (reg?.identity_source
+      ? { ...rest, identity_source: reg.identity_source, ...(reg.identity_source_attestation ? { identity_source_attestation: reg.identity_source_attestation } : {}) }
+      : rest) as DescribeDocument;
   }
 
   // ── the mesh's own requests (platform-services/*.json, "part": "mesh") ──

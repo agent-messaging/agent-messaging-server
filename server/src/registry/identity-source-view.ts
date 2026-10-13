@@ -20,6 +20,7 @@ const REOPEN_MS = 5000;
 
 export class IdentitySourceView {
   private map = new Map<string, IdentitySource>();
+  private attestations = new Map<string, Record<string, unknown>>();
   private iter: KeyedWatch | null = null;
   private lastRevision = 0;
   private stopped = false;
@@ -36,9 +37,15 @@ export class IdentitySourceView {
     return this.map.size;
   }
 
+  /** The signed portable attestation that carries it (§9.7), when there is one. */
+  attestation(agent: string): Record<string, unknown> | undefined {
+    return this.attestations.get(agent);
+  }
+
   /** Set one directly (tests, and the doors in the same process). */
-  set(agent: string, source: IdentitySource): void {
+  set(agent: string, source: IdentitySource, attestation?: Record<string, unknown>): void {
     this.map.set(agent, source);
+    if (attestation) this.attestations.set(agent, attestation); else this.attestations.delete(agent);
   }
 
   async start(): Promise<void> {
@@ -55,10 +62,10 @@ export class IdentitySourceView {
 
   private apply(e: KeyedEntry): void {
     if (e.revision > this.lastRevision) this.lastRevision = e.revision;
-    if (e.operation !== "PUT" || !e.value.length) { this.map.delete(e.key); return; }
-    const rec = e.json<{ identity_source?: IdentitySource }>();
-    if (rec?.identity_source && typeof rec.identity_source.kind === "string") this.map.set(e.key, rec.identity_source);
-    else this.map.delete(e.key);
+    if (e.operation !== "PUT" || !e.value.length) { this.map.delete(e.key); this.attestations.delete(e.key); return; }
+    const rec = e.json<{ identity_source?: IdentitySource; attestation?: Record<string, unknown> }>();
+    if (rec?.identity_source && typeof rec.identity_source.kind === "string") this.set(e.key, rec.identity_source, rec.attestation);
+    else { this.map.delete(e.key); this.attestations.delete(e.key); }
   }
 
   private async open(): Promise<void> {
@@ -92,23 +99,27 @@ export class IdentitySourceView {
   }
 }
 
-/** Whether an identity source meets a discovery filter: every member given matches. */
+/** Whether an identity source meets a discovery filter (§9.3): every member
+ *  given matches, `kind` being one kind or a list of them. An agent with no
+ *  record counts as `kind: "mesh"`, with no issuer and no trust domain. */
 export function identitySourceMatches(
   source: IdentitySource | undefined,
   want: { kind?: unknown; issuer?: unknown; trust_domain?: unknown } | undefined,
 ): boolean {
   if (!want || typeof want !== "object") return true;
-  const asked = (["kind", "issuer", "trust_domain"] as const).filter((k) => typeof want[k] === "string");
-  if (!asked.length) return true;
-  if (!source) return false;
-  return asked.every((k) => source[k] === want[k]);
+  const kinds = typeof want.kind === "string" ? [want.kind] : Array.isArray(want.kind) ? want.kind.filter((k): k is string => typeof k === "string") : null;
+  const kind = source?.kind ?? "mesh";
+  if (kinds && !kinds.includes(kind)) return false;
+  if (typeof want.issuer === "string" && source?.issuer !== want.issuer) return false;
+  if (typeof want.trust_domain === "string" && source?.trust_domain !== want.trust_domain) return false;
+  return true;
 }
 
 /** A manifest with the mesh's own identity source in place of anything the registration said. */
 export function withIdentitySource<M extends { id: string; identity_source?: unknown }>(m: M, view: IdentitySourceView | null): M {
+  const { identity_source: _drop, identity_source_attestation: _dropAtt, ...rest } = m as M & { identity_source_attestation?: unknown };
   const source = view?.get(m.id);
-  if (source) return { ...m, identity_source: source };
-  if (m.identity_source === undefined) return m;
-  const { identity_source: _drop, ...rest } = m;
-  return rest as M;
+  if (!source) return rest as M;
+  const att = view?.attestation(m.id);
+  return { ...rest, identity_source: source, ...(att ? { identity_source_attestation: att } : {}) } as M;
 }

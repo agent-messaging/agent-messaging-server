@@ -155,7 +155,10 @@ export class ProofGate {
     let claims: Record<string, unknown> = {};
     try { claims = decodeJwt(p.token) as Record<string, unknown>; } catch { /* the key chain refuses it */ }
     if (p.kind === "jwt-svid") return `spiffe:${String(claims.sub ?? "")}`;
-    return `oauth:${createHash("sha256").update(`${String(claims.iss ?? "")}\n${String(claims.sub ?? "")}`).digest("hex")}`;
+    // The caller_ref (§4.15): SHA-256 of the issuer and the workload id
+    // (client_id, else sub), which is also the key in the identity pool.
+    const workload = typeof claims.client_id === "string" && claims.client_id ? claims.client_id : String(claims.sub ?? "");
+    return `oauth:${createHash("sha256").update(`${String(claims.iss ?? "")}\n${workload}`).digest("hex")}`;
   }
 
   /**
@@ -198,6 +201,8 @@ export class ProofGate {
       caller_id: callerId,
       caller_sig: sign(`mesh-bridge-hosted-v1:${ts}:${nodeId}:${callerId}`),
       proof: { kind: p.kind, token: p.token },
+      // The front the caller called: a token may name it in aud (RFC 8707).
+      audiences: [req.url],
       ...(jkt ? { binding: { jkt } } : {}),
     };
     let res: Response;

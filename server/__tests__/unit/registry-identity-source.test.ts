@@ -53,11 +53,14 @@ describe("identity_source in discovery", () => {
   it("filters on kind, issuer and trust domain, every member given matching", async () => {
     expect((await run({ identity_source: { kind: "oauth" } })).map((a) => a.id)).toEqual(["UOAUTH"]);
     expect((await run({ identity_source: { kind: "oauth", issuer: "https://other.example" } })).map((a) => a.id)).toEqual([]);
-    expect((await run({ identity_source: { kind: "mesh" } })).map((a) => a.id)).toEqual(["UMESH"]);
+    // An agent with no record counts as kind mesh, and kind may be a list.
+    expect((await run({ identity_source: { kind: "mesh" } })).map((a) => a.id)).toEqual(["UMESH", "ULIAR"]);
+    expect((await run({ identity_source: { kind: ["oauth", "spiffe"] } })).map((a) => a.id)).toEqual(["UOAUTH", "USPIFFE"]);
   });
 
   it("matches strictly", () => {
     expect(identitySourceMatches(undefined, { kind: "oauth" })).toBe(false);
+    expect(identitySourceMatches(undefined, { kind: "mesh", issuer: "i" })).toBe(false);
     expect(identitySourceMatches(undefined, {})).toBe(true);
     expect(identitySourceMatches({ kind: "bridged", issuer: "i", since: "x" }, { kind: "bridged", issuer: "i" })).toBe(true);
   });

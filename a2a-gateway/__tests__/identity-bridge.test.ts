@@ -139,7 +139,7 @@ describe("the MCP front", () => {
     expect(JSON.stringify(reg.opts)).toContain(IDENTITY_BRIDGE_URI);
     expect(JSON.stringify(reg.opts)).not.toContain("a2a_bridge");
     // send goes out as that identity.
-    const sent = await (await mcp(ctx.base, auth, { method: "tools/call", params: { name: "send", arguments: { agent: "U" + "A".repeat(55), text: "hello" } } })).json();
+    const sent = await (await mcp(ctx.base, auth, { method: "tools/call", params: { name: "send", arguments: { to: "U" + "A".repeat(55), text: "hello" } } })).json();
     expect(sent.result.isError).toBe(false);
     expect(ctx.mesh.requests.at(-1)).toMatchObject({ from: who.result.structuredContent.agent_id, offering: "chat", input: { text: "hello" } });
   });
@@ -170,7 +170,7 @@ describe("the MCP front", () => {
     ctx = await boot();
     const auth = `Bearer ${await token({})}`;
     expect((await (await mcp(ctx.base, auth, { method: "tools/call", params: { name: "nope", arguments: {} } })).json()).error.code).toBe(-32602);
-    const bad = await (await mcp(ctx.base, auth, { method: "tools/call", params: { name: "send", arguments: { agent: "U" + "A".repeat(55), text: "" } } })).json();
+    const bad = await (await mcp(ctx.base, auth, { method: "tools/call", params: { name: "send", arguments: { to: "U" + "A".repeat(55), text: "" } } })).json();
     expect(bad.result).toMatchObject({ isError: true });
     expect(bad.result.content[0].text).toMatch(/INPUT_INVALID/);
   });

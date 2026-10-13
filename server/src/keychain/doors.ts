@@ -48,7 +48,7 @@ import { customerMintSeed } from "./split-keys.js";
 import { mintRefusal, partitionRoster, stopFor, stopsForKeys, type AgentOwnership, type StopFinding } from "./stop-rules.js";
 import type { StopList } from "./stop-store.js";
 import type { TenantLimitList } from "./tenant-limits.js";
-import { identitySourceOf, verifyOutsideProof, type IdentitySource, type ProofDeps, type ProofInput, type VerifiedProof } from "./outside-proof.js";
+import { identitySourceOf, reasonOf, verifyOutsideProof, type IdentitySource, type ProofDeps, type ProofInput, type VerifiedProof } from "./outside-proof.js";
 import { workloadKey, type IdentitySourceList, type WorkloadBindingList } from "./identity-records.js";
 
 export interface DoorAnswer {
@@ -427,7 +427,8 @@ export function credentialDoors(deps: DoorDeps) {
     }, deps.proofs);
     if (!v.ok) {
       console.log(`${log} bootstrap: an outside proof was refused for ${b.agent_id.slice(0, 12)}…: ${v.code}`);
-      return refused(v.status, v.code, v.error);
+      metrics.event({ kind: "node_credential_refused", actor: b.agent_id, meta: { door: "bootstrap-proof", reason: v.code } });
+      return reply(v.status, { error: v.error, code: v.code, details: { reason: reasonOf(v.code) } });
     }
     const p = v.proof;
     const agentId = b.agent_id;
@@ -583,7 +584,7 @@ export function credentialDoors(deps: DoorDeps) {
    */
   async function bridgedCaller(b: {
     node_id?: string; ts?: number; node_sig?: string; caller_id?: string; caller_sig?: string;
-    proof?: unknown; binding?: { jkt?: unknown; x5t?: unknown };
+    proof?: unknown; binding?: { jkt?: unknown; x5t?: unknown }; audiences?: unknown;
   } | null): Promise<DoorAnswer> {
     const reply = (status: number, body: Record<string, unknown>): DoorAnswer => ({ status, body });
     if (!deps.proofs) return reply(403, { error: "This mesh accepts no outside proofs.", code: "proofs_not_offered" });
@@ -600,9 +601,11 @@ export function credentialDoors(deps: DoorDeps) {
     const v = await verifyOutsideProof(proof, {
       method: "POST",
       urls: [],
+      // The front the caller called (RFC 8707): a token may name it in aud.
+      ...(Array.isArray(b.audiences) ? { extraAudiences: (b.audiences as unknown[]).filter((x): x is string => typeof x === "string" && /^https?:\/\//.test(x)).slice(0, 4) } : {}),
       ...(bound ? { verifiedBinding: { ...(typeof bound.jkt === "string" ? { jkt: bound.jkt } : {}), ...(typeof bound.x5t === "string" ? { x5t: bound.x5t } : {}) } } : {}),
     }, deps.proofs);
-    if (!v.ok) return reply(v.status, { error: v.error, code: v.code });
+    if (!v.ok) return reply(v.status, { error: v.error, code: v.code, details: { reason: reasonOf(v.code) } });
     const p = v.proof;
     const caller = b.caller_id;
     const tenant = p.tenant;
@@ -639,7 +642,7 @@ export function credentialDoors(deps: DoorDeps) {
     if (holder && holder.id !== tenant) return reply(409, { error: EXCLUSIVITY_ERROR, code: "held_elsewhere" });
 
     const scope = p.kind === "oauth" ? p.issuer! : "spiffe";
-    const callerRef = p.kind === "oauth" ? createHash("sha256").update(`${p.issuer}\n${p.subject}`).digest("hex") : p.workload_id;
+    const callerRef = p.kind === "oauth" ? createHash("sha256").update(`${p.issuer}\n${p.workload_id}`).digest("hex") : p.workload_id;
     const prior = await deps.identitySources?.get(caller).catch(() => null);
     const same = prior?.identity_source.kind === "bridged" && prior.identity_source.bridge === b.node_id && prior.identity_source.workload_id === p.workload_id;
     const source: IdentitySource = same ? prior!.identity_source : identitySourceOf(p, new Date().toISOString(), b.node_id);
@@ -777,7 +780,7 @@ export function credentialDoors(deps: DoorDeps) {
         const first = proofRefused[0]!;
         console.log(`${log} node-credential REFUSED for ${b.node_id.slice(0, 12)}…: ${first.code} (${ip})`);
         metrics.event({ kind: "node_credential_refused", actor: b.node_id, meta: { agents: ids.length, reason: first.code } });
-        return reply(401, { error: first.error, code: first.code, refused: proofRefused.map(({ id, code }) => ({ id, code })) });
+        return reply(401, { error: first.error, code: first.code, details: { reason: reasonOf(first.code) }, refused: proofRefused.map(({ id, code }) => ({ id, code })) });
       }
       const off = new Set(proofRefused.map((r) => r.id));
       ids.splice(0, ids.length, ...ids.filter((k) => !off.has(k)));

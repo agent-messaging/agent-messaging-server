@@ -84,6 +84,22 @@ export interface ProofRequest {
    *  hash. Accepted in place of a DPoP proof or a client certificate here,
    *  and only from a node this mesh names as a bridge. */
   verifiedBinding?: { jkt?: string; x5t?: string };
+  /** At a bridge: the front's own URL, which a token may name in `aud` in
+   *  place of the trust record's audience (RFC 8707). */
+  extraAudiences?: string[];
+}
+
+/** The reason a refusal is given under (SPEC §4.14, `details.reason`). */
+export function reasonOf(code: string): string {
+  switch (code) {
+    case "proof_issuer_untrusted": return "issuer_not_trusted";
+    case "proof_expired": case "proof_not_yet_valid": return "proof_expired";
+    case "proof_wrong_audience": return "audience_mismatch";
+    case "proof_alg_refused": return "algorithm_refused";
+    case "proof_binding_required": case "dpop_required": case "mtls_required": return "binding_required";
+    case "dpop_key_mismatch": case "mtls_cert_mismatch": case "dpop_invalid": return "binding_mismatch";
+    default: return "proof_invalid";
+  }
 }
 
 /** A proof that passed, and what it says. */
@@ -328,16 +344,24 @@ async function verifyOAuth(token: string, req: ProofRequest, deps: ProofDeps, no
   const trusted = oauthTrustFor(all, claims.iss);
   if (!trusted.length) return refuse(401, "proof_issuer_untrusted", "No tenant on this mesh trusts the issuer of this token.");
   const aud = audienceOf(claims);
-  const fits = trusted.filter((t) => aud.includes(t.anchor.audience));
+  let fits = trusted.filter((t) => aud.includes(t.anchor.audience));
+  // At a bridge, a token may name the front it was asked for instead (RFC
+  // 8707, what MCP clients request): the issuer's one tenant still decides.
+  let audience = fits[0]?.anchor.audience;
+  if (!fits.length) {
+    const front = (req.extraAudiences ?? []).find((a) => aud.includes(a));
+    if (front) { fits = trusted.slice(0, 1); audience = front; }
+  }
   if (!fits.length) return refuse(401, "proof_wrong_audience", "The token is not meant for this mesh: its aud names none of the audiences this mesh's tenants set for its issuer.");
-  if (fits.length > 1) return refuse(401, "proof_ambiguous", "The token's aud names the audiences of more than one tenant, so it cannot say which tenant the agent joins.");
+  if (new Set(fits.map((f) => f.tenant)).size > 1) return refuse(401, "proof_ambiguous", "The token's aud names the audiences of more than one tenant, so it cannot say which tenant the agent joins.");
   const { tenant, anchor } = fits[0]!;
-  const v = await verifyAgainst(token, (refresh) => deps.keys.oauthKeys(anchor, refresh), { issuer: anchor.issuer, audience: anchor.audience, now });
+  const v = await verifyAgainst(token, (refresh) => deps.keys.oauthKeys(anchor, refresh), { issuer: anchor.issuer, audience: audience!, now });
   if (!v.ok) return refusalFor(v, "token");
   const p = v.payload;
   if (typeof p.iat === "number" && p.iat > Math.floor(now / 1000) + SKEW_S) return refuse(401, "proof_not_yet_valid", "The token is dated in the future.");
   if (typeof p.sub !== "string" || !p.sub) return refuse(401, "proof_invalid", "The token names no subject (sub).");
-  const workload = [p.client_id, p.azp, p.sub].find((x): x is string => typeof x === "string" && x.length > 0)!;
+  // The workload identifier (§9.7): client_id, else sub.
+  const workload = [p.client_id, p.sub].find((x): x is string => typeof x === "string" && x.length > 0)!;
   const b = await bindingOf(p, token, anchor.require_binding, req, deps.replay, now);
   if (!b.ok) return b;
   return {

@@ -193,10 +193,15 @@ export function addRefusal(all: Map<string, TrustRecord[]>, tenant: string, reco
   for (const [t, list] of all) {
     for (const r of list) {
       if (t === tenant && r.id === record.id) return { status: 409, error: `This tenant already has a trust record with the id ${record.id}.` };
-      if (sameClaim(r, record)) {
-        return t === tenant
-          ? { status: 409, error: `This tenant already trusts that ${record.kind === "oauth" ? "issuer and audience" : "trust domain"} (record ${r.id}).` }
-          : { status: 409, error: `Another tenant already trusts that ${record.kind === "oauth" ? "issuer and audience" : "trust domain"}. A proof has to name one tenant, so each can be trusted by one tenant only.` };
+      if (t === tenant && sameClaim(r, record)) {
+        return { status: 409, error: `This tenant already trusts that ${record.kind === "oauth" ? "issuer and audience" : "trust domain"} (record ${r.id}).` };
+      }
+      // An issuer or a trust domain belongs to one account per mesh (§4.14),
+      // so a proof always names exactly one tenant.
+      const sameSource = r.kind === "oauth" && record.kind === "oauth" ? r.issuer === record.issuer
+        : r.kind === "spiffe" && record.kind === "spiffe" ? r.trust_domain === record.trust_domain : false;
+      if (t !== tenant && sameSource) {
+        return { status: 409, error: `Another tenant already trusts that ${record.kind === "oauth" ? "issuer" : "trust domain"}. An issuer or a trust domain belongs to one account on a mesh, so a proof always names one.` };
       }
     }
   }

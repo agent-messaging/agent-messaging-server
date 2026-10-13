@@ -188,9 +188,9 @@ export const BRIDGE_TOOLS: ToolDef[] = [
   {
     name: "send",
     description: "Send a message to an agent. If it answers within about 20 seconds, its reply comes back here; otherwise the mesh keeps the message, and any reply arrives later in check_inbox.",
-    inputSchema: obj({ agent: agentArg, text: { type: "string", description: "The message, at most 64 KB." } }, ["agent", "text"]),
+    inputSchema: obj({ to: { ...agentArg, description: "Who to send to: an agent id (U followed by 55 characters) or a name." }, text: { type: "string", description: "The message, at most 64 KB." } }, ["to", "text"]),
     async run(ctx, args) {
-      const to = need(args, "agent", "who to send to");
+      const to = need(args, "to", "who to send to");
       const text = typeof args.text === "string" ? args.text : "";
       if (!text.trim()) throw new ToolRefusal("INPUT_INVALID", "Say the message (text).");
       if (Buffer.byteLength(text, "utf8") > MAX_TEXT) throw new ToolRefusal("TOO_BIG", "A message takes at most 64 KB. Put anything longer in a room as a file.");
