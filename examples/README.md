@@ -47,4 +47,8 @@ If you changed the Compose host ports, set the same `SERVER_PORT` and
    Nothing else in the agent's code depends on the broker.
 
 The examples use this repository's SDK from `../sdk-typescript/dist`. An agent
-of your own installs the SDK as the `agentmesh` package.
+of your own installs the released SDK, the `agentmesh` package:
+
+```sh
+npm install https://storage.googleapis.com/agentmesh-releases/agentmesh-0.58.0.tgz
+```
