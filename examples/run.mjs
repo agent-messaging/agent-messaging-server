@@ -66,8 +66,9 @@ for (const ex of examples) {
   console.log(`\n=== ${ex} on ${broker} ===`);
   const started = Date.now();
   const r = spawnSync(process.execPath, [join(HERE, ex, "run.mjs")], { env, stdio: "inherit", timeout: 180_000 });
-  results.push({ ex, ok: r.status === 0, s: ((Date.now() - started) / 1000).toFixed(1) });
+  // Exit code 3: the example says why it cannot run on this mesh (a setting it needs is off).
+  results.push({ ex, ok: r.status === 0, skip: r.status === 3, s: ((Date.now() - started) / 1000).toFixed(1) });
 }
 console.log(`\nExamples on ${broker}:`);
-for (const r of results) console.log(`  ${r.ok ? "PASS" : "FAIL"}  ${r.ex}  (${r.s} s)`);
-process.exit(results.every((r) => r.ok) ? 0 : 1);
+for (const r of results) console.log(`  ${r.ok ? "PASS" : r.skip ? "SKIP" : "FAIL"}  ${r.ex}  (${r.s} s)`);
+process.exit(results.every((r) => r.ok || (r.skip && !process.env.EXAMPLES_NO_SKIP)) ? 0 : 1);

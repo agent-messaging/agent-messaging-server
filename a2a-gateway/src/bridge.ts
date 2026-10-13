@@ -450,6 +450,8 @@ export class Bridge {
     // down must not turn into a 500 for a caller whose actual work — the mesh
     // request — is about to go through fine. It is retried on the next use.
     if (!entry.markerRegistered) await this.registerCallerMarker(entry);
+    // A caller that is not an A2A client (a sandbox key) keeps an inbox, as the HTTPS and MCP fronts read it.
+    if (!isA2aKind(entry.kind)) await this.ensureInbox(key).catch(() => undefined);
     return entry.agent;
   }
 
@@ -567,6 +569,8 @@ export class Bridge {
     entry.lastUsed = Date.now();
     this.config.callerStore?.touch(key);
     if (!entry.markerRegistered) await this.registerCallerMarker(entry);
+    // Its inbox from the first call, so what other agents send it waits there.
+    await this.ensureInbox(key).catch((err) => console.warn(`[bridge] the inbox of caller ${entry!.ref.slice(0, 8)} did not start: ${(err as Error).message}`));
     return { agent: entry.agent, key, caller: entry.bridged! };
   }
 

@@ -1,0 +1,11 @@
+# SPIRE beside the mesh for example 07: one SPIRE server, which is the
+# trust domain example.org's authority. The example asks it for a JWT-SVID
+# and for the trust bundle, and stops it at the end.
+name: agent-messaging-example-spire
+
+services:
+  spire-server:
+    image: ghcr.io/spiffe/spire-server:1.11.0
+    command: ["-config", "/conf/server.conf"]
+    volumes:
+      - ./server.conf:/conf/server.conf:ro

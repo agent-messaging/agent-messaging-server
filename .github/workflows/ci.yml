@@ -79,6 +79,10 @@ jobs:
 
       - name: Bring the mesh up from empty
         working-directory: deploy/compose/${{ matrix.broker }}
+        # The identity profile and example 08 run a test issuer over http on
+        # this machine; only a test mesh is started with this on.
+        env:
+          MESH_TRUST_ALLOW_HTTP: "on"
         run: |
           docker compose build
           docker compose up -d --wait --wait-timeout 300
@@ -100,7 +104,12 @@ jobs:
       - name: The core conformance profile
         run: node tools/conformance.mjs ${{ matrix.broker }} --ci
 
+      - name: The identity profile (bring your own identity)
+        run: node tools/identity-profile.mjs ${{ matrix.broker }} --ci
+
       - name: The examples
+        env:
+          EXAMPLES_NO_SKIP: "1"
         run: node examples/run.mjs ${{ matrix.broker }}
 
       - name: Logs, on failure
