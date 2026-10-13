@@ -1,0 +1,20 @@
+{
+  "name": "agent-messaging-server-scenario-laptop-purchase",
+  "private": true,
+  "type": "module",
+  "description": "A business scenario against the Agent Messaging Server: a laptop purchase between an internal company and an external vendor. Uses this repository's SDK (../../sdk-typescript).",
+  "license": "Apache-2.0",
+  "scripts": {
+    "nats": "node run.mjs nats",
+    "rabbitmq": "node run.mjs rabbitmq",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "agent-messaging": "file:../../sdk-typescript"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.2",
+    "typescript": "5.6.3",
+    "vitest": "3.2.4"
+  }
+}

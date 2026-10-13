@@ -1,0 +1,23 @@
+{
+  "_comment": "Defaults for the laptop purchase scenario. Every value can be overridden by the environment variable named in src/config.ts (for example SHIP_DELAY_MS=7200000 for a two-hour shipment).",
+  "ship_delay_ms": 8000,
+  "approval_delay_ms": 1500,
+  "approval_review_ms": 500,
+  "quote_timeout_ms": 5000,
+  "quote_ttl_ms": 60000,
+  "auto_approve_limit_usd": 2000,
+  "offline_window_ms": 4000,
+  "requirements": {
+    "employee": "new hire, engineering",
+    "cpu_cores_min": 8,
+    "ram_gb_min": 32,
+    "storage_gb_min": 512,
+    "screen_in_max": 15,
+    "budget_usd": 2500
+  },
+  "vendor_catalog": [
+    { "sku": "LT-14-PRO", "model": "Vendor 14 Pro", "cpu_cores": 10, "ram_gb": 32, "storage_gb": 1024, "screen_in": 14, "price_usd": 1899 },
+    { "sku": "LT-16-MAX", "model": "Vendor 16 Max", "cpu_cores": 14, "ram_gb": 64, "storage_gb": 2048, "screen_in": 16, "price_usd": 3299 },
+    { "sku": "LT-13-AIR", "model": "Vendor 13 Air", "cpu_cores": 8, "ram_gb": 16, "storage_gb": 512, "screen_in": 13, "price_usd": 1199 }
+  ]
+}
