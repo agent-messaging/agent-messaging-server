@@ -45,8 +45,8 @@ docker compose up -d
 ```
 
 The first start builds the two images from this clone (to run the released
-images instead, set `SERVER_IMAGE=ghcr.io/jeffrschneider/agent-messaging-server:0.1.0`
-and `GATEWAY_IMAGE=ghcr.io/jeffrschneider/agent-messaging-a2a-gateway:0.1.0`), runs first-run setup
+images instead, set `SERVER_IMAGE=ghcr.io/jeffrschneider/agent-messaging-server:0.1.1`
+and `GATEWAY_IMAGE=ghcr.io/jeffrschneider/agent-messaging-a2a-gateway:0.1.1`), runs first-run setup
 once (the operator key, the signing keys, the broker's settings and the first
 admin token, all in the Compose volume `config`), and starts NATS, the server
 and the A2A gateway. Every port is published on 127.0.0.1 only.
@@ -93,7 +93,7 @@ down in [docs/rabbitmq-binding.md](docs/rabbitmq-binding.md).
 | `server/` | The server: the core services, first-run setup (`src/setup/`), the admin API (`src/admin/`), the storage layer for both brokers (`src/storage/`), and `tools/mesh-admin.mjs`. |
 | `a2a-gateway/` | The A2A gateway. Its mapping between Agent Messaging and A2A is [MAPPING.md](a2a-gateway/MAPPING.md). |
 | `sdk-typescript/` | The TypeScript SDK (the `agentmesh` package), with transports for NATS and for AMQP. |
-| `conformance/` | The conformance suite's core profile, and the specification it tests. |
+| `conformance/` | The conformance suite's core profile, and the specification it tests, copied from where the specification is written (see [changes and releases](docs/releasing.md)). |
 | `deploy/compose/` | Docker Compose for NATS, and for RabbitMQ with Postgres. |
 | `deploy/kubernetes/` | Kubernetes manifests for both, on one node. |
 | `docs/` | The [operator handbook](docs/operator-handbook.md), the [sizing guide](docs/sizing.md), the RabbitMQ binding, and [changes and releases](docs/releasing.md). |
