@@ -51,7 +51,11 @@ stay there and keep working. The first release after the move publishes under
 every image reference: `README.md`, `deploy/compose/nats/.env.example`,
 `deploy/compose/nats/README.md`, `deploy/compose/rabbitmq/.env.example` and
 both `deploy/kubernetes/*/mesh.yaml`. The CI workflows match any owner, so they
-need no change. AgentMesh pins the server by release tag and SDK tarball, so it
+need no change. On https://agentmessaging.ai, the "Start in five minutes" and
+"Upgrades and backups" pages (`run.html` and `run-operate.html` in
+`agent-messaging/agentmessaging.ai`) build the image name from the newest
+release's version, so their `ghcr.io/jeffrschneider/` prefix must switch the
+same day the release publishes. AgentMesh pins the server by release tag and SDK tarball, so it
 only needs its pin moved, as for any release.
 
 Use a patch release (0.1.1) for fixes and anything that adds without changing
