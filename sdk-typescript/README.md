@@ -21,7 +21,7 @@ that into what `AgentMesh.connect` needs. The same agent code runs on either.
 The package is not on npm yet. Install the release tarball:
 
 ```bash
-npm install https://storage.googleapis.com/agentmesh-releases/agent-messaging-SDK_VERSION.tgz
+npm install https://storage.googleapis.com/agentmesh-releases/agent-messaging-0.59.0.tgz
 ```
 
 or build it from this repository:
