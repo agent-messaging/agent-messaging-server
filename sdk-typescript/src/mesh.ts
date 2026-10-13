@@ -175,6 +175,9 @@ import {
   MAX_SEEN_INBOX_IDS,
   MAX_SEEN_EVENT_IDS,
   DEFAULT_MAX_INBOUND_CHARS,
+  TASK_RECORD_TIMEOUT_MS,
+  TASK_RECORD_RECHECK_MS,
+  TASK_RECORD_POLL_MAX_MS,
 } from "./constants.js";
 import { fenceInboundInput, inboundTextLength } from "./internal/fence.js";
 import { cardText, fitCheck, inputNotUnderstood, isHelpQuestion, offeringsFromManifest } from "./input-fit.js";
@@ -491,6 +494,12 @@ export class AgentMesh {
    *  revisions and progress arrive on `mesh.task.<id>.update`. Torn down when
    *  the task goes terminal, and wholesale on detach. */
   private taskUpdateSubs = new Map<string, Subscription>();
+  /** Per watched Task: resolves when its update subscription is live on the
+   *  broker (watchTaskUpdates). */
+  private taskUpdateBound = new Map<string, Promise<void>>();
+  /** Per watched Task still running after its first record read: the one
+   *  later read (watchTaskUpdates). Cleared on unwatch and detach. */
+  private taskRecheckTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private taskUpdateHandler: TaskUpdateHandler | null = null;
   /** Delegations (§10.8): sub-requests a handler issued for an inbound task,
    *  recorded via the ambient dispatch context. Parent task id → the offering
@@ -2031,6 +2040,7 @@ export class AgentMesh {
         revoked: true,
         ...(typeof at === "string" ? { revokedAt: at } : {}),
         ...(typeof to === "string" ? { replacedBy: to } : {}),
+        ...(err.details.status === "terminated" ? { terminated: true } : {}),
       };
     }
     // The kill switch (§9 registry status): a paused agent's manifest says
@@ -2141,6 +2151,10 @@ export class AgentMesh {
           queued: true,
           inbox_id: c.inbox_id,
           ...(typeof c.text === "string" ? { text: c.text } : {}),
+          // The mesh's answer for a paused agent (§4.12) says so, with the
+          // reason a stop carries everywhere else (`agent_paused`).
+          ...(c.paused === true ? { paused: true as const } : {}),
+          ...(typeof c.code === "string" ? { reason: c.code } : {}),
         };
       }
     }
@@ -2153,9 +2167,13 @@ export class AgentMesh {
   private queuedError(ack: QueuedAck, request: Envelope): MeshError {
     return new MeshError(
       ErrorCode.REQUEST_QUEUED,
-      `The target's node queued this request (inbox ${ack.inbox_id}) for an attended session ` +
-        `(§6.4a, §16.4). That is delivery to a held mailbox, not an answer: the real reply, if ` +
-        `any, arrives later at this agent's own inbox, correlated by in_reply_to.`,
+      ack.paused
+        ? `${request.to ?? "The target"} is paused: the mesh stopped it (§4.12). This request waits in its ` +
+            `inbox (${ack.inbox_id}) and is delivered when it resumes; its reply, if any, arrives then at ` +
+            `this agent's own inbox, correlated by in_reply_to.`
+        : `The target's node queued this request (inbox ${ack.inbox_id}) for an attended session ` +
+            `(§6.4a, §16.4). That is delivery to a held mailbox, not an answer: the real reply, if ` +
+            `any, arrives later at this agent's own inbox, correlated by in_reply_to.`,
       {
         retryable: false,
         details: {
@@ -2163,6 +2181,7 @@ export class AgentMesh {
           inbox_id: ack.inbox_id,
           request_id: request.id,
           ...(ack.text !== undefined ? { text: ack.text } : {}),
+          ...(ack.paused ? { paused: true, reason: ack.reason ?? "agent_paused" } : {}),
         },
       },
     );
@@ -2497,6 +2516,48 @@ export class AgentMesh {
           err.code === ErrorCode.TRANSPORT_NO_RESPONDERS) &&
         err.details?.accepted !== true
       ) {
+        // Silence from an agent the mesh has stopped, or whose key was
+        // revoked, is not "maybe offline": ask the registry (§9.2 status,
+        // §4.10) and say what it answers. A pause keeps the message (§4.12);
+        // a terminated agent or a revoked key never reads it.
+        const standing = await this.registryRevocation(agentId);
+        if ("revoked" in standing && standing.revoked) {
+          throw new MeshError(
+            ErrorCode.AGENT_UNAVAILABLE,
+            standing.terminated
+              ? `${agentId} was terminated (§4.12). It does not come back, and this request will not be read.`
+              : `${agentId}'s signing key was revoked (§4.10), so this request will not be read` +
+                  (standing.replacedBy ? `; the agent moved to ${standing.replacedBy}.` : "."),
+            {
+              cause: err,
+              details: {
+                captured: false,
+                reason: standing.terminated ? "agent_terminated" : "agent_key_revoked",
+                request_id: envelope.id,
+                ...(standing.revokedAt ? { revoked_at: standing.revokedAt } : {}),
+                ...(standing.replacedBy ? { replaced_by: standing.replacedBy } : {}),
+              },
+            },
+          );
+        }
+        if ("revoked" in standing && standing.paused) {
+          throw new MeshError(
+            ErrorCode.REQUEST_QUEUED,
+            `${agentId} is paused: the mesh stopped it (§4.12). This request waits in its inbox and ` +
+              `is delivered when it resumes; its reply, if any, arrives then at this agent's own inbox.`,
+            {
+              cause: err,
+              details: {
+                queued: true,
+                captured: true,
+                paused: true,
+                reason: "agent_paused",
+                request_id: envelope.id,
+                ...(standing.since ? { since: standing.since } : {}),
+              },
+            },
+          );
+        }
         throw new MeshError(
           ErrorCode.AGENT_UNAVAILABLE,
           `No response from ${agentId} — the agent may just be offline. ` +
@@ -2564,8 +2625,13 @@ export class AgentMesh {
         // request's budget and it becomes live — revisable, latest-wins.
         budget: config?.budget,
       });
-      this.watchTaskUpdates(taskId);
       this.recordDelegation(taskId);
+      // The task id is the responder's, so this agent could not subscribe to
+      // the task's updates before it asked. It waits here until the
+      // subscription is live, so the caller never acts on `working` while a
+      // terminal update could still fall into the gap, and the task record is
+      // read once it is live for any update published before (watchTaskUpdates).
+      await this.watchTaskUpdates(taskId);
     }
 
     if (respEnv.error) {
@@ -2658,7 +2724,10 @@ export class AgentMesh {
       context_id: config?.context_id,
       budget: config?.budget,
     });
-    this.watchTaskUpdates(taskId);
+    // The task id is this agent's own, so the subscription is asked for
+    // before the request goes out, and on both transports it is live first:
+    // there is no gap, and so no record to read.
+    void this.watchTaskUpdates(taskId, { readRecord: false });
     this.recordDelegation(taskId);
 
     // Subscribe BEFORE sending request to prevent race condition (task_id is requester-generated)
@@ -4325,23 +4394,28 @@ export class AgentMesh {
    * This is the requester's half of §7.0 deferral
    * (`HandlerOptions.deferAfterMs`): a request that resolved with
    * `status: "working"` and a `task_id` is work still running, and this is how
-   * to wait for it. Subscription first, local record second: the request path
-   * has been watching the update subject since the deferred respond arrived,
-   * so a terminal that landed before this call is in the local task store, and
-   * one that lands after is on the subscription — no gap. Resolves on
-   * `completed`, `failed`, `canceled`, `exhausted` or `rejected`; rejects with
-   * TRANSPORT_TIMEOUT when the wait elapses first. Within-process only: a
-   * caller that restarted holds no local record and should read the task
-   * manager's durable record instead.
+   * to wait for it. Three sources, so no terminal is lost: the local task
+   * store (the request path has watched the update subject since before it
+   * returned `working`), this call's own subscription, and the task manager's
+   * durable record (§7.4), read once the subscription is live and again at
+   * growing intervals while the wait lasts. The record also answers a caller
+   * that restarted and holds no local record of the task, as long as it is
+   * the task's requester. Resolves on `completed`, `failed`, `canceled`,
+   * `exhausted` or `rejected`; rejects with TRANSPORT_TIMEOUT when the wait
+   * elapses first.
    */
   async awaitTask(taskId: string, timeoutMs = 300_000): Promise<RespondPayload> {
     return await new Promise<RespondPayload>((resolve, reject) => {
       let done = false;
       let timer: ReturnType<typeof setTimeout> | undefined;
+      let pollTimer: ReturnType<typeof setTimeout> | undefined;
+      let wakePoll: (() => void) | undefined;
       const finish = (fn: () => void) => {
         if (done) return;
         done = true;
         if (timer !== undefined) clearTimeout(timer);
+        if (pollTimer !== undefined) clearTimeout(pollTimer);
+        wakePoll?.();
         sub.unsubscribe();
         fn();
       };
@@ -4369,18 +4443,68 @@ export class AgentMesh {
           ),
         );
       }, timeoutMs);
-      const task = this.tasks.get(taskId);
-      if (task && TERMINAL_STATES.has(task.state)) {
-        for (let i = task.history.length - 1; i >= 0; i--) {
-          const payload = task.history[i].payload as RespondPayload | undefined;
-          if (payload?.status === task.state) {
-            finish(() => resolve(payload));
+      const fromLocal = (): boolean => {
+        const payload = this.terminalPayload(taskId);
+        if (payload) finish(() => resolve(payload));
+        return payload !== undefined;
+      };
+      if (fromLocal()) return;
+      void (async () => {
+        // Once the connection has flushed, this call's subscription is live:
+        // a terminal published from then on arrives on it. One published
+        // before is in the local store or in the task manager's record.
+        await this.connFlushed();
+        let wait = 1_000;
+        while (!done) {
+          if (fromLocal()) return;
+          const recorded = await this.terminalFromRecord(taskId);
+          if (recorded) {
+            finish(() => resolve(recorded));
             return;
           }
+          if (fromLocal() || done) return;
+          await new Promise<void>((r) => {
+            wakePoll = r;
+            pollTimer = setTimeout(r, wait);
+            (pollTimer as unknown as { unref?: () => void }).unref?.();
+          });
+          wait = Math.min(wait * 2, TASK_RECORD_POLL_MAX_MS);
         }
-        finish(() => resolve({ status: task.state } as RespondPayload));
-      }
+      })();
     });
+  }
+
+  /** A Task's terminal payload from the task manager's record (§7.4), or
+   *  undefined while it is still running or the record cannot be read. For a
+   *  Task this agent tracks, the record's statements go through recoverTask
+   *  like any other update. For one it does not (a requester that restarted),
+   *  only a terminal statement signed by the record's responder, on a record
+   *  naming this agent as the requester, is taken. */
+  private async terminalFromRecord(taskId: string): Promise<RespondPayload | undefined> {
+    if (this.tasks.get(taskId)) {
+      await this.recoverTask(taskId);
+      return this.terminalPayload(taskId);
+    }
+    let record: { requester?: string; responder?: string; history?: Envelope[] } | undefined;
+    try {
+      record = (await this.serviceRequest(Subjects.taskGet(taskId), { task_id: taskId }, TASK_RECORD_TIMEOUT_MS)) as typeof record;
+    } catch {
+      return undefined;
+    }
+    if (!record || record.requester !== this.agentId || !record.responder) return undefined;
+    const history = Array.isArray(record.history) ? record.history : [];
+    for (let i = history.length - 1; i >= 0; i--) {
+      let env: Envelope;
+      try {
+        env = decode(encode(history[i]));
+      } catch {
+        continue;
+      }
+      if (env.type !== "respond" || env.task_id !== taskId || env.from !== record.responder) continue;
+      const payload = env.payload as RespondPayload | undefined;
+      if (payload?.status && TERMINAL_STATES.has(payload.status as TaskState)) return payload;
+    }
+    return undefined;
   }
 
   /**
@@ -5025,9 +5149,20 @@ export class AgentMesh {
     }
   }
 
-  /** Subscribe to a Task's update subject. Idempotent per task. */
-  private watchTaskUpdates(taskId: string): void {
-    if (this.taskUpdateSubs.has(taskId)) return;
+  /** Subscribe to a Task's update subject. Idempotent per task.
+   *
+   *  Resolves when the subscription is live on the broker. On RabbitMQ a
+   *  subscription is a queue bound to the exchange a few round trips after it
+   *  is asked for, and a message published before the binding exists is
+   *  routed to no queue at all. When the task id came from the responder (a
+   *  deferred answer, §7.0), the responder can publish the terminal update
+   *  before that binding exists, so the caller waits for it here, and once it
+   *  is live the task manager's durable record is read once (§7.4) for any
+   *  statement published in the gap. A second read follows a little later,
+   *  for a statement the task manager had not stored yet at the first. */
+  private watchTaskUpdates(taskId: string, opts: { readRecord?: boolean } = {}): Promise<void> {
+    const existing = this.taskUpdateBound.get(taskId);
+    if (this.taskUpdateSubs.has(taskId) && existing) return existing;
     const sub = this.conn.subscribe(Subjects.taskUpdate(taskId), (msg: Msg) => {
       try {
         // Full decode: updates progress local Task state and carry budget
@@ -5038,6 +5173,21 @@ export class AgentMesh {
       }
     });
     this.taskUpdateSubs.set(taskId, sub);
+    const bound = this.connFlushed();
+    this.taskUpdateBound.set(taskId, bound);
+    if (opts.readRecord === false) return bound;
+    void bound.then(async () => {
+      if (!this.taskUpdateSubs.has(taskId)) return;
+      if (await this.recoverTask(taskId)) return;
+      if (!this.taskUpdateSubs.has(taskId)) return;
+      const timer = setTimeout(() => {
+        this.taskRecheckTimers.delete(taskId);
+        if (this.taskUpdateSubs.has(taskId)) void this.recoverTask(taskId);
+      }, TASK_RECORD_RECHECK_MS);
+      (timer as unknown as { unref?: () => void }).unref?.();
+      this.taskRecheckTimers.set(taskId, timer);
+    });
+    return bound;
   }
 
   private unwatchTaskUpdates(taskId: string): void {
@@ -5046,10 +5196,78 @@ export class AgentMesh {
       sub.unsubscribe();
       this.taskUpdateSubs.delete(taskId);
     }
+    this.taskUpdateBound.delete(taskId);
+    const timer = this.taskRecheckTimers.get(taskId);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      this.taskRecheckTimers.delete(taskId);
+    }
   }
 
-  /** Dispatch one verified envelope from a Task's update subject. */
-  private handleTaskUpdate(taskId: string, env: Envelope): void {
+  /**
+   * Read the task manager's durable record of a Task this agent asked for
+   * (`mesh.task.get.<id>`, §7.4) and apply the statements in it that the
+   * update subscription did not deliver. Each one is checked like a live one:
+   * its signature against its `from`, and only the Task's two parties may
+   * progress it (handleTaskUpdate). Never throws; a mesh with no task record
+   * (or none yet) changes nothing. True when the local Task is terminal.
+   */
+  private async recoverTask(taskId: string): Promise<boolean> {
+    const isTerminal = () => {
+      const t = this.tasks.get(taskId);
+      return !!t && TERMINAL_STATES.has(t.state);
+    };
+    if (!this.tasks.get(taskId)) return false;
+    if (isTerminal()) return true;
+    let record: { history?: Envelope[] } | undefined;
+    try {
+      record = (await this.serviceRequest(Subjects.taskGet(taskId), { task_id: taskId }, TASK_RECORD_TIMEOUT_MS)) as
+        | { history?: Envelope[] }
+        | undefined;
+    } catch {
+      return isTerminal();
+    }
+    for (const env of Array.isArray(record?.history) ? record.history : []) {
+      let verified: Envelope;
+      try {
+        // A statement read back from the record is verified exactly as one
+        // read off the wire: its own signature, against its own `from`.
+        verified = decode(encode(env));
+      } catch {
+        continue;
+      }
+      this.handleTaskUpdate(taskId, verified, true);
+    }
+    return isTerminal();
+  }
+
+  /** Resolves when everything this agent has asked of its connection so far
+   *  has reached the broker, its subscriptions included (on RabbitMQ: bound).
+   *  Never rejects; a connection that cannot say resolves at once. */
+  private connFlushed(): Promise<void> {
+    const conn = this.conn as unknown as { flush?: () => Promise<void> };
+    if (typeof conn.flush !== "function") return Promise.resolve();
+    return conn.flush().catch(() => undefined);
+  }
+
+  /** The terminal payload of a Task this agent tracks, or undefined while it
+   *  is still running. */
+  private terminalPayload(taskId: string): RespondPayload | undefined {
+    const task = this.tasks.get(taskId);
+    if (!task || !TERMINAL_STATES.has(task.state)) return undefined;
+    for (let i = task.history.length - 1; i >= 0; i--) {
+      const payload = task.history[i].payload as RespondPayload | undefined;
+      if (payload?.status === task.state) return payload;
+    }
+    return { status: task.state } as RespondPayload;
+  }
+
+  /** Dispatch one verified envelope from a Task's update subject, or, with
+   *  `recorded`, one read back from the task manager's durable record (§7.4).
+   *  A recorded statement is old by construction, so its freshness bound is
+   *  the mailbox's retention, as for the §16.4 drain; the seen-id memory still
+   *  keeps a statement that also arrived live from being applied twice. */
+  private handleTaskUpdate(taskId: string, env: Envelope, recorded = false): void {
     if (env.type !== "respond") return;
     if (env.task_id !== taskId) return;
     // "accepted" is not a Task state and never appears in a Task record
@@ -5064,7 +5282,7 @@ export class AgentMesh {
     // memory (the update subject and the inbox can both deliver a copy), same
     // live freshness window.
     if (!this.rememberInboxId(env.from, env.id)) return;
-    if (!this.freshEnough(env, false)) return;
+    if (!this.freshEnough(env, recorded)) return;
 
     // Budget revisions: absolute, latest wins (§7.7). A lower-or-equal
     // revision is ignored by applyBudget, and a malformed budget is ignored
@@ -5164,6 +5382,9 @@ export class AgentMesh {
     this.stopFeedDurable();
     for (const sub of this.taskUpdateSubs.values()) sub.unsubscribe();
     this.taskUpdateSubs.clear();
+    this.taskUpdateBound.clear();
+    for (const timer of this.taskRecheckTimers.values()) clearTimeout(timer);
+    this.taskRecheckTimers.clear();
   }
 
   /** Stop (never delete) every durable event subscription. Splice-idempotent,

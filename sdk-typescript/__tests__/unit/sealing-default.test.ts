@@ -209,6 +209,10 @@ async function callerFor(manifest: Manifest, opts?: { encryptionSeed?: string })
 /** Run request() far enough to capture the published request envelope. The
  *  fake connection never answers an agent inbox, so the send times out; the
  *  envelope it built is the observable. */
+/** How many calls the connection's own request mock had seen when the
+ *  request itself went out (sentInput). */
+let callsBeforeSend = -1;
+
 async function sentInput(
   caller: AgentMesh,
   agentId: string,
@@ -220,6 +224,7 @@ async function sentInput(
   const original = conn.request;
   conn.request = vi.fn(async (subject: string, data: Uint8Array) => {
     if (subject.startsWith("mesh.agent.")) {
+      callsBeforeSend = (original as { mock?: { calls: unknown[] } }).mock?.calls.length ?? -1;
       captured = (decodeUnverified(data).payload as { input?: unknown }).input;
       throw new MeshError(ErrorCode.TRANSPORT_TIMEOUT, "no responder in this test");
     }
@@ -271,11 +276,14 @@ describe("§8.9 compatibility — an agent that never opted in is untouched", ()
     openAgents.push(caller);
     // No getManifest: the cache is cold. The send must NOT go and fetch one —
     // a registry round trip in front of every request would make a registry
-    // blip a messaging outage. The recipient refuses it instead (below).
+    // blip a messaging outage. The recipient refuses it instead (below). (After
+    // the target stayed silent, the SDK may ask whether it was stopped; that is
+    // behind the send, never in front of it.)
     await sentInput(caller, manifest.id, { x: 1 });
-    expect(conn.request.mock.calls.some(([s]) => String(s).startsWith("mesh.registry.get."))).toBe(
-      false,
-    );
+    expect(callsBeforeSend).toBeGreaterThanOrEqual(0);
+    expect(
+      conn.request.mock.calls.slice(0, callsBeforeSend).some(([s]) => String(s).startsWith("mesh.registry.get.")),
+    ).toBe(false);
   });
 
   it("a receiving agent that declared no posture still reads a cleartext request", async () => {

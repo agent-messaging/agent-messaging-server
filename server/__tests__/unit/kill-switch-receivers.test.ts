@@ -9,7 +9,7 @@ import type { Envelope, Manifest } from "../../src/sdk.js";
 import { PresenceStore } from "../../src/registry/presence-store.js";
 import { NodeProfileStore } from "../../src/registry/node-profile-store.js";
 import { MemoryAgentStatus, type AgentStatusEntry } from "../../src/shared/agent-status.js";
-import { answerStopped, stopNotice, StopAnswerer, PAUSED_TEXT, TERMINATED_TEXT } from "../../src/admission/stop-answerer.js";
+import { answerStopped, answerStatus, stopNotice, StopAnswerer, PAUSED_TEXT, TERMINATED_TEXT, REVOKED_TEXT } from "../../src/admission/stop-answerer.js";
 import { AGENT_KEY_REVOKED } from "../../src/shared/agent-key-revocations.js";
 
 const key = () => nkeys.createUser().getPublicKey();
@@ -102,6 +102,22 @@ describe("the sender of a message to a stopped agent is told", () => {
     const env = decode(stopNotice(req, key(), "terminated", kp)) as unknown as Envelope;
     expect(env.error?.message).toBe(TERMINATED_TEXT);
     expect(env.error?.details?.reason).toBe("agent_terminated");
+  });
+
+  it("revoked key while paused: an error saying it was not delivered, with when and where it moved", () => {
+    const moved = key();
+    const env = decode(stopNotice(req, key(), "revoked", kp, { at: "2026-10-13T00:00:00.000Z", reason: "leaked", by: "operator", replaced_by: moved })) as unknown as Envelope;
+    expect(env.payload).toBeUndefined();
+    expect(env.error?.code).toBe(ErrorCode.AGENT_UNAVAILABLE);
+    expect(env.error?.message).toBe(REVOKED_TEXT);
+    expect(env.error?.details).toMatchObject({ reason: AGENT_KEY_REVOKED, revoked_at: "2026-10-13T00:00:00.000Z", replaced_by: moved });
+  });
+
+  it("which answer: terminated stays terminated, a revoked key outranks a pause, a pause alone is a pause", () => {
+    const rev = { at: "2026-10-13T00:00:00.000Z", reason: "leaked", by: "operator" };
+    expect(answerStatus("terminated", rev)).toBe("terminated");
+    expect(answerStatus("paused", rev)).toBe("revoked");
+    expect(answerStatus("paused", null)).toBe("paused");
   });
 
   it("the answer goes to the sender's inbox and the reply subject; answers are not answered", () => {

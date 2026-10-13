@@ -112,6 +112,9 @@ jobs:
           EXAMPLES_NO_SKIP: "1"
         run: node examples/run.mjs ${{ matrix.broker }}
 
+      - name: The regression checks
+        run: node tools/regressions/run.mjs ${{ matrix.broker }}
+
       - name: Logs, on failure
         if: failure()
         working-directory: deploy/compose/${{ matrix.broker }}

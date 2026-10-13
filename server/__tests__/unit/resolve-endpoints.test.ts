@@ -265,6 +265,17 @@ describe("stamp-on-read fallback for pre-`endpoints` records (§8.2/§14.4)", ()
     });
   });
 
+  it("get answers a deregistered agent (a delete marker) as not found, never an internal error", async () => {
+    const { id } = makeVouchedManifest();
+    const kv = {
+      get: vi.fn(async () => ({ operation: "DEL", value: new Uint8Array(0), json: () => { throw new Error("Bad JSON"); } })),
+    };
+    const env = createEnvelope({ type: "discover", from: "some-caller", payload: {} });
+    const resp = await handleGet(env, { subject: `mesh.registry.get.${id}` } as any, kv as any, serviceId, new Map());
+    expect(resp.error?.code).toBe(ErrorCode.AGENT_UNAVAILABLE);
+    expect(resp.error?.message).toContain("not found");
+  });
+
   it("withEndpoints leaves an already-stamped manifest alone (same object)", () => {
     const { id, manifest } = makeVouchedManifest();
     manifest.endpoints = { inbox: `mesh.agent.${id}.inbox`, stream: `mesh.agent.${id}.stream` };
