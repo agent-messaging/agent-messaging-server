@@ -64,10 +64,9 @@ jobs:
       - name: The laptop purchase scenario
         run: node scenarios/laptop-purchase/run.mjs ${{ matrix.broker }} --exclude tests/deferred-task-timing.test.ts
 
-      # The RabbitMQ deferred-result race (scenarios/laptop-purchase/README.md,
-      # Known issue) shows here as a warning until it is fixed.
+      # The RabbitMQ deferred-result race was fixed in server 0.2.1 and SDK
+      # 0.61.1; this step is required on both brokers.
       - name: Deferred task timing
-        continue-on-error: ${{ matrix.broker == 'rabbitmq' }}
         run: node scenarios/laptop-purchase/run.mjs ${{ matrix.broker }} tests/deferred-task-timing.test.ts --outputFile.junit .state/junit-timing-${{ matrix.broker }}.xml
 
       - uses: actions/upload-artifact@v4

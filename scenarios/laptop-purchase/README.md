@@ -88,13 +88,16 @@ commit, then runs the scenario on pull requests that touch the server, the
 SDK or the scenario. It also runs nightly with a two-hour shipment, and by
 hand with your own delays.
 
-## Known issue
+## A fixed issue
 
-On RabbitMQ, a deferred task whose handler finishes about 50 ms after it
-deferred can lose its result: `awaitTask` times out. The final update is
-published before the requester is listening, and nothing recovers it from the
-task record. On server 0.1.3 it failed every time; on 0.2.0 it fails some of
-the time. `tests/deferred-task-timing.test.ts` reproduces it. The approver
-spends `APPROVAL_REVIEW_MS` on its check, so the other tests aren't hidden
-by it; set it to 0 to see the scenario hit the bug. Until the fix lands, the
-workflow runs the timing test on RabbitMQ as a warning, not a failure.
+On RabbitMQ, a deferred task whose handler finished about 50 ms after it
+deferred could lose its result: `awaitTask` timed out. The final update was
+published before the requester's subscription was bound, and nothing
+recovered it from the task record. It failed every time on server 0.1.3 and
+some of the time on 0.2.0. SDK 0.61.1 (with server 0.2.1) fixes it: the
+requester waits until its subscription is live before it acts on `working`,
+and reads the task record for anything published before.
+`tests/deferred-task-timing.test.ts` reproduces the old failure, and the
+workflow now requires it on both brokers. The approver still spends
+`APPROVAL_REVIEW_MS` on its check; set it to 0 to run the scenario at full
+speed.
