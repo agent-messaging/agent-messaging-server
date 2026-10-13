@@ -45,6 +45,9 @@ act on.
    installs the tarball in an empty project, and attaches
    `agentmesh-<version>.tgz` and its SHA-256 to the GitHub release
    `sdk-v<version>`. A released version is never replaced.
+4. Move the install lines (`sdk-typescript/README.md`, `examples/README.md`)
+   and the peering suite's pin to the new version once the tarball is at the
+   address below.
 
 The same tarball is also served at
 `https://storage.googleapis.com/agentmesh-releases/agentmesh-<version>.tgz`,
