@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.58.1 (2026-10-13)
+
+- The default addresses can be set from the environment. When a caller gives
+  no address, the SDK uses AgentMesh's public network: the API for the
+  capabilities answer and the mesh's HTTPS doors, the naming service for the
+  naming gate and name lookups, and the broker. A Node process can now point
+  them at another mesh with `AGENTMESH_API_URL`, `AGENTMESH_NAMING_URL` and
+  `AGENTMESH_BROKER_WSS`, read once when the SDK loads; an empty value counts
+  as unset, and an option a caller passes still wins. Nothing changes when
+  they are unset, or in a browser. Before, the only way to change them was to
+  build the SDK again with other constants.
+- Released from the Agent Messaging Server's repository by its release
+  workflow (`.github/workflows/release-sdk.yml`): the tarball and its SHA-256
+  are attached to the GitHub release `sdk-v0.58.1`.
+
 ## 0.58.0 (2026-10-12)
 
 - On an AMQP mesh, only what came on a subject reaches an agent. RabbitMQ

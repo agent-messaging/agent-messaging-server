@@ -2,8 +2,8 @@ name: CI
 
 # Every push to main and every pull request:
 #   checks    typecheck and unit tests of the server, the A2A gateway and the
-#             SDK; the secret check; the Kubernetes manifests checked against
-#             the Kubernetes schemas
+#             SDK; the secret check; the boundary check; the Kubernetes
+#             manifests checked against the Kubernetes schemas
 #   mesh      for each broker: the Compose setup brought up from empty (images
 #             built from this commit, first-run, broker, server, gateway), the
 #             core conformance profile against it with --ci, and every example
@@ -32,6 +32,9 @@ jobs:
 
       - name: Secrets
         run: node tools/check-secrets.mjs
+
+      - name: The boundary (nothing leaves the server; the core reaches the broker through the storage layer)
+        run: node tools/check-boundary.mjs --self-test && node tools/check-boundary.mjs
 
       - name: The SDK
         working-directory: sdk-typescript

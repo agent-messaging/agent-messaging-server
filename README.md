@@ -96,8 +96,9 @@ down in [docs/rabbitmq-binding.md](docs/rabbitmq-binding.md).
 | `conformance/` | The conformance suite's core profile, and the specification it tests. |
 | `deploy/compose/` | Docker Compose for NATS, and for RabbitMQ with Postgres. |
 | `deploy/kubernetes/` | Kubernetes manifests for both, on one node. |
-| `docs/` | The [operator handbook](docs/operator-handbook.md), the [sizing guide](docs/sizing.md) and the RabbitMQ binding. |
+| `docs/` | The [operator handbook](docs/operator-handbook.md), the [sizing guide](docs/sizing.md), the RabbitMQ binding, and [changes and releases](docs/releasing.md). |
 | `examples/` | Five examples, each runnable on either broker. |
+| `tools/` | The conformance runner for a Compose setup, the secret check and the boundary check. |
 
 ## The examples
 
@@ -134,9 +135,16 @@ cd server && npm ci && npm run typecheck && npm test
 
 `npm run test:integration` in `server/` runs the tests that need a live NATS,
 RabbitMQ or Postgres; each skips and says what to set when its broker is not
-there. The server's release number is in `server/server-release.json`;
-`.github/workflows/release-images.yml` builds, tests and publishes both images
-for a `server-v<version>` tag.
+there. `node tools/check-boundary.mjs` checks that nothing imports outside the
+server, the gateway and the SDK, and that the core reaches the broker only
+through its storage layer.
+
+This repository is the only home of the server's source, and every release is
+made here: a `server-v<version>` tag publishes both images
+(`.github/workflows/release-images.yml`), and an `sdk-v<version>` tag releases
+the SDK's tarball (`.github/workflows/release-sdk.yml`).
+[docs/releasing.md](docs/releasing.md) says how a change goes from a pull
+request to a release, and from a release to a deployment that pins it.
 
 ## Support and security
 
