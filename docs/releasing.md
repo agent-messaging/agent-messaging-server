@@ -33,11 +33,26 @@ without the other.
 3. `.github/workflows/release-images.yml` builds both images from the tag,
    runs the smoke test (first-run from an empty volume, a live revocation, the
    gateway connecting) and publishes
-   `ghcr.io/jeffrschneider/agent-messaging-server:<version>` and
-   `ghcr.io/jeffrschneider/agent-messaging-a2a-gateway:<version>`.
+   `ghcr.io/agent-messaging/agent-messaging-server:<version>` and
+   `ghcr.io/agent-messaging/agent-messaging-a2a-gateway:<version>` (the owner is
+   the repository's organization, `github.repository_owner`).
    A published tag is never replaced.
-4. Write the GitHub release for the tag, then move the image pins in
+4. Make sure both packages are public: `gh api orgs/agent-messaging/packages?package_type=container`
+   lists them with `visibility: public`. A new package in an organization starts
+   private; change it under the package's settings, or it can't be pulled
+   without signing in.
+5. Write the GitHub release for the tag, then move the image pins in
    `deploy/`, the README and `.env.example` to the new version.
+
+**The move to the `agent-messaging` organization (2026-10-13).** Releases up to
+server 0.2.1 were published under `ghcr.io/jeffrschneider/`, and those images
+stay there and keep working. The first release after the move publishes under
+`ghcr.io/agent-messaging/`. At that release, step 5 also switches the owner in
+every image reference: `README.md`, `deploy/compose/nats/.env.example`,
+`deploy/compose/nats/README.md`, `deploy/compose/rabbitmq/.env.example` and
+both `deploy/kubernetes/*/mesh.yaml`. The CI workflows match any owner, so they
+need no change. AgentMesh pins the server by release tag and SDK tarball, so it
+only needs its pin moved, as for any release.
 
 Use a patch release (0.1.1) for fixes and anything that adds without changing
 what is there, and a minor release (0.2.0) for a change a deployment has to

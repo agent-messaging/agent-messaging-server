@@ -35,8 +35,8 @@ jobs:
       - name: Apply the manifest from empty
         run: |
           kind load docker-image agent-messaging-server:local agent-messaging-a2a-gateway:local --name mesh
-          sed -e 's#ghcr.io/jeffrschneider/agent-messaging-server:[0-9.]*#agent-messaging-server:local#' \
-              -e 's#ghcr.io/jeffrschneider/agent-messaging-a2a-gateway:[0-9.]*#agent-messaging-a2a-gateway:local#' \
+          sed -e 's#ghcr.io/[^/]*/agent-messaging-server:[0-9.]*#agent-messaging-server:local#' \
+              -e 's#ghcr.io/[^/]*/agent-messaging-a2a-gateway:[0-9.]*#agent-messaging-a2a-gateway:local#' \
               deploy/kubernetes/${{ matrix.broker }}/mesh.yaml > "$RUNNER_TEMP/mesh.yaml"
           kubectl apply -f "$RUNNER_TEMP/mesh.yaml"
           kubectl -n agent-messaging wait --for=condition=complete job/first-run --timeout=180s

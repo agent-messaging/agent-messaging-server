@@ -231,7 +231,7 @@ async function handle(
         api_key: bridge.apiKeyRequired,
         anonymous: bridge.anonymousAllowed,
       },
-      mapping: "https://github.com/jeffrschneider/agent-messaging-server/blob/main/a2a-gateway/MAPPING.md",
+      mapping: "https://github.com/agent-messaging/agent-messaging-server/blob/main/a2a-gateway/MAPPING.md",
     });
   }
 

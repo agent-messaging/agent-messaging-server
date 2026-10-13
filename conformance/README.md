@@ -5,7 +5,7 @@ Messaging server must pass (the specification's §1.6), and the specification
 they test, `SPEC.md`, as published at https://agentmessaging.ai. The whole
 suite, with the profiles for deployment-defined parts and for naming
 registrars, is published with the specification at
-https://github.com/jeffrschneider/agent-messaging.
+https://github.com/agent-messaging/agent-messaging.
 
 | | |
 |---|---|

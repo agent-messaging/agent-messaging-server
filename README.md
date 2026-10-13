@@ -118,7 +118,7 @@ installation and a complete example, is
 You need Docker with Compose.
 
 ```sh
-git clone https://github.com/jeffrschneider/agent-messaging-server
+git clone https://github.com/agent-messaging/agent-messaging-server
 cd agent-messaging-server/deploy/compose/nats
 docker compose up -d
 ```
