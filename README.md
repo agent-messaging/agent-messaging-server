@@ -34,6 +34,58 @@ sponsored by [AgentMesh](https://agentmesh.ai).
   manages agents, not people: who may hold an admin token is your identity
   system's decision.
 
+## What an agent can do
+
+An agent uses the server through the TypeScript SDK in `sdk-typescript/`, the
+`agent-messaging` package. These are its calls, grouped the way the
+specification groups them: the three ways agents talk (inbox messaging,
+publish and subscribe, and the registry with presence), and then admission,
+tasks, rooms and files. Each one works on either broker.
+
+| | SDK call | What it does | Specification |
+|---|---|---|---|
+| **Who I am** | `createAgentIdentity()` | Makes the agent's own key pair, on the agent's machine. | §4.3 |
+| | `exchangeBootstrapToken(url, key, publicKey)` | Trades a one-time enrollment key from the operator for a connection credential. | §4.8, §18.10 |
+| | `AgentMesh.connect(servers, options)` | Connects the agent, and renews its credential before it lapses. | §4.8, §18 |
+| | `mesh.identity.me()` | Says who this agent is on this server. | §4.3 |
+| | `mesh.capabilities()` | Says what this server offers: its profile, its broker, and its requests. | §1.6 |
+| **Finding agents** | `mesh.register({ name, offerings })` | Says "I exist" and what the agent offers. | `register`, §6.2 |
+| | `mesh.discover(query)` | Finds agents by what they offer, or by whether they are online. | `discover`, §6.3 |
+| | `mesh.getManifest(agentId)` | Reads one agent's manifest. | §8, §9 |
+| | `mesh.registry.list()` | Lists the agents this agent can see. | §9 |
+| | `mesh.deregister()` | Takes the agent off the registry. | §9 |
+| **Presence** | `mesh.startHeartbeat()` | Tells the server the agent is here. | §9.6 |
+| | `mesh.trackPresence(handler)` | Watches agents come and go. | §9.6, §10.10 |
+| | `mesh.contacts.presence({ who })` | Asks whether particular agents are around now. | §9.6 |
+| **Getting in** | `mesh.register({ guarded: true, ... })` | Puts the agent's inbox behind the admission service, so a stranger has to knock first. | EXT-6 |
+| | `mesh.contacts.knock({ to, via })` | Asks to be let into another agent's inbox. | EXT-6 |
+| **Inbox messaging** | `mesh.request(agentId, offering, input)` | Asks an agent something and waits for the answer. A request to an agent that is away waits in its mailbox. | `request`, §6.4 |
+| | `mesh.requestStream(...)` | The same, with the answer streamed back in parts. | §11.3 |
+| | `mesh.onRequest(offering, handler)` | Answers requests for one offering. `onStreamRequest` streams the answer, and `onDefault` takes everything else. | `respond`, §6.5 |
+| | `mesh.messages.send({ to, text })` | Sends a plain text message to an agent's `chat` offering. If the agent is busy or away, the mailbox holds it and any reply comes later. | §6.4, §16.4 |
+| **Tasks** | `mesh.awaitTask(taskId)`, `mesh.getTask(taskId)`, `mesh.onTaskUpdate(fn)` | Follows work that takes longer than one reply. | §7 |
+| | `mesh.cancel(taskId, reason)`, `mesh.failTask(taskId, reason)` | Stops work, from either side, with a reason. | §7.3, §10.8 |
+| | `mesh.reviseBudget(...)` | Changes a task's budget while it runs. | §7.7 |
+| **Publish and subscribe** | `mesh.emit(topic, data)` | Publishes an event. No reply is expected. | `emit`, §6.6 |
+| | `mesh.subscribe(pattern, handler)` | Receives the events that match a pattern, durably if asked. | `subscribe`, §6.7, §18.6 |
+| | `mesh.declareFeed(topic, kind)`, `mesh.publishFeed(topic, data)` | Publishes a feed that belongs to this agent. | §6.6a |
+| | `mesh.subscribeFeed(agentId, topic, handler)`, `mesh.trackFeed(...)`, `mesh.feeds.*` | Follows another agent's feed. | §6.6a |
+| **Rooms** | `mesh.openRoom(options)`, `mesh.joinRoom(...)`, `mesh.myRooms()` | Opens or joins a room: a shared, optionally sealed conversation between several agents. | EXT-5 |
+| | `mesh.rooms.invite`, `.post`, `.history`, `.phase`, `.list` | Invites agents, posts, reads what was said, and moves the room through its phases. | EXT-5 |
+| | `mesh.rooms.attach`, `.fetch`, `.files`, `.link` | Uses the room's shared drive. | EXT-5 |
+| | `mesh.board.list`, `.post`, `.claim`, `.done`, `.abandon`, `.withdraw` | Uses the room's work board: post work, claim it and finish it. | EXT-5 |
+| **Files** | `mesh.putArtifact(...)`, `mesh.fetchArtifact(ref)` | Stores a file and reads it back by its reference. | §7.5 |
+| | `mesh.artifactLink(ref)`, `mesh.statArtifact(ref)`, `mesh.removeArtifact(ref)`, `mesh.artifactUsage()` | Makes a signed link for a large file, checks it, removes it, and shows the space used. | §7.5 |
+| **Many agents** | `MeshNode.connect(...)` | Runs many agents on one connection, each with its own key. | §4.2, §4.4 |
+
+Every message is signed by the agent that sends it and checked before the
+receiving agent sees it. The operator's side (tenants, enrollment keys,
+admission policy, limits, the kill switch and the audit log) is the
+`mesh-admin` command line, described in the
+[operator handbook](docs/operator-handbook.md). The SDK's own guide, with
+installation and a complete example, is
+[sdk-typescript/README.md](sdk-typescript/README.md).
+
 ## Start in five minutes
 
 You need Docker with Compose.
@@ -92,7 +144,7 @@ down in [docs/rabbitmq-binding.md](docs/rabbitmq-binding.md).
 |---|---|
 | `server/` | The server: the core services, first-run setup (`src/setup/`), the admin API (`src/admin/`), the storage layer for both brokers (`src/storage/`), and `tools/mesh-admin.mjs`. |
 | `a2a-gateway/` | The A2A gateway. Its mapping between Agent Messaging and A2A is [MAPPING.md](a2a-gateway/MAPPING.md). |
-| `sdk-typescript/` | The TypeScript SDK (the `agentmesh` package), with transports for NATS and for AMQP. |
+| `sdk-typescript/` | The TypeScript SDK (the `agent-messaging` package), with transports for NATS and for AMQP. |
 | `conformance/` | The conformance suite's core profile, and the specification it tests, copied from where the specification is written (see [changes and releases](docs/releasing.md)). |
 | `deploy/compose/` | Docker Compose for NATS, and for RabbitMQ with Postgres. |
 | `deploy/kubernetes/` | Kubernetes manifests for both, on one node. |
