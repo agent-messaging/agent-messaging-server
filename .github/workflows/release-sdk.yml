@@ -130,8 +130,13 @@ jobs:
             echo ""
             echo "SHA-256 \`$SHA\`."
           } >> /tmp/notes.md
+          # A pushed tag already names the commit, and on a tag push GITHUB_SHA
+          # can be the tag object rather than a commit, which the API refuses
+          # (403, sdk-v0.58.1). Only a run by hand makes the tag, on its commit.
+          TARGET=()
+          [ "${{ github.event_name }}" = "workflow_dispatch" ] && TARGET=(--target "$GITHUB_SHA")
           gh release create "sdk-v$VERSION" "$TGZ" "$TGZ.sha256" \
-            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --repo "$GITHUB_REPOSITORY" "${TARGET[@]}" \
             --title "TypeScript SDK $VERSION" --notes-file /tmp/notes.md --latest=false
           {
             echo "### Released"
