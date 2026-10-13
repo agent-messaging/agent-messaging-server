@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.60.0 (2026-10-13)
+
+- **Admission on the agent's own side (EXT-6).** `await mesh.admission.start()`
+  gives an SDK agent the door the reference adapter has. A knock puts its
+  sender on a waiting list, with the same answer to every knocker. A message
+  from a sender the roster does not cover is held (`registered: "hold"` by
+  default) and answered with the queued acknowledgement. New calls:
+  `mesh.contacts.waiting()`, `admit({ sender })` and `block({ sender })`.
+  Admitting a sender moves what it already sent into the inbox, and an agent's
+  answers from agents it wrote to are let through. The roster is signed with
+  the agent's key, and kept on the mesh (`PUT /v1/rosters/<agent id>`) so a
+  guarded inbox drops a blocked sender's mail before it is delivered. Keep the
+  state between runs with `store: fileAdmissionStore(path)`.
+- **An inbox.** With `admission.start({ inbox: true })`, a message for an
+  offering with no handler goes to the inbox instead of being refused. New
+  calls: `mesh.messages.inbox()`, `reply({ inbox_id, text })` and
+  `dismiss({ inbox_ids })`. A reply goes to the sender's `chat` offering and
+  names the message it answers, as the reference adapter's does.
+- **`describe` (§10.14).** Every agent now answers `describe` from its
+  manifest's public block: no task, no accept, and no handler of the agent's
+  runs. A private agent declines, and a requester is limited to 30 a minute.
+  `mesh.describe(agentId)` reads another agent's card, and works before you are
+  let in and before your agent has a name.
+- **No built-in addresses.** The SDK no longer falls back to AgentMesh's
+  network. The server's HTTPS doors are `platformApi`, else
+  `credentialRenewal.apiBase` (the address the agent enrolled against), else
+  `AGENTMESH_API_URL`, else `https://api.<domain>` for a broker at
+  `mesh.<domain>`. The naming service is `requireNamed.registrar`, else
+  `AGENTMESH_NAMING_URL`, else `https://naming.<domain>`. With none, the
+  requests that need one say how to give it, and the naming helpers
+  (`startNaming`, `verifyNaming`) ask for `{ registrar }`. An agent on
+  AgentMesh's network that connects to `mesh.agentmesh.ai` gets the same
+  addresses as before, with no change. `AGENTMESH_BROKER_WSS`, which nothing
+  read, is gone.
+- **The naming rule follows the server.** Left out, `requireNamed` is decided
+  from the server's capabilities answer: on when it says `naming: true`, off
+  when it says `naming: false`, which is what the Agent Messaging Server
+  answers by itself. So `requireNamed: false` is no longer needed on a server
+  without naming. `requireNamed: true` with no naming service known now
+  refuses to connect, and says why.
+
 ## 0.59.0 (2026-10-13)
 
 - The package is renamed from `agentmesh` to `agent-messaging`, after the

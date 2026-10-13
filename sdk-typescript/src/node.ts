@@ -108,6 +108,9 @@ export class MeshNode {
    *  it is an operator's decision about a host, not something each agent should
    *  be able to switch on for itself. Off unless set. */
   private emitSpans?: boolean;
+  /** Where the server's HTTPS doors are, for the hosted agents: the
+   *  transport's platformApi, else the credential renewal's address. */
+  private platformApi?: string;
   /**
    * The mesh URL(s) this node dialled, handed to each hosted agent.
    *
@@ -157,6 +160,7 @@ export class MeshNode {
     node.maxInboundChars = opts?.transport?.maxInboundChars;
     node.mailboxDrainIntervalMs = opts?.transport?.mailboxDrainIntervalMs;
     node.emitSpans = opts?.transport?.emitSpans;
+    node.platformApi = opts?.transport?.platformApi ?? opts?.credentialRenewal?.apiBase;
     if (opts?.credentialRenewal && opts.jwt && opts.nodeSeed !== undefined) {
       node.startCredentialRenewal(opts.credentialRenewal, opts.jwt, opts.nodeSeed);
     }
@@ -228,6 +232,7 @@ export class MeshNode {
       maxInboundChars: this.maxInboundChars,
       mailboxDrainIntervalMs: this.mailboxDrainIntervalMs,
       emitSpans: this.emitSpans,
+      platformApi: this.platformApi,
       // So a hosted agent can open an acl room's scoped connection. Without it
       // every node-hosted agent was locked out of the one room grade whose
       // membership the broker actually enforces.

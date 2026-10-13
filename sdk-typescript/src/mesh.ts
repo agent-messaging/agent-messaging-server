@@ -62,8 +62,9 @@ import { ReviewsDoor } from "./reviews-door.js";
 import { capabilitiesReader, gatedDoor, notAvailableRefusal, type MeshCapabilities } from "./capabilities.js";
 import {
   MessagesDoor, ContactsDoor, OwnerDoor, IdentityDoor, NamesDoor, FeedsDoor, RegistryDoor, type MeshDoorContext,
+  type MessagesInboxRequests, type ContactsAdmissionRequests,
 } from "./mesh-door.js";
-import { AM_URL_API, AM_URL_NAMING } from "./am-env.generated.js";
+import { AM_URL_API, AM_URL_NAMING, addressesFromBroker, requireApi } from "./am-env.generated.js";
 import {
   PlatformServices,
   type MessagesRequests,
@@ -210,6 +211,9 @@ import {
   sealPayloadTo,
 } from "./internal/sealed.js";
 import { derivedSealing } from "./internal/sealing-posture.js";
+import { AdmissionGate, readKnockInput, textOfInput, type AdmissionControl, type AdmissionOptions, type DescribeDocument } from "./admission.js";
+import { describeDocumentOf } from "./interview.js";
+import { registrarNameLookup } from "./naming-gate.js";
 import {
   StorefrontAdopter,
   type StorefrontAdoption,
@@ -688,6 +692,8 @@ export class AgentMesh {
        *  free, but producing a durable record of who this agent talked to is a
        *  different act and wants a decision. */
       emitSpans?: boolean;
+      /** Where the server's HTTPS doors are (ConnectOptions.platformApi). */
+      platformApi?: string;
     },
   ): AgentMesh {
     const seedBytes =
@@ -702,6 +708,9 @@ export class AgentMesh {
     // These are dialled only for an acl room's scoped second connection, which
     // no shared connection can carry.
     mesh.servers = opts?.servers ?? [];
+    const implied = addressesFromBroker(mesh.servers);
+    mesh.platformApi = opts?.platformApi ?? implied.api;
+    mesh.registrarUrl = implied.naming;
     mesh.encryptionSeed = opts?.encryptionSeed;
     mesh.onSecurityWarning = opts?.onSecurityWarning;
     if (opts?.vouchTtlMs !== undefined) { mesh.vouchTtlMs = opts.vouchTtlMs; mesh.vouchTtlExplicit = true; }
@@ -908,10 +917,15 @@ export class AgentMesh {
     mesh.encryptionSeed = opts?.encryptionSeed;
     mesh.servers = Array.isArray(servers) ? servers : [servers];
     mesh.serviceKeys = opts?.serviceKeys ?? {};
-    mesh.platformApi = opts?.platformApi;
+    // Where the server's HTTPS doors and its naming service are, when the
+    // caller does not say: the address the agent enrolled against, the
+    // environment, then the broker's own domain (am-env.generated.ts).
+    const implied = addressesFromBroker(mesh.servers);
+    mesh.platformApi = opts?.platformApi ?? opts?.credentialRenewal?.apiBase ?? AM_URL_API ?? implied.api;
     mesh.platformKey = opts?.platformKey;
     mesh.operatorKey = opts?.operatorKey;
-    mesh.registrarUrl = typeof opts?.requireNamed === "object" ? opts.requireNamed.registrar : undefined;
+    const namedExplicitly = (typeof opts?.requireNamed === "object" ? opts.requireNamed.registrar : undefined) ?? AM_URL_NAMING;
+    mesh.registrarUrl = namedExplicitly ?? implied.naming;
     mesh.configuredIntermediaries = opts?.intermediaryKeys
       ? new Set(opts.intermediaryKeys)
       : null;
@@ -960,9 +974,16 @@ export class AgentMesh {
       mesh.credRenewer.start();
     }
     // The naming rule: asked once now, so the first send (and a send that
-    // cannot wait, like emit) has an answer to go on. On unless the caller
-    // said `requireNamed: false` (tests only), since 2026-09-27.
-    mesh.namingGate = namingGateFor(agentId, opts?.requireNamed ?? true);
+    // cannot wait, like emit) has an answer to go on. Left out, it follows
+    // what the server says it offers: on when it offers naming, off when it
+    // says it does not, and on whenever a naming service is known when it
+    // cannot be asked. A naming service only implied by the broker's domain
+    // is forgotten when the server says it offers none.
+    const ask = opts?.requireNamed === undefined || (!namedExplicitly && !!mesh.registrarUrl);
+    const offered = ask ? await mesh.namingOffered() : undefined;
+    if (offered === false && !namedExplicitly) mesh.registrarUrl = undefined;
+    const rule = opts?.requireNamed ?? (offered === false ? false : !!mesh.registrarUrl);
+    mesh.namingGate = namingGateFor(agentId, rule, mesh.registrarUrl);
     if (mesh.namingGate) await mesh.namingGate.check();
     return mesh;
   }
@@ -2359,9 +2380,25 @@ export class AgentMesh {
     input: unknown,
     config?: RequestConfig,
   ): Promise<RequestResult> {
+    return this.requestWith(agentId, offering, input, config, {});
+  }
+
+  /** request(), with what only the SDK's own calls may ask for:
+   *  `preAdmission` for `describe` (§10.14), which strangers make before they
+   *  are let in and an agent not yet named may make too. */
+  private async requestWith(
+    agentId: string,
+    offering: string,
+    input: unknown,
+    config: RequestConfig | undefined,
+    internal: { preAdmission?: boolean },
+  ): Promise<RequestResult> {
     // The naming rule, before anything else is looked at: an unnamed agent
     // sends nothing, and is told why (naming-gate.ts).
-    if (this.namingGate) await this.namingGate.require();
+    if (this.namingGate && !internal.preAdmission) await this.namingGate.require();
+    // Whoever this agent writes to may answer it: their messages are
+    // solicited, and admission lets them through (admission.ts).
+    if (!internal.preAdmission) this.admissionGate?.noteAddressed(agentId);
     // Common Agent 7.7: a trial carries no budget; refused before anything is
     // built or signed, with the code the responder would answer with.
     preflightTrial(config?.trial, config?.budget);
@@ -3587,13 +3624,37 @@ export class AgentMesh {
    *  ("... is not available on this mesh ..."); core requests work on any
    *  Agent Messaging server and are never refused for it (capabilities.ts). */
   capabilities(): Promise<MeshCapabilities | null> {
-    this.capabilitiesRead ??= capabilitiesReader(this.meshApi());
+    const api = this.apiAddress();
+    if (!api) return Promise.resolve(null);
+    this.capabilitiesRead ??= capabilitiesReader(api);
     return this.capabilitiesRead();
   }
 
-  /** The address this agent reaches its mesh's HTTPS doors at. */
+  /** The address this agent reaches its mesh's HTTPS doors at; a refusal
+   *  that says how to give one when none is known. */
   private meshApi(): string {
-    return (this.platformApi ?? AM_URL_API).replace(/\/+$/, "");
+    return requireApi(this.platformApi ?? AM_URL_API);
+  }
+
+  /** The address of this agent's mesh's HTTPS doors, or undefined when none
+   *  is known (ConnectOptions.platformApi says where it comes from). */
+  apiAddress(): string | undefined {
+    const a = this.platformApi ?? AM_URL_API;
+    return a ? a.replace(/\/+$/, "") : undefined;
+  }
+
+  /** The naming service this agent uses to look names up, or undefined when
+   *  none is known (ConnectOptions.requireNamed says where it comes from). */
+  namingService(): string | undefined {
+    const r = this.registrarUrl ?? AM_URL_NAMING;
+    return r ? r.replace(/\/+$/, "") : undefined;
+  }
+
+  /** Whether the server says it offers naming (its capabilities answer's
+   *  `naming`), or undefined when it cannot be asked or does not say. */
+  private async namingOffered(): Promise<boolean | undefined> {
+    const caps = this.apiAddress() ? await this.capabilities().catch(() => null) : null;
+    return caps && typeof caps.naming === "boolean" ? caps.naming : undefined;
   }
 
   /** Refuses a platform request this mesh does not offer. */
@@ -3737,6 +3798,196 @@ export class AgentMesh {
     return this.roomsDoor;
   }
 
+  // ── admission on this agent's own side (admission.ts, EXT-6 §7) ──────────
+
+  private admissionGate: AdmissionGate | null = null;
+  private admissionSync = true;
+  /** sender agent id → its handle, or null when it has none (10 minutes). */
+  private senderHandles = new Map<string, { at: number; handle: string | null }>();
+  /** sender agent id → describe requests answered in the last minute. */
+  private describeHits = new Map<string, number[]>();
+  /** This agent's own card from the naming service, for describe (10 minutes). */
+  private ownCard: { at: number; card: Record<string, unknown> | null } | null = null;
+
+  /**
+   * Admission on this agent's own side: who may reach it, who is waiting at
+   * its door, and its inbox. Off until `start()`. Once started, a knock
+   * puts its sender on the waiting list, a message from a sender the roster
+   * does not cover is held (`registered: "hold"` by default), and
+   * `mesh.contacts.waiting()`, `admit()` and `block()` and
+   * `mesh.messages.inbox()`, `reply()` and `dismiss()` work.
+   */
+  get admission(): AdmissionControl {
+    return {
+      start: async (opts: AdmissionOptions = {}) => {
+        this.admissionGate = await AdmissionGate.open(this.agentId, this.kp, opts);
+        this.admissionSync = opts.syncRoster !== false;
+        await this.syncRoster();
+      },
+      running: () => this.admissionGate !== null,
+      roster: () => this.admissionGate?.roster() ?? null,
+      flush: async () => { await this.admissionGate?.flush(); },
+    };
+  }
+
+  /** Store the signed roster on the mesh (PUT /v1/rosters/:owner), so a
+   *  guarded inbox drops what it blocks before delivery. Quiet when the
+   *  server has no such door or cannot be reached: the agent's own door
+   *  still applies the roster, which is the authority (EXT-6 §7). */
+  private async syncRoster(): Promise<void> {
+    const gate = this.admissionGate;
+    const api = this.apiAddress();
+    if (!gate || !this.admissionSync || !api) return;
+    try {
+      await fetch(`${api}/v1/rosters/${this.agentId}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(gate.roster()),
+        signal: AbortSignal.timeout(10_000),
+      });
+    } catch {
+      /* the mesh's copy catches up at the next change */
+    }
+  }
+
+  /** A sender's handle, from the naming service when one is known; null when
+   *  it has none or none can be asked. Kept for ten minutes. */
+  private async senderHandle(agentId: string): Promise<string | null> {
+    const registrar = this.namingService();
+    if (!registrar) return null;
+    const hit = this.senderHandles.get(agentId);
+    if (hit && Date.now() - hit.at < 600_000) return hit.handle;
+    const r = await registrarNameLookup(registrar)(agentId).catch(() => null);
+    const handle = r?.status === "named" && typeof r.handle === "string" ? r.handle : null;
+    this.senderHandles.set(agentId, { at: Date.now(), handle });
+    if (this.senderHandles.size > 2000) this.senderHandles.delete(this.senderHandles.keys().next().value!);
+    return handle;
+  }
+
+  /** A terminal answer to a request, with no task and no accept before it. */
+  private answerDirect(msg: Msg, env: Envelope, output: unknown, viaReply: boolean, error?: ErrorObject): void {
+    const out = this.newEnvelope({
+      type: "respond",
+      from: this.agentId,
+      to: env.from,
+      in_reply_to: env.id,
+      trace: childSpan(env.trace),
+      ...(error ? { error, payload: { status: "failed" } } : { payload: { status: "completed", output } }),
+    });
+    this.sendRespond(msg, env, encode(out), { transportReply: viaReply, tap: true });
+  }
+
+  /** The §6.4a queued acknowledgement, shaped as conformance/accept-signal.json
+   *  pins it. A held message and a blocked one get the same words, so a sender
+   *  cannot tell them apart; only a message put in the inbox says delivered. */
+  private answerQueued(msg: Msg, env: Envelope, viaReply: boolean, delivered: boolean): void {
+    const name = this.manifest?.name ?? "This agent";
+    const text = delivered
+      ? `Delivered to ${name}'s inbox. It answers in its own time.`
+      : `Sent; it reaches ${name} if ${name} admits you.`;
+    this.answerDirect(msg, env, { queued: true, inbox_id: env.id, text, ...(delivered ? { delivered: true } : {}) }, viaReply);
+  }
+
+  /** §10.14 `describe`: the manifest's public block and the agent's signed
+   *  card, from declared content only. Rate-limited per requester. */
+  private async answerDescribe(msg: Msg, env: Envelope, viaReply: boolean): Promise<void> {
+    const now = Date.now();
+    const hits = (this.describeHits.get(env.from) ?? []).filter((t) => now - t < 60_000);
+    if (hits.length >= 30) {
+      this.describeHits.set(env.from, hits);
+      this.answerDirect(msg, env, null, viaReply, { code: ErrorCode.RATE_LIMITED, message: "Too many describe requests from this agent. Ask again in a minute.", retryable: true });
+      return;
+    }
+    hits.push(now);
+    this.describeHits.set(env.from, hits);
+    if (this.describeHits.size > 5000) this.describeHits.delete(this.describeHits.keys().next().value!);
+    const m = this.manifest;
+    if (m?.visibility === "private") {
+      this.answerDirect(msg, env, { described: false, visibility: "private", reason: "This agent is private: it does not describe itself." }, viaReply);
+      return;
+    }
+    const registrar = this.namingService();
+    if (registrar && (!this.ownCard || now - this.ownCard.at > 600_000)) {
+      const card = await fetch(`${registrar}/api/resolve?agent_id=${encodeURIComponent(this.agentId)}`, { signal: AbortSignal.timeout(5000) })
+        .then((r) => (r.ok ? (r.json() as Promise<Record<string, unknown>>) : null))
+        .catch(() => null);
+      this.ownCard = { at: now, card };
+    }
+    const doc = m ? describeDocumentOf({ ...m, id: this.agentId } as Manifest) : {};
+    const card = this.ownCard?.card;
+    this.answerDirect(msg, env, { ...doc, agent_id: this.agentId, ...(card ? { card } : {}) }, viaReply);
+  }
+
+  /** EXT-6 §9.3 `knock`: the same answer to everyone, and the sender on the
+   *  waiting list. A knock that carries words is refused, in words. */
+  private async answerKnock(msg: Msg, env: Envelope, reqPayload: RequestPayload, viaReply: boolean): Promise<void> {
+    const gate = this.admissionGate!;
+    const read = readKnockInput(reqPayload.input);
+    if (!read.ok) {
+      this.answerDirect(msg, env, { received: false, refused: true, code: "KNOCK_CARRIES_NO_MESSAGE", error: read.why }, viaReply);
+      return;
+    }
+    const handle = await this.senderHandle(env.from);
+    this.answerDirect(msg, env, gate.knock(env.from, read, handle ?? undefined), viaReply);
+  }
+
+  /** The roster's word on one request. True when it was answered here (held,
+   *  blocked, or put in the inbox) and must go no further. */
+  private async admissionDoor(msg: Msg, env: Envelope, reqPayload: RequestPayload, viaReply: boolean): Promise<boolean> {
+    const gate = this.admissionGate!;
+    const stance = gate.stanceFor(env.from);
+    if (stance === "block") {
+      this.answerQueued(msg, env, viaReply, false);
+      return true;
+    }
+    if (stance === "hold") {
+      const handle = await this.senderHandle(env.from);
+      gate.hold({
+        id: env.id, from: env.from, received_at: new Date().toISOString(), offering: reqPayload.offering, input: reqPayload.input,
+        ...(env.task_id ? { task_id: env.task_id } : {}), ...(env.context_id ? { context_id: env.context_id } : {}),
+      }, handle ?? undefined);
+      this.answerQueued(msg, env, viaReply, false);
+      return true;
+    }
+    // Let in. Into the inbox when the agent collects what nobody handles.
+    if (gate.collectsUnhandled && !this.router.has(reqPayload.offering) && !this.router.hasDefault) {
+      const input = reqPayload.input;
+      const inReplyTo = (input as { in_reply_to?: unknown } | null)?.in_reply_to;
+      gate.file({
+        id: env.id, from: env.from, text: textOfInput(input), received_at: new Date().toISOString(),
+        kind: typeof inReplyTo === "string" ? "reply" : "message", offering: reqPayload.offering, input,
+        ...(typeof inReplyTo === "string" ? { in_reply_to: inReplyTo } : {}),
+        ...(env.task_id ? { task_id: env.task_id } : {}), ...(env.context_id ? { context_id: env.context_id } : {}),
+      });
+      this.answerQueued(msg, env, viaReply, true);
+      void this.senderHandle(env.from);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * §10.14 `describe`: read another agent's public card (its manifest's
+   * `public` block, and its signed name card when it has one) before you are
+   * let in. It never runs the other agent's model or code, and it needs no
+   * name: an agent not yet named may describe others.
+   */
+  async describe(target: string, opts: { timeout_ms?: number } = {}): Promise<DescribeDocument> {
+    let agentId = target.trim();
+    if (!/^U[A-Z2-7]{55}$/.test(agentId)) {
+      const { Diagnostics } = await import("./diagnostics.js");
+      const r = await new Diagnostics(this).resolve(agentId);
+      if (!r.resolved || !r.agentId) {
+        throw new MeshError(ErrorCode.NOT_FOUND, `${target} could not be found: ${r.error ?? "its name did not resolve"}.`, { retryable: false });
+      }
+      agentId = r.agentId;
+    }
+    const res = await this.requestWith(agentId, "describe", {}, { timeout_ms: opts.timeout_ms ?? 15_000 }, { preAdmission: true });
+    const out = (res.payload as { output?: unknown } | undefined)?.output ?? res.payload;
+    if (!out || typeof out !== "object") throw new MeshError(ErrorCode.INVALID_ENVELOPE, `${target} answered describe with no document.`, { retryable: false });
+    return out as DescribeDocument;
+  }
+
   // ── the mesh's own requests (platform-services/*.json, "part": "mesh") ──
   // The same names, fields and answers as the MCP tools messages_send,
   // feeds_read and the rest, and the command line's agentmesh messages,
@@ -3753,8 +4004,10 @@ export class AgentMesh {
     if (!this.meshDoorsCache) {
       const ctx: MeshDoorContext = {
         mesh: this,
-        api: () => (this.platformApi ?? AM_URL_API).replace(/\/+$/, ""),
-        registrar: () => (this.registrarUrl ?? AM_URL_NAMING).replace(/\/+$/, ""),
+        api: () => this.meshApi(),
+        registrar: () => this.namingService(),
+        admission: () => this.admissionGate,
+        syncRoster: () => this.syncRoster(),
         declaredFeeds: () => [...this.declaredFeeds.entries()].map(([subject, kind]) => ({ topic: subject.slice(subject.lastIndexOf(".") + 1), kind })),
         retireFeed: (topic) => this.declaredFeeds.delete(Subjects.feed(this.agentId, topic)),
       };
@@ -3770,13 +4023,16 @@ export class AgentMesh {
   }
 
   /** Sending a message to another agent (platform-services/messages.json).
-   *  Messages arriving for this agent come to onRequest, as before. */
-  get messages(): MessagesRequests {
+   *  Messages arriving for this agent come to onRequest, as before; with
+   *  admission started, inbox(), reply() and dismiss() read and answer the
+   *  ones it keeps (admission.ts). */
+  get messages(): MessagesRequests & MessagesInboxRequests {
     return this.meshDoors().messages;
   }
 
-  /** Knocking, and who is around (platform-services/contacts.json). */
-  get contacts(): ContactsRequests {
+  /** Knocking, and who is around (platform-services/contacts.json); with
+   *  admission started, waiting(), admit() and block() (admission.ts). */
+  get contacts(): ContactsRequests & ContactsAdmissionRequests {
     return this.meshDoors().contacts;
   }
 
@@ -5732,6 +5988,20 @@ export class AgentMesh {
     // not reintroduce that shape.
     if (this.overInboundCap(reqPayload.input, env, msg, viaReply)) return;
 
+    // ── the pre-admission surface (§1.5 invariant 4) ──────────────────────
+    // `describe` reads and `knock` asks; admission applies to neither, and
+    // neither creates a task, sends an accept, or reaches a handler the
+    // application did not register for it by name (a default handler is the
+    // agent's own code, and §10.14 says a describe must never run it).
+    if (!probe && reqPayload.offering === "describe" && !this.router.has("describe")) {
+      await this.answerDescribe(msg, env, viaReply);
+      return;
+    }
+    if (!probe && reqPayload.offering === "knock" && this.admissionGate && !this.router.has("knock")) {
+      await this.answerKnock(msg, env, reqPayload, viaReply);
+      return;
+    }
+
     // ── §8.9 open the box ────────────────────────────────────────────────
     // After the size cap, which is a DoS measure and belongs on the bytes that
     // actually arrived; before everything else, so the cancel parser, the
@@ -5791,6 +6061,13 @@ export class AgentMesh {
       this.sendRespond(msg, env, encode(errEnv), { transportReply: viaReply, tap: true });
       return;
     }
+
+    // ── EXT-6 admission, on this agent's own side (admission.ts) ─────────
+    // After the §22 checks and the box is open, before anything is accepted:
+    // a sender the roster holds or blocks gets the queued acknowledgement and
+    // nothing else, and a message for an offering with no handler goes to the
+    // inbox when the agent asked for one.
+    if (this.admissionGate && !probe && (await this.admissionDoor(msg, env, reqPayload, viaReply))) return;
 
     // The task id this dispatch runs under, computed once so the §7.7
     // admission phase, the regular handler and the stream branch all agree.

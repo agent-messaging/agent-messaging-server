@@ -98,6 +98,14 @@ describe("a knock at the mesh-side door", () => {
     expect(back[0]?.payload?.output).toMatchObject({ refused: true, code: "KNOCK_CARRIES_NO_MESSAGE" });
   });
 
+  it("passes a knock and a describe through even from a sender the roster blocks (§10.14, EXT-6 §9.3)", async () => {
+    roster = { admission: "v1", defaults: { registered: "block", anonymous: "block" }, entries: [{ subject: SENDER, stance: "block" }] };
+    expect(await priv.decide(AGENT, SENDER, { offering: "describe", input: {} }, true)).toBe("relay");
+    expect(await priv.decide(AGENT, SENDER, { offering: "knock", input: {} }, true)).toBe("relay");
+    // Anything else from that sender is still dropped.
+    expect(await priv.decide(AGENT, SENDER, chat({ text: "hello" }), true)).toBe("drop");
+  });
+
   it("passes a knock with enumerated grants through, whatever the tier", async () => {
     roster = { admission: "v1", defaults: { registered: "hold", anonymous: "block" }, entries: [] };
     const relay = vi.fn(async () => {});

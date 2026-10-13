@@ -243,16 +243,18 @@ describe("an agent that connected with requireNamed", () => {
 // unless the caller says `requireNamed: false` (tests only). connect() needs a
 // live transport, so the default is pinned on the source and on the builder
 // the default feeds.
-describe("the rule is on by default for connect()", () => {
-  it("connect() builds the gate from `requireNamed ?? true`", () => {
+describe("connect() follows the server when requireNamed is left out", () => {
+  it("asks the server, and leaves the rule off when it offers no naming", () => {
     const src = readFileSync(join(here, "..", "..", "src", "mesh.ts"), "utf8");
-    expect(src).toMatch(/mesh\.namingGate = namingGateFor\(agentId, opts\?\.requireNamed \?\? true\);/);
+    expect(src).toMatch(/const offered = ask \? await mesh\.namingOffered\(\) : undefined;/);
+    expect(src).toMatch(/const rule = opts\?\.requireNamed \?\? \(offered === false \? false : !!mesh\.registrarUrl\);/);
+    expect(src).toMatch(/mesh\.namingGate = namingGateFor\(agentId, rule, mesh\.registrarUrl\);/);
   });
 
-  it("true builds a gate, false builds none", async () => {
+  it("true builds a gate when a naming service is known, false builds none", async () => {
     const { namingGateFor } = await import("../../src/naming-gate.js");
     const id = nkeys.createUser().getPublicKey();
-    expect(namingGateFor(id, undefined ?? true)).not.toBeNull();
-    expect(namingGateFor(id, false)).toBeNull();
+    expect(namingGateFor(id, true, "https://naming.example.com")).not.toBeNull();
+    expect(namingGateFor(id, false, "https://naming.example.com")).toBeNull();
   });
 });

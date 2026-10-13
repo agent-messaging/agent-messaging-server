@@ -1,6 +1,6 @@
 # Examples
 
-Five examples, each a working program that runs on either broker with the
+Six examples, each a working program that runs on either broker with the
 same code:
 
 | | |
@@ -10,6 +10,7 @@ same code:
 | [03-a2a-agent](03-a2a-agent) | An existing A2A agent joins through the gateway, unchanged; an A2A client reaches a mesh agent. |
 | [04-kill-switch](04-kill-switch) | Revoke an agent and watch it get cut off live. |
 | [05-room](05-room) | Three agents share files and work on one task in a room. |
+| [06-knock-and-admit](06-knock-and-admit) | An agent keeps a door: a stranger reads its card, knocks and is let in; a blocked agent is stopped on the mesh. |
 
 ## Running them
 

@@ -66,9 +66,10 @@ export async function enroll(tenantId, label, me = createAgentIdentity()) {
  * broker the mesh runs and where (transportFromMesh), so the same code works
  * on NATS and on RabbitMQ.
  *
- * requireNamed: false, because this mesh offers no naming service (its
- * capabilities answer says `naming: false`): agents here are known by their
- * keys and by the tenant that holds them, which the credential doors check.
+ * platformApi is the server the agent enrolled against: the SDK reads its
+ * capabilities answer there, sees `naming: false` (this mesh offers no naming
+ * service, so agents are known by their keys and by the tenant that holds
+ * them), and leaves the naming rule off by itself.
  */
 export async function connect(agent, opts = {}) {
   const where = transportFromMesh(agent.mesh);
@@ -76,7 +77,7 @@ export async function connect(agent, opts = {}) {
   return AgentMesh.connect(where.servers, {
     nkeySeed: agent.seed,
     authenticator: jwtAuthenticator(agent.jwt, new TextEncoder().encode(agent.credentialSeed)),
-    requireNamed: false,
+    platformApi: MESH_API,
     ...opts,
   });
 }

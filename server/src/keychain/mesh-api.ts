@@ -53,6 +53,7 @@ import { AuditLog } from "../activity/audit-log.js";
 import { adminApi, type AdminApi } from "../admin/admin-api.js";
 import { AdminAuth } from "../admin/admin-auth.js";
 import { AdmissionStore } from "../admission/admission-store.js";
+import { rosterDoor, type RosterDoor } from "../admission/roster-door.js";
 import { dataDbPath } from "../data-dir.js";
 import { AgentKeyRevocationStore } from "../shared/agent-key-revocations.js";
 import { AgentStatusStore } from "../shared/agent-status.js";
@@ -252,6 +253,7 @@ export class MeshApi {
     const docs = registryDocuments(js, env);
     const api = new MeshApi(doors, platform, opts.port ?? Number(env.MESH_API_PORT ?? 3005), opts.host ?? env.MESH_API_HOST ?? "127.0.0.1", env, admin, auth, docs);
     api.storage = js;
+    api.rosters = rosterDoor(admissionStore);
     api.closeUsage = async () => { await streamRoutes.close(); if (usageStore) await usageStore.close(); };
     return api;
   }
@@ -278,6 +280,8 @@ export class MeshApi {
 
   private brokerAuth: { close(): void } | null = null;
   private storage: StorageLike | null = null;
+  /** The admission roster's own door (admission/roster-door.ts). */
+  private rosters: RosterDoor | null = null;
   /** Writes the usage store's last batch, when the Monitor routes opened it. */
   private closeUsage: () => Promise<void> = async () => {};
 
@@ -315,6 +319,10 @@ export class MeshApi {
       if (method === "POST" && path === "/v1/key-standing") return send(res, await this.doors.keyStanding(await readJson(req), ip));
       const m = /^\/v1\/key-check\/([^/]+)$/.exec(path);
       if (method === "GET" && m) return send(res, await this.doors.keyCheck(decodeURIComponent(m[1]!)));
+      if (this.rosters && path.startsWith("/v1/rosters/")) {
+        const answer = await this.rosters(method, path, () => readJson(req));
+        if (answer) return send(res, answer);
+      }
       const doc = this.docs ? await registryDocumentRoute(this.docs, method, path) : null;
       if (doc) return sendRaw(res, doc);
       if (path === "/admin" || path.startsWith("/admin/")) return send(res, await this.adminRoute(req, method, path, url.searchParams));

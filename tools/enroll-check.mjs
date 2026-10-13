@@ -36,13 +36,14 @@ const where = transportFromMesh(creds.mesh);
 if (!where) throw new Error(`the credential answer names no broker this SDK speaks: ${JSON.stringify(creds.mesh)}`);
 console.log(`Enrolled: the credential answer names ${where.binding} at ${[].concat(where.servers).join(", ")}.`);
 
-// requireNamed: false, because this mesh offers no naming service (its
-// capabilities answer says naming: false); the tenant that holds the key is
-// what the credential doors check.
+// platformApi is the server the agent enrolled against. Its capabilities
+// answer says naming: false (this mesh offers no naming service; the tenant
+// that holds the key is what the credential doors check), so the SDK leaves
+// the naming rule off by itself.
 const mesh = await AgentMesh.connect(where.servers, {
   nkeySeed: me.seed,
   authenticator: jwtAuthenticator(creds.jwt, new TextEncoder().encode(creds.seed)),
-  requireNamed: false,
+  platformApi: MESH_API,
 });
 mesh.onRequest("add", (input) => ({ sum: Number(input?.a) + Number(input?.b) }));
 await mesh.register({

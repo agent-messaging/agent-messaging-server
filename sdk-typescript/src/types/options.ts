@@ -41,20 +41,28 @@ export interface ConnectOptions {
    *  handle follows the global standard, its name, a dot and its owner's
    *  email, at the naming service. A refusal is a `NOT_NAMED` MeshError whose
    *  message is the owner's words and whose details carry the proposed
-   *  handle; nothing is built, signed or published. `true` asks
-   *  https://naming.agentmesh.ai.
+   *  handle; nothing is built, signed or published.
    *
-   *  ON BY DEFAULT for `AgentMesh.connect()` since 2026-09-27 (no anonymous
-   *  agents): unset means `true`. `false` turns it off, and is for tests
-   *  only, and for a host that enforces the rule itself (the reference
-   *  adapter, the platform's own in-process agents); an agent on a real mesh
-   *  that sends without a verified name is refused by the platform as well. `withConnection` and a node's
-   *  `addAgent` stay opt-in: they are how tests and hosts that run their own
-   *  check (the reference adapter) build agents. See naming-gate.ts. */
+   *  Left out, `AgentMesh.connect()` decides from the server: the rule is on
+   *  when the server says it offers naming (its capabilities answer has
+   *  `naming: true`) and a naming service is known, and off when it says it
+   *  does not (`naming: false`), which is how the Agent Messaging Server
+   *  answers by itself. When the server cannot be asked, the rule is on
+   *  whenever a naming service is known. The naming service is
+   *  `{ registrar }` when given, else AGENTMESH_NAMING_URL, else
+   *  https://naming.<domain> for a broker at mesh.<domain>.
+   *
+   *  `true` turns it on whatever the server says (a naming service must be
+   *  known); `false` turns it off, for a host that enforces the rule itself
+   *  (the reference adapter). `withConnection` and a node's `addAgent` stay
+   *  opt-in. See naming-gate.ts. */
   requireNamed?: boolean | RequireNamedOptions;
-  /** Where the platform's service door is, for mesh.dependents, mesh.runs and
-   *  the other platform services (platform-services/README.md). This
-   *  environment's API when left out. */
+  /** Where the server's HTTPS doors are: its capabilities answer, the
+   *  credential and roster doors, and the platform services a mesh may offer
+   *  beside the core (mesh.dependents, mesh.runs and the rest). Left out, the
+   *  SDK uses `credentialRenewal.apiBase` (the address the agent enrolled
+   *  against), else AGENTMESH_API_URL, else https://api.<domain> for a broker
+   *  at mesh.<domain>. With none of these, the requests that need it say so. */
   platformApi?: string;
   /** The account's API token, sent beside the agent's signature with an
    *  owner's acts (mesh.credits, mesh.attachments, mesh.portfolio), which need

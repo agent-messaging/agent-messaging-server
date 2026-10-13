@@ -15,6 +15,9 @@
  * Driven through the real handlers with real signed descriptors and envelopes.
  */
 import { describe, it, expect, afterEach, vi } from "vitest";
+// The rooms service reads its naming service when it loads. A server alone
+// names none (shared/settings.ts); these tests stand one up.
+vi.hoisted(() => { process.env.PAN_REGISTRAR ??= "https://naming.test"; });
 import { RoomsService, NO_OWNER_WORDS } from "../../src/rooms/rooms-service.js";
 import { MemoryAgentOwners, roomAccountOf, roomQuotaHolder, type AgentOwnerRecord } from "../../src/keychain/agent-owners.js";
 import { createEnvelope, signEnvelope, nkeys } from "../../src/sdk.js";

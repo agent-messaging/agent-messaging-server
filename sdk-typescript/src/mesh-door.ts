@@ -17,6 +17,7 @@
  */
 import type { AgentMesh } from "./mesh.js";
 import { Diagnostics } from "./diagnostics.js";
+import type { AdmissionGate, InboxMessage, WaitingSender } from "./admission.js";
 import { MeshError } from "./types/errors.js";
 import {
   ServiceRefusal,
@@ -37,6 +38,41 @@ import {
   type RegistryRequests, type RegistryListInput, type RegistryListResult, type RegistryListRefusal,
 } from "./services.generated.js";
 
+// ── the agent's own side of admission (admission.ts): the inbox and the door ─
+//
+// Not in the generated definitions, which record these as adapter-only
+// ("An SDK program ... keeps no inbox"); since 0.60.0 an SDK program keeps
+// one when it starts admission, and these are its calls, with the same names,
+// fields and refusals as the adapter's MCP tools.
+
+export interface MessagesInboxResult { messages: InboxMessage[] }
+export interface MessagesReplyInput { inbox_id: string; text: string }
+export interface MessagesReplyResult { replied_to: string; delivered: boolean; note?: string }
+export type MessagesReplyRefusal = "NOT_FOUND" | "NOT_NAMED" | "TOO_BIG" | "INPUT_INVALID" | "NOT_RUNNING";
+export interface MessagesDismissInput { inbox_ids: string[] }
+export interface MessagesDismissResult { dismissed: number }
+export type MessagesDismissRefusal = "INPUT_INVALID" | "NOT_RUNNING";
+/** `mesh.messages`: sending, and the inbox. */
+export interface MessagesInboxRequests {
+  inbox(): Promise<MessagesInboxResult>;
+  reply(input: MessagesReplyInput): Promise<MessagesReplyResult>;
+  dismiss(input: MessagesDismissInput): Promise<MessagesDismissResult>;
+}
+
+export interface ContactsWaitingResult { senders: WaitingSender[] }
+export interface ContactsAdmitInput { sender: string; note?: string }
+export interface ContactsAdmitResult { name: string; released: number }
+export type ContactsAdmitRefusal = "NOT_WAITING" | "INPUT_INVALID" | "NOT_RUNNING";
+export interface ContactsBlockInput { sender: string; note?: string }
+export interface ContactsBlockResult { name: string; dropped: number }
+export type ContactsBlockRefusal = "NOT_WAITING" | "INPUT_INVALID" | "NOT_RUNNING";
+/** `mesh.contacts`: knocking, presence, and the agent's own door. */
+export interface ContactsAdmissionRequests {
+  waiting(): Promise<ContactsWaitingResult>;
+  admit(input: ContactsAdmitInput): Promise<ContactsAdmitResult>;
+  block(input: ContactsBlockInput): Promise<ContactsBlockResult>;
+}
+
 const AGENT_ID_RE = /^U[A-Z2-7]{55}$/;
 const FEED_TOPIC_RE = /^[A-Za-z0-9_-]+$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -53,8 +89,13 @@ export interface MeshDoorContext {
   mesh: AgentMesh;
   /** The platform's API (the platformApi option, or this environment's). */
   api(): string;
-  /** The naming service (requireNamed.registrar, or this environment's). */
-  registrar(): string;
+  /** The naming service (ConnectOptions.requireNamed says where it comes
+   *  from), or undefined on a mesh with none known. */
+  registrar(): string | undefined;
+  /** This agent's admission (admission.ts), when it was started. */
+  admission(): AdmissionGate | null;
+  /** Store the signed roster on the mesh, when the server takes it. */
+  syncRoster(): Promise<void>;
   /** This agent's declared feeds, by topic, and the way to drop one. */
   declaredFeeds(): Array<{ topic: string; kind: "state" | "stream" }>;
   retireFeed(topic: string): boolean;
@@ -91,7 +132,7 @@ function sendRefusal<C extends string>(no: Refuse<C>, e: unknown, codes: { notNa
 
 // ── messages ────────────────────────────────────────────────────────────────
 
-export class MessagesDoor implements MessagesRequests {
+export class MessagesDoor implements MessagesRequests, MessagesInboxRequests {
   constructor(private readonly ctx: MeshDoorContext) {}
 
   async send(input: MessagesSendInput): Promise<MessagesSendResult> {
@@ -127,11 +168,70 @@ export class MessagesDoor implements MessagesRequests {
       return sendRefusal(no, e, { notNamed: "NOT_NAMED", refused: "REFUSED" });
     }
   }
+
+  /** The admission that keeps the inbox, or the refusal that says to start it. */
+  private gate(request: string): AdmissionGate {
+    const g = this.ctx.admission();
+    if (!g) {
+      throw new ServiceRefusal(request, "NOT_RUNNING", "This agent keeps no inbox yet: start admission first (await mesh.admission.start({ inbox: true })).");
+    }
+    return g;
+  }
+
+  /** The messages waiting in this agent's inbox: released held messages, and
+   *  with `inbox: true` every message for an offering nothing handles.
+   *  Answer with reply(); clear what is done with dismiss(). */
+  async inbox(): Promise<MessagesInboxResult> {
+    return { messages: this.gate("messages.inbox").inbox() };
+  }
+
+  /** Answer a message in the inbox, by its id. The answer goes to the sender
+   *  as a new message (to its `chat` offering) that names the message it
+   *  answers, the way the reference adapter answers. It does not clear the
+   *  message; dismiss() does that. */
+  async reply(input: MessagesReplyInput): Promise<MessagesReplyResult> {
+    const no = refusal<MessagesReplyRefusal>("messages.reply");
+    const gate = this.gate("messages.reply");
+    const id = str(input?.inbox_id);
+    if (!id) no("INPUT_INVALID", "Say which message: its inbox_id, as inbox() lists it.");
+    const text = typeof input?.text === "string" ? input.text : "";
+    if (!text.trim()) no("INPUT_INVALID", "Say the reply: text is empty.");
+    if (text.length > MESH_TEXT_MAX) no("TOO_BIG", `That reply is ${text.length} characters; a message takes at most ${MESH_TEXT_MAX}. Send it as a file instead.`);
+    const m = gate.message(id);
+    if (!m) return no("NOT_FOUND", `No message ${id} is in the inbox. inbox() lists the ones that are.`);
+    let delivered = true;
+    let note: string | undefined;
+    try {
+      await this.ctx.mesh.request(m.from, "chat", { text, in_reply_to: m.id }, { timeout_ms: 30_000, ...(m.context_id ? { context_id: m.context_id } : {}) });
+    } catch (e) {
+      const details = ((e as { details?: Record<string, unknown> }).details ?? {}) as { queued?: boolean };
+      if (errCode(e) === "REQUEST_QUEUED" || details.queued === true) {
+        delivered = false;
+        note = "Sent. The sender's mailbox holds it until the sender reads it.";
+      } else if (/timeout|no response/i.test(errWords(e))) {
+        delivered = false;
+        note = "Sent. The sender did not answer within 30 seconds; if it is offline the mesh holds the reply for it.";
+      } else {
+        return sendRefusal(no, e, { notNamed: "NOT_NAMED" });
+      }
+    }
+    gate.markReplied(id);
+    return { replied_to: m.from, delivered, ...(note ? { note } : {}) };
+  }
+
+  /** Clear messages out of the inbox, by id, without replying. */
+  async dismiss(input: MessagesDismissInput): Promise<MessagesDismissResult> {
+    const no = refusal<MessagesDismissRefusal>("messages.dismiss");
+    const gate = this.gate("messages.dismiss");
+    const ids = Array.isArray(input?.inbox_ids) ? input.inbox_ids.map(String).filter(Boolean) : [];
+    if (!ids.length) no("INPUT_INVALID", "Say which messages: inbox_ids, as inbox() lists them.");
+    return { dismissed: gate.dismiss(ids) };
+  }
 }
 
 // ── contacts ────────────────────────────────────────────────────────────────
 
-export class ContactsDoor implements ContactsRequests {
+export class ContactsDoor implements ContactsRequests, ContactsAdmissionRequests {
   constructor(private readonly ctx: MeshDoorContext) {}
 
   async knock(input: ContactsKnockInput): Promise<ContactsKnockResult> {
@@ -181,6 +281,51 @@ export class ContactsDoor implements ContactsRequests {
       return { name, ...(AGENT_ID_RE.test(id) ? { agent_id: id } : {}), state, ...(attended === undefined ? {} : { attended }), line };
     });
     return { contacts: contacts.sort((a, b) => rank[a.state] - rank[b.state] || a.name.localeCompare(b.name)) };
+  }
+
+  private gate(request: string): AdmissionGate {
+    const g = this.ctx.admission();
+    if (!g) {
+      throw new ServiceRefusal(request, "NOT_RUNNING", "Admission is off for this agent, so nobody waits at its door: start it first (await mesh.admission.start()).");
+    }
+    return g;
+  }
+
+  /** Senders new to this agent who are waiting at its door, longest first:
+   *  who knocked, and who sent a message the roster holds. Nothing from them
+   *  arrives until they are let in. Tell the owner, and ask about each one. */
+  async waiting(): Promise<ContactsWaitingResult> {
+    return { senders: this.gate("contacts.waiting").waiting() };
+  }
+
+  /** Let a sender in. Only at the owner's word: from now on its messages
+   *  reach this agent, and what it already sent moves to the inbox. A sender
+   *  not waiting can be let in by agent id before it ever writes. */
+  async admit(input: ContactsAdmitInput): Promise<ContactsAdmitResult> {
+    const no = refusal<ContactsAdmitRefusal>("contacts.admit");
+    const gate = this.gate("contacts.admit");
+    const sender = str(input?.sender);
+    if (!sender) no("INPUT_INVALID", "Say who: their name as waiting() gave it, or an agent id.");
+    const id = gate.resolve(sender);
+    if (!id) return no("NOT_WAITING", `Nobody called ${sender} is waiting. waiting() gives the names that are.`);
+    const out = gate.admit(id, str(input?.note) || undefined);
+    await this.ctx.syncRoster();
+    return out;
+  }
+
+  /** Keep a sender out. Only at the owner's word: what it already sent is
+   *  dropped, and nothing from it reaches this agent. A guarded inbox drops
+   *  its mail on the mesh from now on. */
+  async block(input: ContactsBlockInput): Promise<ContactsBlockResult> {
+    const no = refusal<ContactsBlockRefusal>("contacts.block");
+    const gate = this.gate("contacts.block");
+    const sender = str(input?.sender);
+    if (!sender) no("INPUT_INVALID", "Say who: their name as waiting() gave it, or an agent id.");
+    const id = gate.resolve(sender);
+    if (!id) return no("NOT_WAITING", `Nobody called ${sender} is waiting. waiting() gives the names that are, or give an agent id.`);
+    const out = gate.block(id, str(input?.note) || undefined);
+    await this.ctx.syncRoster();
+    return out;
   }
 }
 
@@ -241,12 +386,15 @@ export class IdentityDoor implements IdentityRequests {
     const status = mesh.namingStatus() ?? (await mesh.recheckName().catch(() => null));
     // No naming check on this agent (requireNamed: false): asked here instead.
     let handle = status?.handle ?? null;
-    if (!status) {
-      const raw = await fetch(`${this.ctx.registrar()}/api/resolve?agent_id=${encodeURIComponent(mesh.id)}`, { signal: AbortSignal.timeout(6000) })
+    const registrar = this.ctx.registrar();
+    if (!status && registrar) {
+      const raw = await fetch(`${registrar}/api/resolve?agent_id=${encodeURIComponent(mesh.id)}`, { signal: AbortSignal.timeout(6000) })
         .then((r) => (r.ok ? r.json() : null)).catch(() => null) as { card?: { handle?: string } } | null;
       handle = raw?.card?.handle ?? null;
     }
-    const canSend = status ? status.named || !!status.unchecked : !!handle;
+    // With no naming rule and no naming service known, nothing stands
+    // between this agent and sending: the mesh knows it by its key.
+    const canSend = status ? status.named || !!status.unchecked : !registrar || !!handle;
     return {
       agent_id: mesh.id,
       ...(handle ? { handle, name: handle.split(".")[0] } : {}),
@@ -278,7 +426,8 @@ export class NamesDoor implements NamesRequests {
     }
     // The card itself, as the naming service serves it (Diagnostics checked it above).
     const q = AGENT_ID_RE.test(t) ? `agent_id=${encodeURIComponent(t)}` : `handle=${encodeURIComponent(t)}`;
-    const raw = await fetch(`${this.ctx.registrar()}/api/resolve?${q}`, { signal: AbortSignal.timeout(8000) }).then((x) => x.json()).catch(() => null) as { card?: Record<string, unknown> & { handle?: string } } | null;
+    const registrar = this.ctx.registrar();
+    const raw = !registrar ? null : await fetch(`${registrar}/api/resolve?${q}`, { signal: AbortSignal.timeout(8000) }).then((x) => x.json()).catch(() => null) as { card?: Record<string, unknown> & { handle?: string } } | null;
     const handle = raw?.card?.handle ?? (AGENT_ID_RE.test(t) ? undefined : t);
     return { agent_id: r.agentId, ...(handle ? { handle } : {}), ...(raw?.card ? { card: raw.card } : {}), ...(r.notice ? { notice: r.notice } : {}) };
   }
@@ -334,9 +483,11 @@ export class NamesDoor implements NamesRequests {
   }
 
   private async post<C extends string>(no: Refuse<C | "UNAVAILABLE" | "INPUT_INVALID">, path: string, body: unknown, token?: string, codeOnRefusal?: C): Promise<unknown> {
+    const registrar = this.ctx.registrar();
+    if (!registrar) return no("UNAVAILABLE", "No naming service is known for this mesh, so there is nowhere to claim a name. A mesh that offers none knows its agents by their keys.");
     let res: Response;
     try {
-      res = await fetch(`${this.ctx.registrar()}${path}`, {
+      res = await fetch(`${registrar}${path}`, {
         method: "POST",
         headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
         body: JSON.stringify(body),

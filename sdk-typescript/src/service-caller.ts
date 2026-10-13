@@ -17,7 +17,7 @@
  * Browser-safe: no Buffer and no node:crypto, the same as artifacts.ts.
  */
 import { REQUEST_TIERS, ServiceRefusal, type KeyUse, type ServiceCaller } from "./services.generated.js";
-import { AM_URL_API } from "./am-env.generated.js";
+import { AM_URL_API, requireApi } from "./am-env.generated.js";
 import { capabilitiesReader, notAvailableRefusal, type MeshCapabilities } from "./capabilities.js";
 
 /** JSON with keys sorted at every level, so the platform hashes the bytes
@@ -71,11 +71,15 @@ export function bearerFor(opts: Pick<PlatformCallerOptions, "key" | "operatorKey
 
 /** A caller for PlatformServices. */
 export function platformCaller(opts: PlatformCallerOptions): ServiceCaller {
-  const api = (opts.api ?? AM_URL_API).replace(/\/+$/, "");
+  const where = opts.api ?? AM_URL_API;
   const doFetch = opts.fetchImpl ?? ((input: Parameters<typeof fetch>[0], init?: RequestInit) => fetch(input, init));
-  const capabilities = opts.capabilities === undefined ? capabilitiesReader(api, doFetch) : opts.capabilities;
+  const capabilities = opts.capabilities === undefined ? (where ? capabilitiesReader(where, doFetch) : null) : opts.capabilities;
   return {
     async call(request: string, input: Record<string, unknown>, key?: KeyUse): Promise<unknown> {
+      // Asked here, not when the caller was made: an agent with no address
+      // for the server's HTTPS doors still connects, and only the requests
+      // that need them say so.
+      const api = requireApi(where);
       // A platform request this mesh does not offer is refused here, in
       // plain words, rather than sent to fail some other way.
       if (capabilities && REQUEST_TIERS[request] === "platform") {

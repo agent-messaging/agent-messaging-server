@@ -19,14 +19,12 @@
  * A file that is there and broken still throws, at the first read.
  */
 import { findEnvFile as find, envFileGet as get } from "./env-file.js";
-import { AM_URL_NAMING } from "../../../sdk-typescript/src/am-env.generated.js";
 
-/** What the core uses when the deployment has no environment file. */
-const DEFAULTS: Readonly<Record<string, string>> = {
-  // The SDKs' own default naming service, so a core with no file resolves
-  // names where its clients do. PAN_URL or PAN_REGISTRAR overrides it.
-  "urls.naming": AM_URL_NAMING,
-};
+/** What the core uses when the deployment has no environment file. Nothing:
+ *  a server alone offers no naming service (its capabilities say
+ *  `naming: false`) and names none, so it never asks another network's
+ *  naming service about its own agents. PAN_URL or PAN_REGISTRAR names one. */
+const DEFAULTS: Readonly<Record<string, string>> = {};
 
 /** Whether this process found an environment file. */
 export function hasEnvFile(): boolean {
@@ -50,7 +48,8 @@ export function coreUrl(key: string): string | undefined {
   return coreSetting(`urls.${key}`);
 }
 
-/** The naming service the core resolves handles at: the environment's, or the SDKs' default. */
-export function namingUrl(): string {
-  return coreUrl("naming") ?? AM_URL_NAMING;
+/** The naming service the core resolves handles at: the environment's, or
+ *  none (then the core resolves no handles). */
+export function namingUrl(): string | undefined {
+  return coreUrl("naming") ?? (process.env.AGENTMESH_NAMING_URL?.trim() || undefined);
 }

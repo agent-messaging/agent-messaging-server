@@ -9,7 +9,7 @@
  * evidence the reputation bureau keeps, which is why a review is not a
  * platform request signed only as a request.
  */
-import { AM_URL_API } from "./am-env.generated.js";
+import { AM_URL_API, requireApi } from "./am-env.generated.js";
 import { canonicalJSON } from "./internal/identity.js";
 import {
   ServiceRefusal,
@@ -51,7 +51,7 @@ export class ReviewsDoor implements ReviewsRequests {
   constructor(private readonly deps: ReviewsDoorDeps) {}
 
   private async post(path: string, body: Record<string, unknown>): Promise<{ status: number; out: Record<string, unknown> }> {
-    const api = (this.deps.api ?? AM_URL_API).replace(/\/+$/, "");
+    const api = requireApi(this.deps.api ?? AM_URL_API);
     const doFetch = this.deps.fetchImpl ?? fetch;
     const res = await doFetch(`${api}/v1${path}`, {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(10_000),
