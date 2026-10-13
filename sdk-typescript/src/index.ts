@@ -919,6 +919,9 @@ export {
   ProofRefusedError,
 } from "./outside-proof.js";
 export type { OutsideProof, OutsideProofSource, OutsideProofResult } from "./outside-proof.js";
+// Acting for a person (§4.16): evidence in meta.on_behalf_of, checked by the receiver.
+export { verifyOnBehalfOf, onBehalfOfOf } from "./on-behalf-of.js";
+export type { OnBehalfOf, OnBehalfOfKind, OnBehalfOfResult, VerifyOnBehalfOfOptions } from "./on-behalf-of.js";
 export type { BootstrapResult } from "./bootstrap.js";
 export { bindingOfUrl, connectTransport, transportFromMesh } from "./transport.js";
 export type { Binding, MeshObject } from "./transport.js";

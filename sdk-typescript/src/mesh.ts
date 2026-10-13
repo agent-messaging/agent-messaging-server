@@ -2440,7 +2440,8 @@ export class AgentMesh {
       trace: config?.trace ? childSpan(config.trace) : undefined,
       budget: config?.budget,
       payload: reqPayload,
-      meta: config?.meta,
+      // Evidence of acting for a person (§4.16) rides in meta, under the envelope signature.
+      meta: config?.on_behalf_of ? { ...(config.meta ?? {}), on_behalf_of: config.on_behalf_of } : config?.meta,
     });
 
     // §6.4b envelope-size check: the serialized envelope against the
@@ -2637,7 +2638,8 @@ export class AgentMesh {
       trace: config?.trace ? childSpan(config.trace) : undefined,
       budget: config?.budget,
       payload: reqPayload,
-      meta: config?.meta,
+      // Evidence of acting for a person (§4.16) rides in meta, under the envelope signature.
+      meta: config?.on_behalf_of ? { ...(config.meta ?? {}), on_behalf_of: config.on_behalf_of } : config?.meta,
     });
 
     const bytes = encode(envelope);

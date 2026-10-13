@@ -392,6 +392,11 @@ export interface RequestConfig {
   accepted_output?: string[];
   context_id?: string;
   meta?: Record<string, unknown>;
+  /** Evidence that this request acts for a person (Agent Messaging 0.8,
+   *  §4.16): a token-exchange token, an ID-JAG, a transaction token, a CIBA
+   *  approval or a PACT delegation, with its issuer. Carried in
+   *  `meta.on_behalf_of`; the receiver checks it with `verifyOnBehalfOf`. */
+  on_behalf_of?: import("../on-behalf-of.js").OnBehalfOf;
   /** Override the §8.9 seal decision for this one request.
    *
    *  Left alone, the SDK seals when the recipient's manifest asks it to and a
