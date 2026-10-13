@@ -1,11 +1,11 @@
 name: Release the SDK
 
 # Builds, tests and releases the TypeScript SDK (sdk-typescript/, the npm
-# package `agentmesh`) as a tarball attached to a GitHub release:
+# package `agent-messaging`) as a tarball attached to a GitHub release:
 #
 #   https://github.com/<owner>/agent-messaging-server/releases/tag/sdk-v<version>
-#     agentmesh-<version>.tgz          what `npm install <url>` takes
-#     agentmesh-<version>.tgz.sha256   its SHA-256, in sha256sum's format
+#     agent-messaging-<version>.tgz          what `npm install <url>` takes
+#     agent-messaging-<version>.tgz.sha256   its SHA-256, in sha256sum's format
 #
 # The SDK has its own version (sdk-typescript/package.json), separate from the
 # server's: a server release needs no new SDK, and an SDK release needs no new
@@ -95,7 +95,7 @@ jobs:
         run: |
           npm pack --silent > /tmp/packed.txt
           TGZ=$(tail -n 1 /tmp/packed.txt)
-          [ "$TGZ" = "agentmesh-${{ steps.v.outputs.version }}.tgz" ] || { echo "::error::npm pack made $TGZ"; exit 1; }
+          [ "$TGZ" = "agent-messaging-${{ steps.v.outputs.version }}.tgz" ] || { echo "::error::npm pack made $TGZ"; exit 1; }
           sha256sum "$TGZ" > "$TGZ.sha256"
           cat "$TGZ.sha256"
           echo "tgz=$TGZ" >> "$GITHUB_OUTPUT"
@@ -107,9 +107,9 @@ jobs:
           mkdir -p /tmp/try && cd /tmp/try
           npm init -y >/dev/null
           npm install --no-audit --no-fund "$GITHUB_WORKSPACE/sdk-typescript/${{ steps.pack.outputs.tgz }}"
-          node --input-type=module -e 'const m = await import("agentmesh"); if (typeof m.AgentMesh?.connect !== "function") throw new Error("no AgentMesh.connect"); console.log("esm ok,", Object.keys(m).length, "exports")'
-          node -e 'const m = require("agentmesh"); if (typeof m.MeshNode?.connect !== "function") throw new Error("no MeshNode.connect"); console.log("cjs ok")'
-          test -f node_modules/agentmesh/dist/index.d.ts
+          node --input-type=module -e 'const m = await import("agent-messaging"); if (typeof m.AgentMesh?.connect !== "function") throw new Error("no AgentMesh.connect"); console.log("esm ok,", Object.keys(m).length, "exports")'
+          node -e 'const m = require("agent-messaging"); if (typeof m.MeshNode?.connect !== "function") throw new Error("no MeshNode.connect"); console.log("cjs ok")'
+          test -f node_modules/agent-messaging/dist/index.d.ts
 
       - name: Release
         if: steps.v.outputs.publish == 'true'

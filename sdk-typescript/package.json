@@ -1,7 +1,7 @@
 {
-  "name": "agentmesh",
-  "version": "0.58.2",
-  "description": "TypeScript SDK for the AgentMesh agent-to-agent communication protocol",
+  "name": "agent-messaging",
+  "version": "0.59.0",
+  "description": "TypeScript SDK for Agent Messaging: signed, store-and-forward messaging between agents, over NATS or AMQP",
   "license": "Apache-2.0",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -45,9 +45,11 @@
   },
   "keywords": [
     "agent",
+    "agent-messaging",
     "a2a",
-    "agent-mesh",
     "nats",
+    "amqp",
+    "rabbitmq",
     "multi-agent",
     "agent-to-agent"
   ]

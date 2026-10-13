@@ -39,4 +39,5 @@ include every conformance fixture in `conformance/`. The integration lane
 ## Publishing
 
 Not on npm yet. Each release is a tarball at
-`https://storage.googleapis.com/agentmesh-releases/agentmesh-<version>.tgz`.
+`https://storage.googleapis.com/agentmesh-releases/agent-messaging-<version>.tgz`.
+Releases up to 0.58.2 carry the package's old name, `agentmesh-<version>.tgz`.
