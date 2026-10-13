@@ -1,4 +1,5 @@
-import type { Manifest, DiscoverQuery, Availability, NodeProfile, TrustTier } from "../sdk.js";
+import type { Manifest, DiscoverQuery, Availability, NodeProfile, TrustTier, IdentitySource } from "../sdk.js";
+import { identitySourceMatches } from "./identity-source-view.js";
 
 /** Trust tier ordering for the `trust_tier` minimum-standing filter (§9.7). */
 const TRUST_TIER_RANK: Record<TrustTier, number> = { sandbox: 0, standard: 1, verified: 2 };
@@ -15,6 +16,7 @@ export function applyDiscoveryFilters(
   query: DiscoverQuery,
   statusOf: (m: Manifest) => Availability = () => "online",
   profileOf: (m: Manifest) => NodeProfile | undefined = () => undefined,
+  sourceOf: (m: Manifest) => IdentitySource | undefined = () => undefined,
 ): Manifest[] {
   let results = manifests;
 
@@ -71,6 +73,14 @@ export function applyDiscoveryFilters(
 
   if (query.reachability) {
     results = results.filter((m) => profileOf(m)?.reachability === query.reachability);
+  }
+
+  // identity_source (§9.7): where the agent's identity came from, joined from
+  // the key chain's record. Every member given must match; an agent with no
+  // record is excluded whenever the filter is set.
+  if (query.identity_source) {
+    const want = query.identity_source;
+    results = results.filter((m) => identitySourceMatches(sourceOf(m), want));
   }
 
   return results;

@@ -147,6 +147,11 @@ export interface ConnectOptions {
     /** Where the fresh credential goes. Called before the SDK adopts it, so a
      *  throw here is reported as a renewal failure and retried. */
     onRenewed?: (c: { jwt: string; node_id: string; agents: string[]; expires_at: string | null }) => void | Promise<void>;
+    /** For an agent that enrolled with an outside proof (Agent Messaging 0.8,
+     *  §4.14): a fresh proof of the same identity for each renewal, such as a
+     *  new token from the identity provider. The mesh renews such an agent
+     *  only with one. */
+    proof?: import("../outside-proof.js").OutsideProofSource;
   };
   /** Whether inbound sender text is wrapped in a provenance frame, with the
    *  text fenced so it cannot forge that frame, before any `onRequest`,

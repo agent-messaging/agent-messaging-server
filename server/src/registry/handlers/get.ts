@@ -5,6 +5,7 @@ import { createEnvelope, childSpan, ErrorCode } from "../../sdk.js";
 import { withEndpoints } from "../endpoints.js";
 import { AGENT_KEY_REVOKED, type AgentKeyRevocationLookup } from "../../shared/agent-key-revocations.js";
 import type { AgentStatusLookup } from "../../shared/agent-status.js";
+import { withIdentitySource, type IdentitySourceView } from "../identity-source-view.js";
 
 export async function handleGet(
   env: Envelope,
@@ -15,6 +16,8 @@ export async function handleGet(
   revocations?: AgentKeyRevocationLookup,
   /** The kill switch's per-agent status (shared/agent-status.ts). */
   statuses?: AgentStatusLookup,
+  /** Where each agent's identity came from (§9.7), joined on read. */
+  sources?: IdentitySourceView | null,
 ): Promise<Envelope> {
   // Extract agent_id from subject: mesh.registry.get.{agent_id}
   const parts = msg.subject.split(".");
@@ -88,7 +91,8 @@ export async function handleGet(
   // Stamp `endpoints` on read (§8.2/§14.4): records stored before the field
   // existed lack it in KV, and every manifest the registry serves must carry
   // the resolved subjects.
-  const manifest = withEndpoints(entry.json<Manifest>());
+  // The identity source is the key chain's record (§9.7), never the registration's.
+  const manifest = withIdentitySource(withEndpoints(entry.json<Manifest>()), sources ?? null);
 
   // Private manifests are returned only to the owner. Report "not found" to
   // everyone else so their existence isn't revealed. (Unlisted stays reachable

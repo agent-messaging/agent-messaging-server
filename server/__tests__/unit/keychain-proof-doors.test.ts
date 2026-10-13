@@ -153,6 +153,30 @@ describe("bootstrap with an outside proof", () => {
   });
 });
 
+describe("the SDK's side (sdk-typescript/src/outside-proof.ts)", () => {
+  it("exchangeOutsideProof enrolls with a DPoP-bound token, and the renewer sends a fresh bound proof", async () => {
+    const { exchangeOutsideProof, generateDpopKey } = await import("../../../sdk-typescript/src/outside-proof.js");
+    const { renewNodeCredential } = await import("../../../sdk-typescript/src/credential.js");
+    const r = await rig();
+    // The door's address is https://api.test/; the fake fetch hands each request to the door.
+    const fetchImpl = (async (url: string, init: { body: string; headers?: Record<string, string> }) => {
+      const body = JSON.parse(init.body);
+      const out = url.endsWith("/v1/bootstrap") ? await r.doors.bootstrap(body) : await r.doors.nodeCredential(body, "1.2.3.4", () => ({}));
+      return { ok: out.status < 300, status: out.status, json: async () => out.body };
+    }) as unknown as typeof fetch;
+    const dpop = await generateDpopKey();
+    const bound = () => tok("buyer", { cnf: { jkt: dpop.jkt } });
+    const agent = nkeys.createUser();
+    const res = await exchangeOutsideProof("https://api.test", agent.getPublicKey(), { kind: "oauth", token: await bound(), dpopKey: dpop.privateJwk }, fetchImpl);
+    expect(res.identity_source).toMatchObject({ kind: "oauth", workload_id: "buyer" });
+    // Without the key, the bound token is refused.
+    await expect(exchangeOutsideProof("https://api.test", nkeys.createUser().getPublicKey(), { kind: "oauth", token: await bound() }, fetchImpl))
+      .rejects.toMatchObject({ code: "dpop_required" });
+    const renewed = await renewNodeCredential("https://api.test", res.seed, [{ id: agent.getPublicKey(), seed: agent.getSeed(), proof: async () => ({ kind: "oauth", token: await bound(), dpopKey: dpop.privateJwk }) }], fetchImpl);
+    expect(renewed.agents).toEqual([agent.getPublicKey()]);
+  });
+});
+
 describe("renewal of an agent that enrolled with an outside proof", () => {
   it("needs a fresh proof of the same identity (i09); one for another identity, or none, leaves it off", async () => {
     const r = await rig();

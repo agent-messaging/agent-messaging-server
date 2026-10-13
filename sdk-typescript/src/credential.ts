@@ -32,6 +32,7 @@ import {
   VOUCH_RENEWAL_FRACTION,
 } from "./constants.js";
 import { setUnrefInterval, type TimerHandle } from "./internal/timers.js";
+import { proofMembers, type OutsideProofSource } from "./outside-proof.js";
 
 /** Standard base64 with padding, no Buffer — this module ships to browsers. */
 function toB64(bytes: Uint8Array): string {
@@ -127,6 +128,10 @@ export interface RenewalAgent {
   seed?: string | Uint8Array;
   /** Detached Ed25519 signature over `message`, standard base64. */
   sign?: (message: string) => string;
+  /** For an agent that enrolled with an outside proof (§4.14): a fresh proof
+   *  of the same identity, asked for at each renewal. Without it the mesh
+   *  leaves the agent off the credential. */
+  proof?: OutsideProofSource;
 }
 
 /** A roster, or a function returning the current one. The function form is for
@@ -250,10 +255,19 @@ export async function renewNodeCredential(
   fetchImpl: typeof fetch = fetch,
   timeoutMs: number = CREDENTIAL_REQUEST_TIMEOUT_MS,
 ): Promise<RenewedCredential> {
-  const body = buildCredentialRequest(nodeSeed, roster);
+  const agents = rosterOf(roster);
+  const body: ReturnType<typeof buildCredentialRequest> & { agents: Array<{ id: string; sig: string; proof?: unknown; dpop?: string }> } =
+    buildCredentialRequest(nodeSeed, agents);
+  const url = `${apiBase.replace(/\/$/, "")}/v1/node-credential`;
+  // A fresh outside proof for each agent that enrolled with one (§4.14).
+  for (const a of agents) {
+    if (!a.proof) continue;
+    const entry = body.agents.find((x) => x.id === a.id)!;
+    Object.assign(entry, await proofMembers(await a.proof(), "POST", url));
+  }
   let res: Response;
   try {
-    res = await fetchImpl(`${apiBase.replace(/\/$/, "")}/v1/node-credential`, {
+    res = await fetchImpl(url, {
       signal: AbortSignal.timeout(timeoutMs),
       method: "POST",
       headers: { "content-type": "application/json" },

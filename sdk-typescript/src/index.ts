@@ -911,6 +911,14 @@ export type { OtlpOptions } from "./internal/otlp.js";
 export { runWithTrace, currentTrace } from "./internal/trace-ambient.js";
 
 export { exchangeBootstrapToken } from "./bootstrap.js";
+// Enrolling with an identity the company already gave the agent (§4.14).
+export {
+  exchangeOutsideProof,
+  createDpopProof,
+  generateDpopKey,
+  ProofRefusedError,
+} from "./outside-proof.js";
+export type { OutsideProof, OutsideProofSource, OutsideProofResult } from "./outside-proof.js";
 export type { BootstrapResult } from "./bootstrap.js";
 export { bindingOfUrl, connectTransport, transportFromMesh } from "./transport.js";
 export type { Binding, MeshObject } from "./transport.js";

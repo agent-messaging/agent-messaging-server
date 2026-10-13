@@ -967,7 +967,7 @@ export class AgentMesh {
         apiBase: cr.apiBase,
         jwt: opts.jwt,
         nodeSeed: credSeed,
-        agents: [{ id: agentId, seed: kp.getSeed() }],
+        agents: [{ id: agentId, seed: kp.getSeed(), ...(cr.proof ? { proof: cr.proof } : {}) }],
         onRenewed: cr.onRenewed,
         onWarning: (w) => mesh.onSecurityWarning?.(w as SecurityWarning),
       });
@@ -3982,10 +3982,18 @@ export class AgentMesh {
       }
       agentId = r.agentId;
     }
-    const res = await this.requestWith(agentId, "describe", {}, { timeout_ms: opts.timeout_ms ?? 15_000 }, { preAdmission: true });
+    // Where the agent's identity came from (§9.7 identity_source) is the
+    // mesh's attested record, read from the registry beside the agent's own
+    // answer. Whatever the agent says about it is dropped: an agent does not
+    // get to describe its own provenance.
+    const [res, registered] = await Promise.all([
+      this.requestWith(agentId, "describe", {}, { timeout_ms: opts.timeout_ms ?? 15_000 }, { preAdmission: true }),
+      this.getManifest(agentId).catch(() => null),
+    ]);
     const out = (res.payload as { output?: unknown } | undefined)?.output ?? res.payload;
     if (!out || typeof out !== "object") throw new MeshError(ErrorCode.INVALID_ENVELOPE, `${target} answered describe with no document.`, { retryable: false });
-    return out as DescribeDocument;
+    const { identity_source: _claimed, ...doc } = out as DescribeDocument;
+    return (registered?.identity_source ? { ...doc, identity_source: registered.identity_source } : doc) as DescribeDocument;
   }
 
   // ── the mesh's own requests (platform-services/*.json, "part": "mesh") ──

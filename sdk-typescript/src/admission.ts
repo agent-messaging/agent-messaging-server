@@ -186,6 +186,9 @@ export interface DescribeDocument {
   described?: false;
   visibility?: string;
   reason?: string;
+  /** Where the agent's identity came from (§9.7): the mesh's attested
+   *  record, read from the registry, never the agent's own word. */
+  identity_source?: import("./types/manifest.js").IdentitySource;
   [extra: string]: unknown;
 }
 

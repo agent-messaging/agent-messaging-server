@@ -5,6 +5,7 @@ import { withEndpoints } from "../endpoints.js";
 import type { PresenceStore } from "../presence-store.js";
 import type { NodeProfileStore } from "../node-profile-store.js";
 import { unlistedKeys } from "../unlisted.js";
+import { withIdentitySource, type IdentitySourceView } from "../identity-source-view.js";
 
 export async function handleDiscover(
   env: Envelope,
@@ -12,6 +13,8 @@ export async function handleDiscover(
   cache: Map<string, Manifest>,
   presence: PresenceStore,
   profiles: NodeProfileStore,
+  /** Where each agent's identity came from (§9.7), joined at query time. */
+  sources: IdentitySourceView | null = null,
 ): Promise<Envelope> {
   const query = (env.payload as DiscoverQuery) ?? {};
   // §8.5 deprecation window: pre-rename SDKs filter by `skill_id`.
@@ -70,6 +73,7 @@ export async function handleDiscover(
     query,
     (m) => presence.status(m.node?.id ?? ""),
     (m) => profiles.get(m.node?.id ?? ""),
+    (m) => sources?.get(m.id),
   );
   const limit = query.limit ?? filtered.length;
   // Join presence at query time (§9.3): liveness is not stored in the manifest
@@ -78,7 +82,7 @@ export async function handleDiscover(
   // existed lack it in KV, and every discovery record must carry the resolved
   // subjects so no caller falls back to constructing them.
   const results = filtered.slice(0, limit).map((m) => ({
-    ...withEndpoints(m),
+    ...withIdentitySource(withEndpoints(m), sources),
     availability: presence.status(m.node?.id ?? ""),
   }));
 
