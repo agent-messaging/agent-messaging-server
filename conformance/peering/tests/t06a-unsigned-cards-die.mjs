@@ -17,7 +17,7 @@ import { serve, runResolver } from "../lib/resolver.mjs";
 const HANDLE = "Fake.someone@example.com";
 
 const RESOLVER_SRC = process.env.RESOLVER_MJS ??
-  join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "conformance", "reference-adapter", "mesh-adapter.mjs");
+  join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "mesh-adapter", "mesh-adapter.mjs");
 
 const unsignedCard = () => JSON.stringify({
   ok: true,

@@ -424,17 +424,35 @@ export async function run(argv, { env = process.env, fetch: fetchImpl = globalTh
 
 let isMain = false;
 try { isMain = !!process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href; } catch { isMain = false; }
+/**
+ * End with `code` once everything written has left. `process.exit()` right
+ * after a write drops what a pipe has not taken yet: stdout to a pipe is
+ * asynchronous, and a large `--json` answer (agents list on a big mesh) was
+ * cut at 64 KB. An empty write's callback runs after every write before it
+ * has been handed to the pipe, so the exit waits for those.
+ */
+function finish(code) {
+  process.exitCode = code;
+  let open = 2;
+  const done = () => {
+    if (--open === 0) process.exit(code);
+  };
+  process.stdout.write("", done);
+  process.stderr.write("", done);
+}
+
 if (isMain) {
   run(process.argv.slice(2)).then(
-    (code) => process.exit(code ?? 0),
+    (code) => finish(code ?? 0),
     (err) => {
       if (err instanceof UsageError) {
         console.error(err.message);
-        process.exit(2);
+        finish(2);
+        return;
       }
       console.error(err.message);
       if (err.body && process.argv.includes("--json")) console.error(JSON.stringify(err.body, null, 2));
-      process.exit(1);
+      finish(1);
     },
   );
 }

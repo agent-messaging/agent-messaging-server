@@ -10,7 +10,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 const ADAPTER = process.env.RESOLVER_MJS ??
-  join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "conformance", "reference-adapter", "mesh-adapter.mjs");
+  join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "mesh-adapter", "mesh-adapter.mjs");
 
 export function serve(handler) {
   return new Promise((resolve) => {

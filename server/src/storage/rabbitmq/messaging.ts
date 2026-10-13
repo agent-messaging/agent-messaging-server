@@ -29,7 +29,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { MESSAGING } from "../marks.js";
 import type { BusMessage, BusSubscription, Messaging, PublishOptions, RequestOptions, SubscribeOptions } from "../types.js";
 import type { AmqpLink } from "./link.js";
-import { bindingKey, DIRECT_REPLY, joinReply, LIVE_EXPIRATION, MESH_EXCHANGE, splitReply, subjectMatches } from "./subjects.js";
+import { bindingKey, cameOnSubject, DIRECT_REPLY, joinReply, LIVE_EXPIRATION, MESH_EXCHANGE, splitReply, subjectMatches } from "./subjects.js";
 import { createHash } from "node:crypto";
 
 /** The errors a request ends with, in the shapes the NATS client used (a
@@ -294,7 +294,7 @@ export class RabbitSubscription implements BusSubscription {
       (m) => {
         if (!m) return;
         // Only what came on a subject this subscription asked for (subjects.ts).
-        if (!subjectMatches(this.subject, m.fields.routingKey)) return;
+        if (!cameOnSubject(m) || !subjectMatches(this.subject, m.fields.routingKey)) return;
         this.inbox.push(this.bus.message(m.fields.routingKey, m.content, m.properties.replyTo, m.properties.correlationId));
       },
       { noAck: true },

@@ -1,0 +1,6 @@
+{
+  "about": "The reference adapter the conformance suite's adapter tests (c12, c13, c15) and its own echo agent run: a released tarball, pinned by URL and checked by its SHA-256. node tools/conformance.mjs install fetches it, checks it and installs it under .state/reference-adapter, with this repository's SDK in place of the SDK it was released with.",
+  "version": "0.99.2",
+  "url": "https://storage.googleapis.com/agentmesh-releases/mesh-adapter-0.99.2.tgz",
+  "sha256": "2e4e578cbdb49055c539f0ef36f18f5e82ce8da8e0b06dc61b8261a683516d52"
+}

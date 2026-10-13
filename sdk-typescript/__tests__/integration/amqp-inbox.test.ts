@@ -175,4 +175,58 @@ live("an agent's inbox on the RabbitMQ binding (live broker)", () => {
     expect(r.counts.get(`mesh.agent.${id}.inbox`)).toBe(1);
     await caller.close();
   }, 30_000);
+
+  it("never hands the agent a message put straight into one of its queues by name", async () => {
+    // Any connection may publish into a queue by its name through the default
+    // exchange. Such a message never came on a subject, so the mailbox, the
+    // durable event subscription and the durable feed subscription each take
+    // it off the queue and drop it (binding document §2.1).
+    const kp = nkeys.createUser();
+    const id = kp.getPublicKey();
+    const mailbox = await makeMailbox(id);
+    const r = await receiver(kp);
+    await until("the mailbox consumer", async () => (await admin.checkQueue(mailbox)).consumerCount === 1);
+
+    const senderKp = nkeys.createUser();
+    const sender = AgentMesh.withConnection(await dial(), senderKp, undefined, { refuseRevokedSenders: false });
+    open.push(sender);
+
+    const events: unknown[] = [];
+    const feeds: unknown[] = [];
+    const ev = await r.agent.subscribe("offsubject.>", (p) => { events.push(p.data); }, { durable: "offsubject" });
+    const fd = await r.agent.subscribeFeed(senderKp.getPublicKey(), "news", (p) => { feeds.push((p as unknown as { data: unknown }).data); }, { durable: true });
+
+    // Signed by a real sender, so the only thing wrong with each is how it came.
+    const signed = (type: "request" | "emit", payload: Record<string, unknown>, to?: string) => {
+      const env = createEnvelope({ type, from: senderKp.getPublicKey(), ...(to ? { to } : {}), payload });
+      signEnvelope(env, senderKp);
+      return Buffer.from(encode(env));
+    };
+    const smuggled = {
+      [mailbox]: signed("request", { offering: "echo", input: { smuggled: true } }, id),
+      [ev.durable]: signed("emit", { domain: "offsubject", event_type: "thing", data: { smuggled: true } }),
+      [fd.durable]: signed("emit", { topic: "news", kind: "stream", data: { smuggled: true } }),
+    };
+    const sendToQueue = admin.sendToQueue as unknown as (q: string, b: Buffer) => boolean;
+    for (const [queue, body] of Object.entries(smuggled)) sendToQueue.call(admin, queue, body);
+
+    // And the same three sent properly, on their subjects.
+    const answered = await sender.request(id, "echo", { proper: true }, { timeout: 10_000 });
+    expect(answered.payload.output).toEqual({ proper: true });
+    sender.emit("offsubject.thing", { proper: true });
+    sender.publishFeed("news", { proper: true }, { kind: "stream" });
+
+    await until("the proper event and feed message", () => events.length === 1 && feeds.length === 1);
+    await sleep(2000); // long enough for a smuggled copy, were it handed on, to arrive
+    expect(r.handled).toEqual([{ proper: true }]);
+    expect(events).toEqual([{ proper: true }]);
+    expect(feeds).toEqual([{ proper: true }]);
+    for (const queue of Object.keys(smuggled)) {
+      expect((await admin.checkQueue(queue)).messageCount, queue).toBe(0); // taken off, not left to loop
+    }
+    await ev.stop();
+    await fd.stop();
+    await admin.deleteQueue(ev.durable);
+    await admin.deleteQueue(fd.durable);
+  }, 60_000);
 });

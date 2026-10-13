@@ -7,7 +7,7 @@
 import { describe, expect, it } from "vitest";
 import { jwtAuthenticator, nkeyAuthenticator, nkeys } from "nats.ws";
 import { bindingOfUrl, transportFromMesh } from "../../src/transport.js";
-import { amqpLogin, bindingKey, subjectMatches } from "../../src/internal/amqp-connection.js";
+import { amqpLogin, bindingKey, cameOnSubject, subjectMatches } from "../../src/internal/amqp-connection.js";
 
 const te = new TextEncoder();
 
@@ -77,5 +77,14 @@ describe("the AMQP transport", () => {
   it("presents a key alone when there is no credential, for the broker to refuse", () => {
     const kp = nkeys.createUser();
     expect(amqpLogin(nkeyAuthenticator(kp.getSeed()) as never)).toEqual({ user: kp.getPublicKey(), password: "no-credential" });
+  });
+});
+
+describe("a delivery that came on a subject (AMQP)", () => {
+  it("is one routed by the mesh exchange; one put into a queue by its name is not", () => {
+    expect(cameOnSubject({ fields: { exchange: "mesh" } })).toBe(true);
+    expect(cameOnSubject({ fields: { exchange: "" } })).toBe(false);
+    expect(cameOnSubject({ fields: { exchange: "amq.direct" } })).toBe(false);
+    expect(cameOnSubject(undefined)).toBe(false);
   });
 });

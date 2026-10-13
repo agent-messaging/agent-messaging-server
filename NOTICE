@@ -20,6 +20,3 @@ This repository also contains:
 - conformance/SPEC.md, the Agent Messaging specification, as published at
   https://agentmessaging.ai, and the conformance suite's core profile, from
   https://github.com/jeffrschneider/agent-messaging.
-- conformance/reference-adapter/, a copy of the reference adapter's runtime
-  files, which the conformance suite's adapter tests run. It is licensed under
-  the MIT License, as its package.json says.

@@ -45,7 +45,7 @@ import type { JobManifest } from "../../src/job-manifest.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURE_PATH = join(here, "..", "..", "..", "conformance", "job-manifest.json");
-const ADAPTER_PATH = join(here, "..", "..", "..", "conformance", "reference-adapter", "mesh-adapter.mjs");
+const ADAPTER_PATH = join(here, "..", "..", "..", "mesh-adapter", "mesh-adapter.mjs");
 
 const fixture = JSON.parse(readFileSync(FIXTURE_PATH, "utf8")) as {
   job_manifest: { signed: JobManifest };

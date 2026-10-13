@@ -51,9 +51,14 @@ AMQP's `#` alone matches zero or more words, so `mesh.event.#` would also match 
 `mesh.event` itself, which `mesh.event.>` does not. Writing `>` as `*.#` (one word, then any number) keeps §14.2's
 meaning exactly.
 
-A client checks every delivery's routing key against the pattern it subscribed with before handing it on. A message
-that reached a queue some other way (published straight to a queue through the default exchange) is dropped there,
-so it can never arrive as though it came on a subject.
+Only a message published to the `mesh` exchange came on a subject. Any connection may also publish straight into a
+queue by its name through the default exchange, and the broker cannot refuse that alone: the default exchange
+carries the answers to direct reply-to (§2.3), and RabbitMQ checks routing keys only on topic exchanges. So every
+consumer of a queue bound to `mesh` (a live subscription, a queue group, an agent's mailbox, a durable subscription,
+the server's capture queue) checks each delivery before handing it on: it must have come through the `mesh` exchange
+(the delivery's `exchange` field), and its routing key must match the pattern subscribed to. Anything else is dropped
+(acknowledged and not handed on, where the queue takes acknowledgments), so it can never arrive as though it came on
+a subject, or be kept in a stream.
 
 ### 2.2 Live delivery and queue groups
 
@@ -188,9 +193,9 @@ Once the node consumes the mailbox queue, the queue is the agent's inbox, and th
 the inbox subject beside it: each message is delivered once. A delivery carries the request's `reply_to` and
 `correlation_id`, so the two reply-address exceptions of §18.7 (the probe, a guarded delivery's relay) are answered on
 the reply address from the mailbox delivery. Until the registry has made the mailbox, and for a sandbox agent, which
-has none, the node subscribes live (§2.2) instead. The node checks that each delivery's routing key is the agent's
-inbox subject (or its guarded subject) and drops anything else, such as a message put into the queue by its name
-through the default exchange.
+has none, the node subscribes live (§2.2) instead. The node checks that each delivery came through the `mesh` exchange
+and that its routing key is the agent's inbox subject (or its guarded subject), and drops anything else, such as a
+message put into the queue by its name through the default exchange (§2.1).
 
 The node acknowledges a delivery when its dispatch finishes, and works on up to its prefetch limit at once. A
 delivery that was in the queue when the node attached, that is redelivered, or that was sent more than a minute
@@ -211,6 +216,7 @@ A durable event subscription is a **durable queue named as the reference binding
 is one durable queue per agent, `mesh_feed_<agent_id>`, bound to every feed it follows. Acknowledgment, redelivery
 and resume are as in §6.1: the queue keeps what is published while the agent is away, from when it was first made.
 There is no replay of what was published before the queue existed (the reference binding's `DeliverPolicy.All`).
+A delivery that did not come through the `mesh` exchange is dropped, as in §2.1.
 
 ### 6.3 Streams the server keeps (§18.3)
 

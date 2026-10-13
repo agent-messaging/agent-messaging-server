@@ -7,6 +7,7 @@
 import { describe, expect, it } from "vitest";
 import {
   bindingKey,
+  cameOnSubject,
   joinReply,
   patternCovers,
   patternOfBindingKey,
@@ -84,5 +85,15 @@ describe("RabbitMQ subjects", () => {
     );
     expect(url).toBe("amqp://mesh-core:p%40ss%20word@rabbit:5672/mesh");
     expect(() => amqpUrlFromEnv({})).toThrow(/MESH_AMQP_URL/);
+  });
+});
+
+describe("a delivery that came on a subject", () => {
+  it("is one routed by the mesh exchange; one put into a queue by its name through the default exchange is not", () => {
+    expect(cameOnSubject({ fields: { exchange: "mesh" } })).toBe(true);
+    expect(cameOnSubject({ fields: { exchange: "" } })).toBe(false);
+    expect(cameOnSubject({ fields: { exchange: "amq.topic" } })).toBe(false);
+    expect(cameOnSubject({ fields: {} })).toBe(false);
+    expect(cameOnSubject(null)).toBe(false);
   });
 });

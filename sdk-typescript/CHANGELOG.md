@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased (the next release, 0.58.0)
+## 0.58.0 (2026-10-12)
+
+- On an AMQP mesh, only what came on a subject reaches an agent. RabbitMQ
+  lets any connection publish into a queue by its name through the default
+  exchange; such a message never came on a subject. Every consumer the
+  transport holds (live subscriptions, the mailbox, durable event and feed
+  subscriptions) now drops a delivery that did not come through the mesh's
+  `mesh` exchange, and takes it off a durable queue rather than leaving it
+  there (`cameOnSubject`). Nothing changes on a NATS mesh.
 
 - The first connection, tried again. `connectRetry` on `ConnectOptions` (and
   so on `MeshNode.connect`'s `transport`) tries the first connection to a

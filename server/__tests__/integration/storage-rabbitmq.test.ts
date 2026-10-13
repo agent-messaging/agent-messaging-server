@@ -21,7 +21,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { pgSql, type Sql } from "../../src/storage/postgres/sql.js";
 import { CapturePump } from "../../src/storage/rabbitmq/capture.js";
 import { AmqpLink } from "../../src/storage/rabbitmq/link.js";
-import { RabbitMqMessaging } from "../../src/storage/rabbitmq/messaging.js";
+import { groupQueueName, RabbitMqMessaging } from "../../src/storage/rabbitmq/messaging.js";
 import { RabbitMqStorage } from "../../src/storage/rabbitmq/storage.js";
 import type { BusMessage, BusSubscription } from "../../src/storage/types.js";
 import { InboxBuffer } from "../../src/registry/inbox-buffer.js";
@@ -103,6 +103,22 @@ live("RabbitMQ binding (live broker and database)", () => {
     expect(gb.length).toBeGreaterThan(0);
     a.unsubscribe();
     b.unsubscribe();
+  });
+
+  it("never delivers a message put straight into a subscription's queue by name", async () => {
+    // A queue group's queue has a name anyone can work out. Bound to `>`, its
+    // routing key alone would pass the subject check, so the exchange is what
+    // tells a message sent on a subject from one put into the queue directly.
+    const group = `direct${run}`;
+    const sub = bus.subscribe(">", { queue: group });
+    await bus.flush();
+    const queue = groupQueueName(group, ">");
+    admin.sendToQueue(queue, Buffer.from("smuggled"));
+    bus.publish(`d${run}.proper`, te.encode("proper"));
+    const got = await collect(sub, 1500);
+    const mine = got.filter((m) => m.subject === `d${run}.proper` || td.decode(m.data) === "smuggled");
+    expect(mine.map((m) => td.decode(m.data))).toEqual(["proper"]);
+    sub.unsubscribe();
   });
 
   it("answers a request, says at once when nobody listens, and times out", async () => {

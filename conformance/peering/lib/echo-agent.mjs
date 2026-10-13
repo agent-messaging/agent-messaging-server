@@ -22,7 +22,7 @@ import { resolveAgentId } from "./env.mjs";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const AGENT_KEY = /^U[A-Z2-7]{55}$/;
 const ADAPTER = process.env.RESOLVER_MJS ??
-  join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "conformance", "reference-adapter", "mesh-adapter.mjs");
+  join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "mesh-adapter", "mesh-adapter.mjs");
 
 /**
  * The agent to send to, as { agentId, own, stop }. `own` says whether the

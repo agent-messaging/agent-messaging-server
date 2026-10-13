@@ -45,6 +45,20 @@ export function bindingKey(pattern: string): string {
     .join(".");
 }
 
+/**
+ * Whether a delivery came on a subject: published to the mesh's topic
+ * exchange, which is the only place a routing key is a subject and the broker
+ * checks the sender's publish permission on it. RabbitMQ also lets any
+ * connection publish into a queue by its name through the default exchange
+ * (the binding needs that exchange for direct reply-to answers, and RabbitMQ
+ * checks routing keys only on topic exchanges, so the broker cannot refuse
+ * one and allow the other). Such a message never came on a subject, so every
+ * consumer of a queue bound to `mesh` drops it (binding document §2.1).
+ */
+export function cameOnSubject(m: { fields?: { exchange?: unknown } } | null | undefined): boolean {
+  return m?.fields?.exchange === MESH_EXCHANGE;
+}
+
 /** Whether `subject` matches `pattern` (SPEC §14.2). */
 export function subjectMatches(pattern: string, subject: string): boolean {
   const p = pattern.split(".");
@@ -496,7 +510,7 @@ export class AmqpConnection {
       q,
       (m: AmqpMessage) => {
         if (!m || s.closed) return;
-        if (!subjectMatches(s.subject, m.fields.routingKey)) return;
+        if (!cameOnSubject(m) || !subjectMatches(s.subject, m.fields.routingKey)) return;
         const msg = this.msg(m.fields.routingKey, m.content, m.properties?.replyTo, m.properties?.correlationId);
         msg.sid = ++this.sidSeq;
         if (s.handler) {
@@ -625,6 +639,16 @@ export class AmqpConnection {
         let settled = false;
         const early = backlog > 0;
         if (early) backlog--;
+        // Put into the queue by its name, not sent on a subject: taken off
+        // the queue and never handed on (cameOnSubject).
+        if (!cameOnSubject(m)) {
+          try {
+            c.ack(m);
+          } catch {
+            /* the channel went; it comes again and is dropped then */
+          }
+          return;
+        }
         const replyTo = m.properties?.replyTo as string | undefined;
         const correlationId = m.properties?.correlationId as string | undefined;
         const reply = replyTo ? (correlationId ? `${replyTo}#${correlationId}` : replyTo) : undefined;

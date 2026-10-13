@@ -14,7 +14,7 @@ https://github.com/jeffrschneider/agent-messaging.
 | `core/expectations.json`, `peering/expectations.json` | What each test does on a NATS mesh. `--ci` fails on a regression against them. |
 | `*/expectations.amqp.json` | The same, on a RabbitMQ mesh. |
 | `*.json` (this folder) | Test vectors the SDK's tests read: canonical JSON, signatures, delegation and the rest. |
-| `reference-adapter/` | The reference adapter, which the adapter tests (c12, c13, c15) and the suite's own echo agent run. |
+| `reference-adapter.json` | The released reference adapter the adapter tests (c12, c13, c15) and the suite's own echo agent run, pinned by URL and SHA-256. `tools/conformance.mjs install` installs it, and the runner finds it through `RESOLVER_MJS`. |
 
 ## Running it
 
@@ -39,6 +39,7 @@ SDK under test. Against any other server, set what `run.mjs` reads yourself:
 | `STOREFRONT_BASE` | The server's HTTP address (the credential doors). |
 | `MESH_ADMIN_URL`, `MESH_ADMIN_TOKEN_FILE` | The admin API, with which the adapter tests enroll the adapter's fresh key on a mesh that offers no naming. |
 | `AGENTMESH_SDK` | A built SDK folder to test instead of the published one. |
+| `RESOLVER_MJS` | The reference adapter's `mesh-adapter.mjs`, for the adapter tests and the echo agent. |
 
 The runner prints the specification version, the profile and the binding it
 tested.

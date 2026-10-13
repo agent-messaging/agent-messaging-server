@@ -20,7 +20,7 @@ import type { Channel, ConsumeMessage } from "amqplib";
 import type { Sql } from "../postgres/sql.js";
 import { notices } from "../postgres/notices.js";
 import type { AmqpLink } from "./link.js";
-import { bindingKey, LIVE_EXPIRATION, MESH_EXCHANGE, subjectMatches } from "./subjects.js";
+import { bindingKey, cameOnSubject, LIVE_EXPIRATION, MESH_EXCHANGE, subjectMatches } from "./subjects.js";
 
 export const CAPTURE_QUEUE = "ams.capture";
 
@@ -129,6 +129,12 @@ export class CapturePump {
   private write(ch: Channel, m: ConsumeMessage): Promise<void> {
     this.queue = this.queue.then(async () => {
       const subject = m.fields.routingKey;
+      // Put into the capture queue by its name, not sent on a subject: no
+      // stream keeps it (subjects.ts, cameOnSubject).
+      if (!cameOnSubject(m)) {
+        ch.ack(m);
+        return;
+      }
       // A live request (the registry's probe) is for a receiver listening
       // now and is kept nowhere, the record of a mailbox included.
       if (m.properties.expiration === LIVE_EXPIRATION) {

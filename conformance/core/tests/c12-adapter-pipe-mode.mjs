@@ -25,7 +25,7 @@ const te = new TextEncoder();
 const td = new TextDecoder();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const ADAPTER = process.env.RESOLVER_MJS ??
-  join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "conformance", "reference-adapter", "mesh-adapter.mjs");
+  join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "mesh-adapter", "mesh-adapter.mjs");
 
 export default {
   id: "c12",

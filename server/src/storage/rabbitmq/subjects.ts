@@ -11,14 +11,29 @@
  *        message published on `mesh.event` itself, which `mesh.event.>` does
  *        not. `*` then `#` is one word and then any number: exactly `>`.
  *
- * Every delivery is checked against the subscription's pattern before it is
- * handed on (`subjectMatches`), so a message that reached a queue some other
- * way (published straight to the queue through the default exchange) never
- * reaches a subscriber as though it came on a subject.
+ * Every delivery is checked before it is handed on: it must have come through
+ * the mesh's exchange (`cameOnSubject`) and match the subscription's pattern
+ * (`subjectMatches`), so a message that reached a queue some other way
+ * (published straight to the queue through the default exchange) never
+ * reaches a subscriber, or a stream, as though it came on a subject.
  */
 
 /** The topic exchange every subject is published on. */
 export const MESH_EXCHANGE = "mesh";
+
+/**
+ * Whether a delivery came on a subject: published to the mesh's topic
+ * exchange, the only place a routing key is a subject and the broker checks
+ * the sender's publish permission on it. Any connection may also publish into
+ * a queue by its name through the default exchange. The binding cannot refuse
+ * that at the broker: it needs the default exchange for direct reply-to
+ * answers, and RabbitMQ checks routing keys only on topic exchanges. So every
+ * consumer of a queue bound to `mesh` drops a delivery that did not come
+ * through it (binding document §2.1).
+ */
+export function cameOnSubject(m: { fields?: { exchange?: unknown } } | null | undefined): boolean {
+  return m?.fields?.exchange === MESH_EXCHANGE;
+}
 
 /** A subscription pattern as an AMQP binding key. */
 export function bindingKey(pattern: string): string {

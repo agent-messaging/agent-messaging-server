@@ -19,7 +19,8 @@
 // AMQP_PORT), with the same defaults.
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,22 +34,42 @@ function run(cmd, args, opts = {}) {
   if (r.status !== 0) throw new Error(`${cmd} ${args.join(" ")} exited ${r.status ?? r.error}`);
 }
 
-/** node_modules/agentmesh in the reference adapter is this repository's SDK. */
-function linkSdk() {
-  const link = join(ROOT, "conformance", "reference-adapter", "node_modules", "agentmesh");
-  if (existsSync(link) || (() => { try { lstatSync(link); return true; } catch { return false; } })()) rmSync(link, { recursive: true, force: true });
-  mkdirSync(dirname(link), { recursive: true });
+/** Where the reference adapter is installed, and its entry point. */
+const ADAPTER_HOME = join(ROOT, ".state", "reference-adapter");
+const ADAPTER_MJS = join(ADAPTER_HOME, "node_modules", "mesh-adapter", "mesh-adapter.mjs");
+
+/** The released reference adapter (conformance/reference-adapter.json), checked
+ *  by its SHA-256, installed with this repository's SDK as its `agentmesh`. */
+async function installAdapter() {
+  const pin = JSON.parse(readFileSync(join(ROOT, "conformance", "reference-adapter.json"), "utf8"));
+  const res = await fetch(pin.url);
+  if (!res.ok) throw new Error(`could not fetch the reference adapter ${pin.url}: HTTP ${res.status}`);
+  const bytes = Buffer.from(await res.arrayBuffer());
+  const got = createHash("sha256").update(bytes).digest("hex");
+  if (got !== pin.sha256) throw new Error(`the reference adapter ${pin.url} is not the pinned one (sha256 ${got}, want ${pin.sha256})`);
+  rmSync(ADAPTER_HOME, { recursive: true, force: true });
+  mkdirSync(ADAPTER_HOME, { recursive: true });
+  const tgz = join(ADAPTER_HOME, `mesh-adapter-${pin.version}.tgz`);
+  writeFileSync(tgz, bytes);
+  writeFileSync(join(ADAPTER_HOME, "package.json"), JSON.stringify({ name: "reference-adapter-install", private: true }));
+  run(npm, ["install", "--no-audit", "--no-fund", tgz], { cwd: ADAPTER_HOME });
+  // The SDK under test is this repository's, for the adapter too.
+  const link = join(ADAPTER_HOME, "node_modules", "agentmesh");
+  let isLink = false;
+  try { isLink = lstatSync(link).isSymbolicLink(); } catch { /* not there */ }
+  if (isLink) unlinkSync(link);
+  else rmSync(link, { recursive: true, force: true });
   symlinkSync(join(ROOT, "sdk-typescript"), link, process.platform === "win32" ? "junction" : "dir");
+  return pin.version;
 }
 
 if (what === "install") {
   run(npm, ["install", "--no-audit", "--no-fund"], { cwd: join(ROOT, "conformance", "peering") });
-  run(npm, ["ci", "--no-audit", "--no-fund"], { cwd: join(ROOT, "conformance", "reference-adapter") });
-  linkSdk();
+  const version = await installAdapter();
   if (!existsSync(join(ROOT, "sdk-typescript", "dist", "index.js"))) {
     console.log("The SDK has no build yet: run npm ci and npm run build in sdk-typescript.");
   }
-  console.log("The conformance suite and the reference adapter are installed; the adapter runs this repository's SDK.");
+  console.log(`The conformance suite and the reference adapter ${version} are installed; the adapter runs this repository's SDK.`);
   process.exit(0);
 }
 
@@ -100,6 +121,7 @@ const r = spawnSync(process.execPath, [join(ROOT, "conformance", "run.mjs"), ...
     MESH_IDENTITY_FILE: identityFile,
     STOREFRONT_BASE: adminUrl,
     AGENTMESH_SDK: join(ROOT, "sdk-typescript"),
+    RESOLVER_MJS: ADAPTER_MJS,
   },
 });
 process.exit(r.status ?? 1);
