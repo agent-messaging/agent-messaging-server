@@ -1,0 +1,53 @@
+{
+  "about": "Server files that reach the broker outside the storage layer (tools/check-boundary.mjs, rule 2), each with why. The list only shrinks.",
+  "entries": [
+    {
+      "file": "server/src/keychain/live-revoke.ts",
+      "rule": "nats-import",
+      "what": "connect from \"nats\"",
+      "reason": "The key chain's broker administration: a connection to the NATS system account that pushes revoked users live. It is the NATS binding's own credential machinery, behind the BrokerAdmin interface the admin API and the kill switch use; the RabbitMQ binding has its management API behind the same interface."
+    },
+    {
+      "file": "server/src/keychain/live-revoke.ts",
+      "rule": "nats-import",
+      "what": "credsAuthenticator from \"nats\"",
+      "reason": "The system account connection's credentials, part of the NATS binding's broker administration (BrokerAdmin); see the entry above."
+    },
+    {
+      "file": "server/src/keychain/live-revoke.ts",
+      "rule": "nats-import",
+      "what": "NatsConnection from \"nats\"",
+      "reason": "The type of the system account connection, part of the NATS binding's broker administration (BrokerAdmin); see the first entry."
+    },
+    {
+      "file": "server/tools/migrate-events-stream.mjs",
+      "rule": "nats-import",
+      "what": "connect from \"nats\"",
+      "reason": "The NATS binding's one migration off the pre-MESH_EVENTS stream layout, which the core's refusal log names (storage/jetstream/events-stream.ts EVENTS_MIGRATION_TOOL). It reworks JetStream streams by hand, so it is the binding's own machinery, like the key chain's broker administration."
+    },
+    {
+      "file": "server/tools/migrate-events-stream.mjs",
+      "rule": "nats-import",
+      "what": "credsAuthenticator from \"nats\"",
+      "reason": "The migration's credentials; see the entry above."
+    },
+    {
+      "file": "server/tools/migrate-events-stream.mjs",
+      "rule": "call",
+      "what": ".jetstreamManager(",
+      "reason": "The migration's stream manager; see the first entry for this file."
+    },
+    {
+      "file": "server/src/shared/events-stream.ts",
+      "rule": "layer-inside",
+      "what": "server/src/storage/jetstream/events-stream.ts",
+      "reason": "Re-exports MESH_EVENTS's JetStream settings for the migration tool (server/tools/migrate-events-stream.mjs) and the tests; server code reaches the stream through the layer and takes only the stream's name from here."
+    },
+    {
+      "file": "server/src/shared/feed-stream.ts",
+      "rule": "layer-inside",
+      "what": "server/src/storage/jetstream/feed-stream.ts",
+      "reason": "Re-exports MESH_FEED's JetStream settings for the tests; server code reaches the stream through the layer and takes only the stream's name and subject from here."
+    }
+  ]
+}

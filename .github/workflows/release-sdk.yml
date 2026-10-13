@@ -1,0 +1,140 @@
+name: Release the SDK
+
+# Builds, tests and releases the TypeScript SDK (sdk-typescript/, the npm
+# package `agentmesh`) as a tarball attached to a GitHub release:
+#
+#   https://github.com/<owner>/agent-messaging-server/releases/tag/sdk-v<version>
+#     agentmesh-<version>.tgz          what `npm install <url>` takes
+#     agentmesh-<version>.tgz.sha256   its SHA-256, in sha256sum's format
+#
+# The SDK has its own version (sdk-typescript/package.json), separate from the
+# server's: a server release needs no new SDK, and an SDK release needs no new
+# server. docs/releasing.md says when each is cut.
+#
+# A released version is never replaced: the job stops if the release or its
+# tarball is already there. To release again, raise the version in
+# sdk-typescript/package.json.
+#
+# When it runs:
+#   - a tag `sdk-v<version>`: test, build, pack, release. The tag must name the
+#     version in sdk-typescript/package.json.
+#   - by hand (workflow_dispatch) with that same version: the same, and the
+#     workflow makes the tag on the commit it ran on.
+#   - a pull request that changes this file: test, build and pack only.
+on:
+  push:
+    tags: ["sdk-v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the leading v. Must equal sdk-typescript/package.json."
+        required: true
+  pull_request:
+    paths:
+      - ".github/workflows/release-sdk.yml"
+
+concurrency:
+  group: release-sdk-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  sdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: sdk-typescript
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Work out the version
+        id: v
+        run: |
+          FILE=$(node -p "require('./package.json').version")
+          case "${{ github.event_name }}" in
+            workflow_dispatch) ASKED="${{ github.event.inputs.version }}" ;;
+            push) ASKED="${GITHUB_REF_NAME#sdk-v}" ;;
+            *) ASKED="$FILE" ;;
+          esac
+          case "$ASKED" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::version '$ASKED' is not X.Y.Z"; exit 1 ;;
+          esac
+          if [ "$ASKED" != "$FILE" ]; then
+            echo "::error::asked to release $ASKED, but sdk-typescript/package.json says $FILE. Raise the file in a commit first, then tag that commit sdk-v$FILE."
+            exit 1
+          fi
+          grep -q "^## $FILE " CHANGELOG.md || { echo "::error::CHANGELOG.md has no '## $FILE' section"; exit 1; }
+          echo "version=$FILE" >> "$GITHUB_OUTPUT"
+          echo "publish=${{ github.event_name != 'pull_request' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse to replace a release
+        if: steps.v.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "sdk-v${{ steps.v.outputs.version }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::the release sdk-v${{ steps.v.outputs.version }} already exists, and is never replaced. Raise the version in sdk-typescript/package.json."
+            exit 1
+          fi
+
+      - name: Test and build
+        run: |
+          npm ci --no-audit --no-fund
+          npx tsc --noEmit
+          npx vitest run
+          npm run build
+
+      - name: Pack
+        id: pack
+        run: |
+          npm pack --silent > /tmp/packed.txt
+          TGZ=$(tail -n 1 /tmp/packed.txt)
+          [ "$TGZ" = "agentmesh-${{ steps.v.outputs.version }}.tgz" ] || { echo "::error::npm pack made $TGZ"; exit 1; }
+          sha256sum "$TGZ" > "$TGZ.sha256"
+          cat "$TGZ.sha256"
+          echo "tgz=$TGZ" >> "$GITHUB_OUTPUT"
+
+      # The tarball as a user gets it: installed into an empty project by its
+      # file, then loaded both ways the package exports.
+      - name: Install the tarball in an empty project
+        run: |
+          mkdir -p /tmp/try && cd /tmp/try
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund "$GITHUB_WORKSPACE/sdk-typescript/${{ steps.pack.outputs.tgz }}"
+          node --input-type=module -e 'const m = await import("agentmesh"); if (typeof m.AgentMesh?.connect !== "function") throw new Error("no AgentMesh.connect"); console.log("esm ok,", Object.keys(m).length, "exports")'
+          node -e 'const m = require("agentmesh"); if (typeof m.MeshNode?.connect !== "function") throw new Error("no MeshNode.connect"); console.log("cjs ok")'
+          test -f node_modules/agentmesh/dist/index.d.ts
+
+      - name: Release
+        if: steps.v.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.v.outputs.version }}
+          TGZ: ${{ steps.pack.outputs.tgz }}
+        run: |
+          SHA=$(cut -d' ' -f1 "$TGZ.sha256")
+          awk -v v="$VERSION" '$0 ~ "^## "v" " {on=1; next} on && /^## / {exit} on {print}' CHANGELOG.md > /tmp/notes.md
+          {
+            echo ""
+            echo "## Install"
+            echo ""
+            echo '```sh'
+            echo "npm install https://github.com/$GITHUB_REPOSITORY/releases/download/sdk-v$VERSION/$TGZ"
+            echo '```'
+            echo ""
+            echo "SHA-256 \`$SHA\`."
+          } >> /tmp/notes.md
+          gh release create "sdk-v$VERSION" "$TGZ" "$TGZ.sha256" \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "TypeScript SDK $VERSION" --notes-file /tmp/notes.md --latest=false
+          {
+            echo "### Released"
+            echo ""
+            echo "sdk-v$VERSION: $TGZ, SHA-256 \`$SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
