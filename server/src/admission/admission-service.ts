@@ -33,6 +33,13 @@ const MAX_GUARDS = Number(process.env.ADMISSION_MAX_GUARDS ?? 500);
  *  admitted answer still has a live, waiting caller. */
 const RELAY_TIMEOUT_MS = Number(process.env.ADMISSION_RELAY_TIMEOUT_MS ?? 35_000);
 
+/** The offering a request names, under its current name or the pre-rename
+ *  `skill`; empty when it names none. */
+function offeringOf(payload: unknown): string {
+  const p = payload && typeof payload === "object" ? (payload as { offering?: unknown; skill?: unknown }) : {};
+  return typeof p.offering === "string" ? p.offering : typeof p.skill === "string" ? p.skill : "";
+}
+
 /** What the relay reads off an admitted request: who sent it (the roster
  *  decision and the reply routing), which envelope it is (the benign ack's
  *  in_reply_to), and whether it is the reaper's probe (relayGuarded says why
@@ -486,6 +493,16 @@ export class AdmissionService {
     const roster = (owner ? await this.store.get(owner) : null) ?? await this.store.get(recipientId);
     const limits = (roster?.limits as { per_sender_per_hour?: number }) ?? {};
     if (this.overRate(recipientId, from, limits.per_sender_per_hour ?? 12)) return "drop";
+    // The pre-admission surface (§1.5 invariant 4): `describe` reads and
+    // `knock` asks, and admission filtering does not apply to either (§10.14;
+    // EXT-6 §7 and §9.3). A blocked sender's knock still reaches the agent's
+    // own door, which answers it exactly as it answers anyone's, so the
+    // sender cannot tell a block from a knock that is waiting. The rate limit
+    // above still counts them.
+    if (isRequest) {
+      const offering = offeringOf(payload);
+      if (offering === "describe" || offering === "knock") return "relay";
+    }
     const entries = (roster?.entries as Array<{ subject: string; stance: string } & GrantedEntry>) ?? [];
     // A connection's entry that has run out is no entry: the sender meets
     // its tier default below, as a stranger would.

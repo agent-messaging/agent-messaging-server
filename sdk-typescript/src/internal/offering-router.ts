@@ -129,6 +129,17 @@ export class OfferingRouter {
     return this.handlers.get(offeringId) ?? this.defaultHandler;
   }
 
+  /** Whether the application registered a handler for this offering by
+   *  name (the default handler does not count). */
+  has(offeringId: string): boolean {
+    return this.handlers.has(offeringId) || this.streamHandlers.has(offeringId);
+  }
+
+  /** Whether a default handler takes offerings nobody registered. */
+  get hasDefault(): boolean {
+    return this.defaultHandler !== null;
+  }
+
   /** The options registered for an offering, if any. An offering served by the
    *  default handler has none and gets every default. */
   optionsFor(offeringId: string): HandlerOptions | undefined {

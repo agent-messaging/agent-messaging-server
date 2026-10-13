@@ -28,6 +28,11 @@ export interface MeshCapabilities {
   protocol?: string;
   /** How the mesh keeps its tenants. */
   tenancy?: string;
+  /** The binding the mesh runs: "nats" or "rabbitmq". */
+  binding?: string;
+  /** Whether the mesh offers naming: a naming service whose verified names
+   *  it requires. The Agent Messaging Server alone answers false. */
+  naming?: boolean;
   /** Every request the mesh offers, by service. */
   services?: Record<string, string[]>;
   [entry: string]: unknown;

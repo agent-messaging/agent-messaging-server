@@ -13,7 +13,13 @@
 import { nkeys } from "./internal/nkeys.js";
 import { AM_URL_NAMING } from "./am-env.generated.js";
 
-const DEFAULT_REGISTRAR = AM_URL_NAMING;
+/** The naming service to use: the one passed, else AGENTMESH_NAMING_URL. There
+ *  is no built-in one: a mesh names its own, or offers none. */
+function registrarOf(given: string | undefined): string {
+  const r = given ?? AM_URL_NAMING;
+  if (!r) throw new Error("Naming needs the naming service's address: pass { registrar }, or set AGENTMESH_NAMING_URL.");
+  return r.replace(/\/+$/, "");
+}
 
 /** Standard base64 without Buffer — this module ships to browsers too. */
 function bytesToB64(bytes: Uint8Array): string {
@@ -42,13 +48,13 @@ async function post(url: string, body: unknown, token?: string): Promise<any> {
 /** Send a verification code to the owner's email. Returns nothing useful to
  *  the caller — the code goes to the inbox; the human reads it back. */
 export async function startNaming(email: string, opts: { registrar?: string } = {}): Promise<void> {
-  const registrar = opts.registrar ?? DEFAULT_REGISTRAR;
+  const registrar = registrarOf(opts.registrar);
   await post(`${registrar}/api/handles/start`, { email });
 }
 
 /** Verify the emailed code and return a naming session (an 8h PAN session). */
 export async function verifyNaming(email: string, code: string, opts: { registrar?: string } = {}): Promise<NamingSession> {
-  const registrar = opts.registrar ?? DEFAULT_REGISTRAR;
+  const registrar = registrarOf(opts.registrar);
   const { token } = await post(`${registrar}/api/handles/verify`, { email, code });
   if (!token) throw new Error("verification did not return a session");
   return { registrar, token, email };

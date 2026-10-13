@@ -33,7 +33,6 @@ import { AM_URL_NAMING } from "./am-env.generated.js";
 export const NAMING_STANDARD_WORDS =
   "AgentMesh uses one global standard for agent names: the agent's name, a dot, and its owner's email. That way no two agents anywhere have the same name. This agent does not have one yet, so nothing was sent.";
 
-const DEFAULT_REGISTRAR = AM_URL_NAMING;
 
 /** Whether a handle follows the global standard: a name with no dot, a dot,
  *  then the owner's email. */
@@ -90,7 +89,7 @@ export type NameLookup = (agentId: string) => Promise<NameCheck>;
  *  its own /api/registrar-key, and the card bound to the key asked about. A
  *  404 is "not named"; anything else that is not a verified card is
  *  "unreachable", never "named". */
-export function registrarNameLookup(registrar: string = DEFAULT_REGISTRAR, fetchImpl: typeof fetch = fetch): NameLookup {
+export function registrarNameLookup(registrar: string, fetchImpl: typeof fetch = fetch): NameLookup {
   const base = registrar.replace(/\/+$/, "");
   let keys: { at: number; list: string[] } | null = null;
   const signingKeys = async (): Promise<string[]> => {
@@ -157,7 +156,8 @@ export interface NamingGateOptions {
 
 /** What `ConnectOptions.requireNamed` takes when it is more than `true`. */
 export interface RequireNamedOptions {
-  /** The naming service to ask. Default https://naming.agentmesh.ai. */
+  /** The naming service to ask. Default: the one the connection implies
+   *  (AGENTMESH_NAMING_URL, or naming.<domain> for a broker at mesh.<domain>). */
   registrar?: string;
   /** Ask some other way (an embedder's own resolver, a test). Wins over
    *  `registrar`. */
@@ -172,12 +172,26 @@ export interface RequireNamedOptions {
 }
 
 /** Build the gate an agent's `requireNamed` option asks for. */
-export function namingGateFor(agentId: string, opt: boolean | RequireNamedOptions | undefined): NamingGate | null {
+export function namingGateFor(
+  agentId: string,
+  opt: boolean | RequireNamedOptions | undefined,
+  /** The naming service the connection implies, used when `opt` names none. */
+  registrar?: string,
+): NamingGate | null {
   if (!opt) return null;
   const o: RequireNamedOptions = opt === true ? {} : opt;
+  const where = o.registrar ?? registrar ?? AM_URL_NAMING;
+  if (!o.lookup && !where) {
+    throw new MeshError(
+      ErrorCode.INPUT_INVALID,
+      "requireNamed needs the naming service's address: pass requireNamed: { registrar }, or set AGENTMESH_NAMING_URL. " +
+        "A mesh that offers no naming service is used without it: leave requireNamed out.",
+      { retryable: false },
+    );
+  }
   return new NamingGate({
     agentId,
-    lookup: o.lookup ?? registrarNameLookup(o.registrar ?? DEFAULT_REGISTRAR),
+    lookup: o.lookup ?? registrarNameLookup(where!),
     name: o.name,
     ownerEmail: o.ownerEmail,
     lastVerified: o.lastVerified,

@@ -532,7 +532,11 @@ export class Diagnostics {
 
   constructor(mesh: AgentMesh, opts: DiagnosticsOptions = {}) {
     this.mesh = mesh;
-    this.registrar = opts.registrar ?? DEFAULT_REGISTRAR;
+    // The caller's naming service, else the one the connected agent uses
+    // (its requireNamed registrar, the environment's, or the broker's
+    // domain's), else none: a handle is then resolved only where its anchor
+    // domain answers for it.
+    this.registrar = (opts.registrar ?? mesh?.namingService?.() ?? DEFAULT_REGISTRAR ?? "").replace(/\/+$/, "");
     this.awaitAsyncReply = opts.awaitAsyncReply;
     this.anchorWebFingerBase = opts.anchorWebFingerBase;
   }
@@ -564,6 +568,13 @@ export class Diagnostics {
         resolveUrl = domainCardUrl;
         authority = "anchor-domain";
       } else {
+        if (!this.registrar) {
+          return {
+            ...base,
+            error: "no naming service is known here, so the name could not be looked up: address the agent by its agent id, or pass the naming service's address",
+            ms: Date.now() - t0,
+          };
+        }
         const q = AGENT_ID_RE.test(target)
           ? `agent_id=${encodeURIComponent(target)}`
           : `handle=${encodeURIComponent(target)}`;

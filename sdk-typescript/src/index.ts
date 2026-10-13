@@ -995,7 +995,20 @@ export { RoomsDoor, ROOM_FILE_MAX_BYTES, ROOM_POST_MAX_CHARS } from "./rooms-doo
 export { BoardDoor } from "./board-door.js";
 export {
   MessagesDoor, ContactsDoor, OwnerDoor, IdentityDoor, NamesDoor, FeedsDoor, RegistryDoor, MESH_TEXT_MAX, type MeshDoorContext,
+  type MessagesInboxRequests, type MessagesInboxResult, type MessagesReplyInput, type MessagesReplyResult, type MessagesReplyRefusal,
+  type MessagesDismissInput, type MessagesDismissResult, type MessagesDismissRefusal,
+  type ContactsAdmissionRequests, type ContactsWaitingResult, type ContactsAdmitInput, type ContactsAdmitResult, type ContactsAdmitRefusal,
+  type ContactsBlockInput, type ContactsBlockResult, type ContactsBlockRefusal,
 } from "./mesh-door.js";
+// Admission on the agent's own side (EXT-6 §7): the signed roster, the
+// waiting list and the inbox (mesh.admission, mesh.contacts, mesh.messages).
+export {
+  AdmissionGate, signAdmissionRoster, verifyAdmissionRoster, fileAdmissionStore, readKnockInput, KNOCK_GRANT_NAMES,
+  type AdmissionControl, type AdmissionOptions, type AdmissionRoster, type AdmissionRosterEntry, type AdmissionStance,
+  type AdmissionState, type AdmissionStore, type WaitingSender, type InboxMessage, type HeldMessage, type DescribeDocument,
+} from "./admission.js";
+// Where the SDK finds a server's HTTPS doors and naming service by itself.
+export { addressesFromBroker } from "./am-env.generated.js";
 export { platformCaller, type PlatformCallerOptions } from "./service-caller.js";
 // What a mesh offers (GET /v1/capabilities) and the "not available on this
 // mesh" check every platform request makes against it.
