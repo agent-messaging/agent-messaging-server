@@ -11,6 +11,7 @@ import {
 import { idOf, sealEnvelope, type ServiceIdentity } from "../../shared/handler.js";
 import { observedTaskTerminal, publishMeterEvents } from "../../shared/metering.js";
 import { isPartyToTask, reportRefusal } from "../task-parties.js";
+import { audienceRefusal, reportAudienceFirstUpdate } from "../audience.js";
 import {
   validateBudget,
   deadlinePassed,
@@ -93,6 +94,51 @@ export async function handleTaskUpdate(
   const parts = msg.subject.split(".");
   const taskId = parts[2];
   if (!taskId) return;
+
+  // §5.7: a message for the person behind an agent is never a Task
+  // transition. An update whose `meta.audience` is present and is anything
+  // other than "agent" leaves the Task as it was, creates no Task, and is
+  // reported as an invalid transition is (§7.3), to a party only (see the
+  // party check below for why a stranger gets no signed event).
+  const audience = audienceRefusal(env);
+  if (audience !== null) {
+    const existing = await kv.get(taskId);
+    if (!existing) {
+      reportAudienceFirstUpdate(taskId, env.from, audience);
+      return;
+    }
+    const current = existing.json<TaskRecord>();
+    if (!isPartyToTask(current, env.from)) {
+      reportRefusal(
+        `an update marked meta.audience ${audience} on task ${taskId}`,
+        env.from,
+        `it is neither the requester nor the responder of this task.`,
+      );
+      return;
+    }
+    const toState = (env.payload as RespondPayload | undefined)?.status ?? null;
+    console.warn(
+      `[task-manager] invalid transition: an update marked meta.audience ${audience} ` +
+        `for task ${taskId} (a message for a person is never a Task transition, §5.7)`,
+    );
+    const errEnv = createEnvelope({
+      type: "emit",
+      from: idOf(serviceId),
+      payload: {
+        domain: "task",
+        event_type: "invalid_transition",
+        data: {
+          task_id: taskId,
+          from_state: current.state,
+          to_state: toState,
+          agent: env.from,
+          reason: "audience",
+        },
+      },
+    });
+    nc.publish(Subjects.event("task.invalid_transition"), sealEnvelope(errEnv, serviceId));
+    return;
+  }
 
   // §5.2 `budget` field, validated AT THE DOOR (§7.7): a malformed block
   // refuses the whole update before it touches any state — same
