@@ -349,6 +349,12 @@ export interface RegisterOptions {
   sealing?: SealingChoice;
   /** Extensions this agent declares (§17.2), e.g. the a2a-bridge marker. */
   extensions?: Extension[];
+  /** SPEC.md §5.7: declare `mesh://extensions/audience/v1`, saying that
+   *  messages marked for this agent's person reach that person and are never
+   *  given to the agent as work. Requires a person surface registered with
+   *  `onPersonMessage` first, because an agent that cannot reach its person
+   *  must not declare it. */
+  personMessages?: boolean;
   /** Discovery visibility. Default "public". */
   visibility?: "public" | "unlisted" | "private";
   /** How inbound requests are handled: `service` (no person in the loop) or

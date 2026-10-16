@@ -188,6 +188,29 @@ export {
   type SealingInputs,
 } from "./internal/sealing-posture.js";
 
+// Messages for the person behind an agent (SPEC.md §5.7, Common Agent
+// Specification §4.9): how the mark reads, the manifest declaration, the frame's
+// audience line, the sender's pre-flight, and the shape the person surface
+// receives. AgentMesh applies them on its receive paths.
+export {
+  AUDIENCE_EXTENSION_URI,
+  AUDIENCE_DECLARATION,
+  AUDIENCE_FRAME_LINE,
+  readAudience,
+  audienceOf,
+  frameForPerson,
+  declaresAudience,
+  audiencePreflight,
+  personTextOf,
+} from "./audience.js";
+export type {
+  AudienceReading,
+  AudienceReceiver,
+  PersonMessage,
+  PersonMessageHandler,
+  AgentMayRead,
+} from "./audience.js";
+
 // Provenance framing + fencing for untrusted sender text (safety register 2.2,
 // 2.3). Applied BY DEFAULT on the inbound dispatch path — `onRequest`,
 // `onStreamRequest` and `subscribe` handlers receive framed text unless the

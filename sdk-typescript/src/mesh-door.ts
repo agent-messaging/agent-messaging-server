@@ -185,7 +185,7 @@ export class MessagesDoor implements MessagesRequests, MessagesInboxRequests {
    *  with `inbox: true` every message for an offering nothing handles.
    *  Answer with reply(); clear what is done with dismiss(). */
   async inbox(): Promise<MessagesInboxResult> {
-    return { messages: this.gate("messages.inbox").inbox() };
+    return { messages: this.gate("messages.inbox").harnessListing() };
   }
 
   /** Answer a message in the inbox, by its id. The answer goes to the sender

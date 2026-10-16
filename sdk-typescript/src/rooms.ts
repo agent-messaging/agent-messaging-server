@@ -37,6 +37,7 @@ import {
   type KeyPair,
 } from "./internal/identity.js";
 import { encode } from "./internal/codec.js";
+import { audienceOf, audiencePreflight, AUDIENCE_EXTENSION_URI } from "./audience.js";
 import { MeshError, ErrorCode } from "./types/errors.js";
 import { Subjects, isSubjectToken } from "./internal/subjects.js";
 import {
@@ -257,7 +258,14 @@ export interface OpenRoomOptions {
 /** One entry of a durable room's record. */
 export interface RecordEntry {
   seq: number;
+  /** The message, or null when it is unreadable or is a post marked for the
+   *  person behind this agent (SPEC.md §5.7: replay applies the rules live
+   *  delivery does, so a marked post is never handed over as the room's
+   *  conversation). */
   message: RoomMessage | null;
+  /** "person" when the post is marked for the person behind each member that
+   *  receives it. The envelope still carries it, for the person surface. */
+  audience?: "person";
   envelope: Envelope;
 }
 
@@ -563,6 +571,14 @@ export interface RoomHost {
   /** Meta the host stamps on everything it signs right now (SPEC §4.11
    *  `meta.via`: the place the agent is acting from). Absent means none. */
   outgoingMeta?(): Record<string, unknown> | undefined;
+  /** SPEC.md §5.7: hand a room post marked for the person behind this agent
+   *  to the person surface. Absent, such a post goes to nobody's handler. */
+  surfaceToPerson?(env: Envelope, text: string | undefined, roomId: string): boolean;
+  /** SPEC.md §5.7: whether an agent declares `mesh://extensions/audience/v1`,
+   *  or "unknown" when its manifest could not be read. */
+  audienceDeclaredBy?(agentId: string): Promise<boolean | "unknown">;
+  /** A local signal (§22.7) for a room post dropped for its mark. */
+  onAudienceDropped?(env: Envelope, why: string): void;
 }
 
 /** A host's stamped meta under the caller's own: the caller's keys win. */
@@ -1174,6 +1190,38 @@ export class Room {
     );
   }
 
+  /**
+   * Say something to the people behind the room's members (SPEC.md §5.7): a
+   * `say` marked `meta.audience: "person"`. Each member's node shows it to
+   * its person and gives it to no handler or model. Refused locally with
+   * `AUDIENCE_NOT_SUPPORTED`, naming the members that do not declare
+   * `mesh://extensions/audience/v1`, unless `sendAnyway` is set; the agent
+   * SHOULD take that choice from its own person.
+   */
+  async sayToPeople(
+    body: string,
+    opts?: { channel?: string; in_reply_to?: string; sendAnyway?: boolean },
+  ): Promise<void> {
+    if (opts?.sendAnyway !== true) {
+      const others = [...this.roster].filter((m) => m !== this.host.agentId);
+      const receivers = [];
+      for (const id of others) {
+        receivers.push({ id, declares: this.host.audienceDeclaredBy ? await this.host.audienceDeclaredBy(id) : ("unknown" as const) });
+      }
+      const verdict = audiencePreflight(receivers, { sendAnyway: opts?.sendAnyway });
+      if (!verdict.send) {
+        throw new MeshError(
+          ErrorCode.AUDIENCE_NOT_SUPPORTED,
+          `${verdict.receivers.join(", ")} ${verdict.receivers.length === 1 ? "does" : "do"} not declare ` +
+            `${AUDIENCE_EXTENSION_URI}, so nothing says this post will reach their people rather than their ` +
+            `agents (SPEC §5.7). Nothing was posted.`,
+          { retryable: false, details: { receivers: verdict.receivers } },
+        );
+      }
+    }
+    this.say(body, { channel: opts?.channel, in_reply_to: opts?.in_reply_to, meta: { audience: "person" } });
+  }
+
   /** Receive room messages (signature-verified; own messages skipped unless
    *  the room was opened/joined with includeSelf). */
   onMessage(handler: RoomMessageHandler): void {
@@ -1277,9 +1325,13 @@ export class Room {
       if (valid && payload.type === "phase") {
         this.applyPhase(payload, m.envelope.from, Date.parse(m.envelope.ts) || 0);
       }
+      // SPEC.md §5.7: a replayed post marked for the person is never handed
+      // over as the room's conversation, exactly as at live delivery.
+      const forPerson = valid && payload.type === "say" && audienceOf(m.envelope) !== "agent";
       entries.push({
         seq: m.seq,
-        message: valid ? this.unsealIfNeeded(payload) : null,
+        message: valid && !forPerson ? this.unsealIfNeeded(payload) : null,
+        ...(forPerson ? { audience: "person" as const } : {}),
         envelope: m.envelope,
       });
     }
@@ -1831,6 +1883,25 @@ export class Room {
     // the room (§8.5). Dropping it would hide a signed statement a member
     // made; obeying it would make the declared facilitator meaningless.
     if (msg.type === "phase") this.applyPhase(msg, env.from, Date.parse(env.ts) || Date.now());
+
+    // SPEC.md §5.7: a `say` marked for the person goes to the person surface
+    // and to no handler. On a control message or an artifact announcement the
+    // mark has no meaning and is ignored.
+    if (msg.type === "say") {
+      const audience = audienceOf(env);
+      if (audience === "malformed") {
+        this.host.onAudienceDropped?.(env, "a room post with a malformed meta.audience");
+        return;
+      }
+      if (audience === "person") {
+        if (env.from !== this.host.agentId) {
+          const opened = this.unsealIfNeeded(msg);
+          const text = opened.type === "say" && !isSealedBody(opened.body) ? opened.body : undefined;
+          this.host.surfaceToPerson?.(env, text, this.descriptor.room_id);
+        }
+        return;
+      }
+    }
 
     let delivered = this.unsealIfNeeded(msg);
     // Receivers MUST treat an unknown expel severity as `conduct` (§8.1).

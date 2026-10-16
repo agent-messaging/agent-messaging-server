@@ -118,6 +118,19 @@ import { withDetectedDevice } from "./internal/device-profile.js";
 import { encode, decode } from "./internal/codec.js";
 import { Subjects, isSubjectToken, isPublishableSubject } from "./internal/subjects.js";
 import { uuid7 } from "./internal/uuid.js";
+import {
+  AUDIENCE_DECLARATION,
+  AUDIENCE_EXTENSION_URI,
+  audienceOf,
+  audiencePreflight,
+  declaresAudience,
+  frameForPerson,
+  personTextOf,
+  type AgentMayRead,
+  type AudienceReceiver,
+  type PersonMessage,
+  type PersonMessageHandler,
+} from "./audience.js";
 import { RevokedSenders, type RevocationAnswer } from "./internal/revoked-senders.js";
 import { childSpan } from "./internal/trace.js";
 import { spanPayload, traceSubject, outcomeOf, type SpanInput, type SpanOutcome, type SpanData } from "./internal/spans.js";
@@ -501,6 +514,11 @@ export class AgentMesh {
    *  later read (watchTaskUpdates). Cleared on unwatch and detach. */
   private taskRecheckTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private taskUpdateHandler: TaskUpdateHandler | null = null;
+  /** SPEC.md §5.7: where messages written to this agent's person go
+   *  (`onPersonMessage`), and whether the person lets the agent read them
+   *  (`setPersonMessages`, off until the person turns it on). */
+  private personHandler: PersonMessageHandler | null = null;
+  private agentMayRead: AgentMayRead = false;
   /** Delegations (§10.8): sub-requests a handler issued for an inbound task,
    *  recorded via the ambient dispatch context. Parent task id → the offering
    *  that delegated (for the per-handler opt-out) and the still-live sub-task
@@ -1169,6 +1187,26 @@ export class AgentMesh {
 
   /** Register this agent with the mesh, making it discoverable. */
   async register(opts: RegisterOptions): Promise<Manifest> {
+    // SPEC.md §5.7: declare `mesh://extensions/audience/v1` only when this
+    // agent can reach its person, which here means a person surface is
+    // registered. The SDK keeps the receiver rules on every path it owns.
+    if (opts.personMessages === true) {
+      if (!this.personHandler) {
+        throw new MeshError(
+          ErrorCode.INVALID_MANIFEST,
+          "personMessages: true declares that messages for this agent's person reach that person (SPEC §5.7), " +
+            "so register a person surface with onPersonMessage() first.",
+        );
+      }
+      const others = (opts.extensions ?? []).filter((e) => e.uri !== AUDIENCE_EXTENSION_URI);
+      opts = { ...opts, extensions: [...others, { ...AUDIENCE_DECLARATION }] };
+    } else if (opts.extensions?.some((e) => e.uri === AUDIENCE_EXTENSION_URI) && !this.personHandler) {
+      throw new MeshError(
+        ErrorCode.INVALID_MANIFEST,
+        "The audience extension says messages for this agent's person reach that person (SPEC §5.7), " +
+          "so register a person surface with onPersonMessage() before declaring it.",
+      );
+    }
     const manifest = await this.buildManifest(opts);
     await this.sendRegister(manifest);
 
@@ -3310,6 +3348,11 @@ export class AgentMesh {
   ): boolean {
     if (!this.rememberEventId(pattern, env.from, env.id)) return false;
     if (!this.freshEnough(env, buffered)) return false;
+    // SPEC.md §5.7 rule 6: an event carrying the mark goes to no handler.
+    if (audienceOf(env) !== "agent") {
+      this.dropMarked(env, `an event on ${subject}`);
+      return false;
+    }
     const payload = env.payload as EmitPayload;
     // An event body is untrusted text from a stranger exactly like a
     // request body is, and it reaches the same model. Same cap, same frame.
@@ -3599,6 +3642,9 @@ export class AgentMesh {
         this.request(agentId, offering, input, config),
       encryptionSeed: this.encryptionSeed,
       getEncryptionKey: (agentId) => this.encryptionKeyFor(agentId),
+      surfaceToPerson: (env, text, roomId) => this.surfaceToPerson(env, "say", { text, roomId }),
+      audienceDeclaredBy: (agentId) => this.audienceDeclaredBy(agentId),
+      onAudienceDropped: (env, why) => this.dropMarked(env, why),
       serviceRequest: (subject, payload, timeoutMs) =>
         this.serviceRequest(subject, payload, timeoutMs),
       openAclTransport: async (jwt, seed, inboxPrefix) => {
@@ -3892,6 +3938,10 @@ export class AgentMesh {
     return {
       start: async (opts: AdmissionOptions = {}) => {
         this.admissionGate = await AdmissionGate.open(this.agentId, this.kp, opts);
+        // SPEC.md §5.7: a held message for the person goes to the person once
+        // its sender is let in.
+        this.admissionGate.onPersonReleased = (h) =>
+          h.envelope ? this.surfaceToPerson(h.envelope as Envelope, "request") : false;
         this.admissionSync = opts.syncRoster !== false;
         await this.syncRoster();
       },
@@ -4035,7 +4085,16 @@ export class AgentMesh {
 
   /** The roster's word on one request. True when it was answered here (held,
    *  blocked, or put in the inbox) and must go no further. */
-  private async admissionDoor(msg: Msg, env: Envelope, reqPayload: RequestPayload, viaReply: boolean): Promise<boolean> {
+  private async admissionDoor(
+    msg: Msg,
+    env: Envelope,
+    reqPayload: RequestPayload,
+    viaReply: boolean,
+    /** SPEC.md §5.7: the message is marked for this agent's person. It is
+     *  held like any other; let in, it goes to the person surface (the caller's
+     *  branch), never into the harness's inbox as text. */
+    forPerson = false,
+  ): Promise<boolean> {
     const gate = this.admissionGate!;
     const stance = gate.stanceFor(env.from, await this.senderFacts(env.from));
     if (stance === "block") {
@@ -4045,14 +4104,16 @@ export class AgentMesh {
     if (stance === "hold") {
       const handle = await this.senderHandle(env.from);
       gate.hold({
-        id: env.id, from: env.from, received_at: new Date().toISOString(), offering: reqPayload.offering, input: reqPayload.input,
+        id: env.id, from: env.from, received_at: new Date().toISOString(), offering: reqPayload.offering,
+        input: forPerson ? env.payload : reqPayload.input,
+        ...(forPerson ? { audience: "person" as const, envelope: env } : {}),
         ...(env.task_id ? { task_id: env.task_id } : {}), ...(env.context_id ? { context_id: env.context_id } : {}),
       }, handle ?? undefined);
       this.answerQueued(msg, env, viaReply, false);
       return true;
     }
     // Let in. Into the inbox when the agent collects what nobody handles.
-    if (gate.collectsUnhandled && !this.router.has(reqPayload.offering) && !this.router.hasDefault) {
+    if (!forPerson && gate.collectsUnhandled && !this.router.has(reqPayload.offering) && !this.router.hasDefault) {
       const input = reqPayload.input;
       const inReplyTo = (input as { in_reply_to?: unknown } | null)?.in_reply_to;
       gate.file({
@@ -4382,6 +4443,209 @@ export class AgentMesh {
    * itself (its own budget revisions echoed back) are book-kept but not
    * surfaced.
    */
+  // ─── Messages for the person behind an agent (SPEC.md §5.7) ─────────
+
+  /**
+   * Where messages written to this agent's person go. A request, a respond or
+   * a room post marked `meta.audience: "person"` (or any string other than
+   * "agent") is given to no offering handler, no tool and no model: the SDK
+   * hands it here, with the verified sender and the time, for the host to show
+   * the person on the surface where they review what concerns this agent.
+   * Register it before `register({ personMessages: true })`, which declares
+   * `mesh://extensions/audience/v1`.
+   */
+  onPersonMessage(handler: PersonMessageHandler | null): void {
+    this.personHandler = handler;
+  }
+
+  /**
+   * The person's setting (§5.7): whether they let this agent read messages
+   * written to them, for everyone (`true`) or for the senders a function
+   * accepts. Off until the person turns it on. With it on, each message
+   * handed to `onPersonMessage` also carries `agentNote`: the text framed
+   * with the audience line, which the agent may tell its person about,
+   * summarize or draft an answer from, and acts on in no way. Nothing is ever
+   * dispatched to an offering handler.
+   */
+  setPersonMessages(opts: { agentMayRead: AgentMayRead }): void {
+    this.agentMayRead = opts.agentMayRead;
+  }
+
+  /** Whether an agent declares that it keeps §5.7's rules: `true`, `false`,
+   *  or `"unknown"` when its manifest could not be read. */
+  async audienceDeclaredBy(agentId: string): Promise<boolean | "unknown"> {
+    try {
+      return declaresAudience(await this.getManifest(agentId));
+    } catch {
+      return "unknown";
+    }
+  }
+
+  /** The sender's pre-flight (§5.7): refuses locally with
+   *  `AUDIENCE_NOT_SUPPORTED`, naming the receivers that do not declare the
+   *  extension, unless the caller chose to send anyway. */
+  private async preflightAudience(receivers: readonly string[], sendAnyway: boolean | undefined): Promise<void> {
+    if (sendAnyway === true) return;
+    const seen: AudienceReceiver[] = [];
+    for (const id of receivers) seen.push({ id, declares: await this.audienceDeclaredBy(id) });
+    const verdict = audiencePreflight(seen, { sendAnyway });
+    if (!verdict.send) {
+      throw new MeshError(
+        ErrorCode.AUDIENCE_NOT_SUPPORTED,
+        `${verdict.receivers.join(", ")} ${verdict.receivers.length === 1 ? "does" : "do"} not declare ` +
+          `${AUDIENCE_EXTENSION_URI}, so nothing says this message will reach the person rather than the ` +
+          `agent (SPEC §5.7). Nothing was sent. Ask your person whether to send anyway: their agent may ` +
+          `read this as a request.`,
+        { retryable: false, details: { receivers: verdict.receivers } },
+      );
+    }
+  }
+
+  /**
+   * Send a message written to the person behind another agent (§5.7): a
+   * `request` marked `meta.audience: "person"`, with the text in
+   * `payload.text`, no offering, no budget and no task id. Refused locally
+   * with `AUDIENCE_NOT_SUPPORTED` when the receiver does not declare
+   * `mesh://extensions/audience/v1`, unless `sendAnyway` is set; the agent
+   * SHOULD take that choice from its own person.
+   *
+   * Resolves with `queued` (the receiver's queued acknowledgement, which is
+   * what a receiver that keeps §5.7 answers), `unconfirmed` (no answer in
+   * time; a registered receiver's mailbox has it), or `answered` (the
+   * receiver answered it as work, which a receiver that keeps §5.7 never
+   * does). A person's reply arrives later through `onPersonMessage`.
+   */
+  async sendToPerson(
+    agentId: string,
+    text: string,
+    opts: { sendAnyway?: boolean; context_id?: string; timeout_ms?: number } = {},
+  ): Promise<{ outcome: "queued" | "unconfirmed" | "answered"; request_id: string; inbox_id?: string; payload?: unknown }> {
+    if (this.namingGate) await this.namingGate.require();
+    this.admissionGate?.noteAddressed(agentId);
+    await this.preflightAudience([agentId], opts.sendAnyway);
+    const recipient = this.manifestCache.get(agentId);
+    preflightSenderText({ text }, effectiveInboundCap(recipient));
+    const envelope = this.newEnvelope({
+      type: "request",
+      from: this.agentId,
+      to: agentId,
+      context_id: opts.context_id,
+      payload: { text },
+      meta: { audience: "person" },
+    });
+    const bytes = encode(envelope);
+    preflightEnvelopeSize(bytes.length, this.conn.maxPayload);
+    try {
+      const resp = await this.awaitAgentReply(
+        this.resolvedInbox(agentId),
+        envelope,
+        bytes,
+        agentId,
+        opts.timeout_ms ?? 30_000,
+        {},
+      );
+      if (resp.error) throw MeshError.fromErrorObject(resp.error);
+      return { outcome: "answered", request_id: envelope.id, payload: resp.payload };
+    } catch (err) {
+      if (err instanceof MeshError && err.code === ErrorCode.REQUEST_QUEUED) {
+        const inbox = err.details?.inbox_id;
+        return { outcome: "queued", request_id: envelope.id, ...(typeof inbox === "string" ? { inbox_id: inbox } : {}) };
+      }
+      if (
+        err instanceof MeshError &&
+        (err.code === ErrorCode.TRANSPORT_TIMEOUT || err.code === ErrorCode.TRANSPORT_NO_RESPONDERS)
+      ) {
+        return { outcome: "unconfirmed", request_id: envelope.id };
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * The person's reply to a message written to them (§5.7): a bare
+   * `respond` marked for a person in turn, `in_reply_to` the message,
+   * `payload.status: "completed"` and the text in `payload.text`, with no
+   * task id. Sent only with the person's own words: a reply the agent writes
+   * without the person's approval is the agent's own message and goes out as
+   * an ordinary one. The same pre-flight applies as for `sendToPerson`.
+   */
+  async replyToPerson(
+    original: Pick<Envelope, "id" | "from">,
+    text: string,
+    opts: { sendAnyway?: boolean } = {},
+  ): Promise<{ id: string }> {
+    if (this.namingGate) await this.namingGate.require();
+    await this.preflightAudience([original.from], opts.sendAnyway);
+    const envelope = this.newEnvelope({
+      type: "respond",
+      from: this.agentId,
+      to: original.from,
+      in_reply_to: original.id,
+      payload: { status: "completed", text },
+      meta: { audience: "person" },
+    });
+    const bytes = encode(envelope);
+    preflightEnvelopeSize(bytes.length, this.conn.maxPayload);
+    this.conn.publish(this.resolvedInbox(original.from), bytes);
+    return { id: envelope.id };
+  }
+
+  /** Hand a message written to the person to the person surface (§5.7 rule
+   *  2), with the agent's framed copy when the person allows it. Returns
+   *  whether a surface took it. */
+  private surfaceToPerson(
+    env: Envelope,
+    kind: PersonMessage["kind"],
+    extra: { text?: string; roomId?: string } = {},
+  ): boolean {
+    const text = extra.text ?? personTextOf(env.payload);
+    const receivedAt = new Date();
+    const allow =
+      typeof this.agentMayRead === "function" ? this.agentMayRead(env.from) === true : this.agentMayRead === true;
+    const message: PersonMessage = {
+      kind,
+      from: env.from,
+      receivedAt: receivedAt.toISOString(),
+      ...(text !== undefined ? { text } : {}),
+      ...(typeof env.in_reply_to === "string" ? { inReplyTo: env.in_reply_to } : {}),
+      ...(extra.roomId ? { roomId: extra.roomId } : {}),
+      ...(allow && text !== undefined
+        ? { agentNote: frameForPerson(text, { from: env.from, trace: env.trace, receivedAt }) }
+        : {}),
+      envelope: env,
+    };
+    const handler = this.personHandler;
+    if (!handler) {
+      this.onSecurityWarning?.({
+        code: "person_message_unsurfaced",
+        message:
+          "a message written to this agent's person arrived and no person surface is registered " +
+          "(onPersonMessage), so it was given to no handler and shown to nobody (SPEC §5.7)",
+        from: env.from,
+        subject: this.agentId,
+      });
+      return false;
+    }
+    try {
+      const r = handler(message);
+      if (r && typeof (r as Promise<void>).catch === "function") (r as Promise<void>).catch(() => {});
+    } catch {
+      /* a surface that throws does not make the message work for the agent */
+    }
+    return true;
+  }
+
+  /** §5.7 rule 6 and §22.7: a marked event or Task update goes to no handler,
+   *  and the agent hears about it. */
+  private dropMarked(env: Envelope, where: string): void {
+    this.onSecurityWarning?.({
+      code: "audience_marked_dropped",
+      message: `dropped ${where} marked meta.audience for a person: it is never given to a handler (SPEC §5.7)`,
+      from: env.from,
+      subject: this.agentId,
+    });
+  }
+
   onTaskUpdate(handler: TaskUpdateHandler): void {
     this.taskUpdateHandler = handler;
   }
@@ -5284,6 +5548,13 @@ export class AgentMesh {
     if (!this.rememberInboxId(env.from, env.id)) return;
     if (!this.freshEnough(env, recorded)) return;
 
+    // SPEC.md §5.7 rule 6: a Task update marked for a person (or with a mark
+    // that is not a string) is never a Task transition and goes to no handler.
+    if (audienceOf(env) !== "agent") {
+      this.dropMarked(env, `a Task update for ${taskId}`);
+      return;
+    }
+
     // Budget revisions: absolute, latest wins (§7.7). A lower-or-equal
     // revision is ignored by applyBudget, and a malformed budget is ignored
     // outright — the tracked budget stands either way.
@@ -5962,6 +6233,20 @@ export class AgentMesh {
   private handleInboxRespond(env: Envelope, buffered: boolean): void {
     if (env.to !== undefined && env.to !== this.agentId) return;
     if (!this.freshEnough(env, buffered)) return;
+    // SPEC.md §5.7: a respond marked for a person is a person's reply to a
+    // message this agent's person sent. It resolves no wait (rule 1) and goes
+    // to the person surface. A malformed mark has no reply path on a respond,
+    // so it is dropped and the agent hears about it (§22.7).
+    const audience = audienceOf(env);
+    if (audience !== "agent") {
+      if (!this.rememberInboxId(env.from, env.id)) return; // §22.2
+      if (audience === "malformed") {
+        this.dropMarked(env, "a respond with a malformed meta.audience");
+        return;
+      }
+      this.surfaceToPerson(env, "respond");
+      return;
+    }
     const pending =
       typeof env.in_reply_to === "string"
         ? this.pendingAgentReplies.get(env.in_reply_to)
@@ -6145,6 +6430,29 @@ export class AgentMesh {
       }
     }
 
+    // SPEC.md §5.7 rule 5: a mark that is present and is not a string is
+    // refused before any handler runs, answered at the sender's inbox. Every
+    // string other than "agent" reads as "person".
+    const audience = audienceOf(env);
+    if (audience === "malformed") {
+      const viaReply = !buffered && typeof msg.subject === "string" && msg.subject.endsWith(".inbox.guarded");
+      const errEnv = this.newEnvelope({
+        type: "respond",
+        from: this.agentId,
+        to: env.from,
+        in_reply_to: env.id,
+        trace: childSpan(env.trace),
+        error: {
+          code: ErrorCode.INVALID_ENVELOPE,
+          message: "meta.audience must be a string: \"agent\" or \"person\" (SPEC §5.7).",
+          details: { reason: "audience_malformed" },
+          retryable: false,
+        },
+      });
+      this.sendRespond(msg, env, encode(errEnv), { transportReply: viaReply });
+      return;
+    }
+
     // The adapter's inbox-mode answer shape (§6.4a): a node that queued a
     // message answers later with a FRESH request whose `in_reply_to` names
     // the original request's envelope id. When the wait it names is still
@@ -6156,7 +6464,8 @@ export class AgentMesh {
     // names NO open wait is an ordinary request, dispatched normally; the
     // asynchronous case, where the caller was already told REQUEST_QUEUED
     // and stopped waiting, lands there.
-    if (typeof env.in_reply_to === "string") {
+    // A request marked for a person is never an answer to a wait (§5.7 rule 1).
+    if (typeof env.in_reply_to === "string" && audience === "agent") {
       const pending = this.pendingAgentReplies.get(env.in_reply_to);
       // Only the ADDRESSED AGENT ITSELF may answer as a request. Checked
       // before bindResponse on purpose: the §6.2 intermediary allowance (and
@@ -6247,7 +6556,7 @@ export class AgentMesh {
     // makes needs to know it is one. It also gets no §6.4a accept, because the
     // probe's caller reads ONE reply, and an accept in front of the answer
     // would be that reply.
-    const probe = reqPayload?.offering === "__registry_probe__";
+    const probe = audience === "agent" && reqPayload?.offering === "__registry_probe__";
     // Where this dispatch's replies go: the transport reply subject for the
     // two sendRespond exceptions, the sender's inbox for everything else.
     const viaReply = probe || guarded;
@@ -6257,18 +6566,20 @@ export class AgentMesh {
     // before the stream branch, because `config.stream = true` used to be the
     // flag that walked past every check the adapter had (2.4) and the SDK must
     // not reintroduce that shape.
-    if (this.overInboundCap(reqPayload.input, env, msg, viaReply)) return;
+    // A message for a person carries its text in `payload.text` (§5.7), so
+    // that is what the cap measures for one.
+    if (this.overInboundCap(audience === "person" ? ((env.payload as Record<string, unknown> | undefined)?.text ?? env.payload) : reqPayload.input, env, msg, viaReply)) return;
 
     // ── the pre-admission surface (§1.5 invariant 4) ──────────────────────
     // `describe` reads and `knock` asks; admission applies to neither, and
     // neither creates a task, sends an accept, or reaches a handler the
     // application did not register for it by name (a default handler is the
     // agent's own code, and §10.14 says a describe must never run it).
-    if (!probe && reqPayload.offering === "describe" && !this.router.has("describe")) {
+    if (audience === "agent" && !probe && reqPayload.offering === "describe" && !this.router.has("describe")) {
       await this.answerDescribe(msg, env, viaReply);
       return;
     }
-    if (!probe && reqPayload.offering === "knock" && this.admissionGate && !this.router.has("knock")) {
+    if (audience === "agent" && !probe && reqPayload.offering === "knock" && this.admissionGate && !this.router.has("knock")) {
       await this.answerKnock(msg, env, reqPayload, viaReply);
       return;
     }
@@ -6299,7 +6610,7 @@ export class AgentMesh {
     // closed-enum string matched byte-exactly) and before the router, so an
     // agent honours cancels whether or not the application registered
     // anything. The note is sender text; the §22.5 cap above already bounded it.
-    if (reqPayload.offering === "task.cancel") {
+    if (audience === "agent" && reqPayload.offering === "task.cancel") {
       this.handleInboundCancel(msg, env, reqPayload, viaReply);
       return;
     }
@@ -6338,7 +6649,20 @@ export class AgentMesh {
     // a sender the roster holds or blocks gets the queued acknowledgement and
     // nothing else, and a message for an offering with no handler goes to the
     // inbox when the agent asked for one.
-    if (this.admissionGate && !probe && (await this.admissionDoor(msg, env, reqPayload, viaReply))) return;
+    if (this.admissionGate && !probe && (await this.admissionDoor(msg, env, reqPayload, viaReply, audience === "person"))) return;
+
+    // ── SPEC.md §5.7: a message written to this agent's person ──────────
+    // After admission (the mark gives a sender no standing: a held sender
+    // stays held) and before anything that makes it work: no trial, no
+    // allowance, no agreement, no admit hook, no accept, no Task, no metering
+    // and no dispatch, whatever offering or budget it names. It goes to the
+    // person surface, and the sender gets the queued acknowledgement any
+    // queued message gets.
+    if (audience === "person") {
+      const surfaced = this.surfaceToPerson(env, "request");
+      this.answerQueued(msg, env, viaReply, surfaced);
+      return;
+    }
 
     // The task id this dispatch runs under, computed once so the §7.7
     // admission phase, the regular handler and the stream branch all agree.
