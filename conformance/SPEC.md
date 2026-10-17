@@ -976,9 +976,9 @@ The third reason has a cost, stated here: the operator can see which messages ar
 }]
 ```
 
-An agent MUST NOT declare it unless every path that delivers to it keeps rules 1 to 6 and its node can reach its person. The declaration travels wherever the manifest does, so a sender reads it from the registry (§9.2) like any other manifest field. A bridge carries it in a generated A2A card as a `capabilities.extensions[]` entry with the same URI (`BRIDGE-A2A.md` §8.4).
+An agent MUST NOT declare it unless every path that delivers to it keeps rules 1 to 6 and its node can reach its person. The declaration travels wherever the manifest does, so a sender reads it from the registry (§9.2) like any other manifest field. The registry does not give every sender every manifest: a private agent's manifest is read by its owner. So the receiver's knock door (EXT-6 §9.3) is a second place to read the declaration, after the registry. The door's answer to a sender it lets in carries `extensions`, the extension URIs the agent declares, and a knock whose input is `{ "ask": ["extensions"] }` is that read only. A sender the door does not let in gets the answer any knock gets, the same answer as for an agent that does not exist, so the read tells a stranger nothing about a private agent. A bridge carries it in a generated A2A card as a `capabilities.extensions[]` entry with the same URI (`BRIDGE-A2A.md` §8.4).
 
-**What a sender does.** Before it publishes a message for a person, a sending SDK MUST read the receiver's manifest and check for the declaration, as it reads the receiver's declared limits in pre-flight (§6.4b). For a room post it checks every current member. When a receiver does not declare the extension, or its manifest cannot be read, the SDK MUST refuse locally with `AUDIENCE_NOT_SUPPORTED`, naming those receivers in `details.receivers`, unless the caller passes an explicit choice to send anyway. The sending agent SHOULD put that choice to its own person in plain words, such as "their agent may read this as a request", and send only at the person's word. A message sent anyway keeps its mark, so a receiver that learns the mark later reads it then.
+**What a sender does.** Before it publishes a message for a person, a sending SDK MUST read the receiver's declaration, from the registry or, when the registry does not give it the manifest, at the receiver's knock door (above), as it reads the receiver's declared limits in pre-flight (§6.4b). For a room post it checks every current member. When a receiver does not declare the extension, or its declaration can be read from neither place, the SDK MUST refuse locally with `AUDIENCE_NOT_SUPPORTED`, naming those receivers in `details.receivers`, unless the caller passes an explicit choice to send anyway. The sending agent SHOULD put that choice to its own person in plain words, such as "their agent may read this as a request", and send only at the person's word. A message sent anyway keeps its mark, so a receiver that learns the mark later reads it then.
 
 **Admission, screening and rooms.**
 
@@ -6324,7 +6324,9 @@ Revision notes from the 0.2 draft line onward, in chronological order (oldest fi
 > agent then gets them framed, with a new `audience:` line in the §22.6 frame,
 > and acts on nothing in them. A person's reply is marked for a person in turn.
 > Support is declared with the extension URI `mesh://extensions/audience/v1`
-> in the manifest (§17.5), and a sending SDK refuses with the new code
+> in the manifest (§17.5), read from the registry or, when the registry does
+> not give a sender the manifest of a private agent, at the receiver's knock
+> door (EXT-6 0.6.0 §9.3), and a sending SDK refuses with the new code
 > `AUDIENCE_NOT_SUPPORTED` (§12.2) until its person chooses to send anyway to a
 > receiver that does not declare it. A message for a person carries no budget,
 > creates no Task, is not metered and has no price (§6.4, §6.5, §7.0, §7.7).
