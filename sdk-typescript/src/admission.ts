@@ -181,6 +181,10 @@ export interface InboxMessage {
   context_id?: string;
   /** Set once messages.reply answered it. */
   replied_at?: string;
+  /** SPEC.md §5.7: "person" when the sender marked the message for the person
+   *  behind this agent. The entry keeps the mark, and a listing the harness
+   *  reads leaves out its text (`harnessListing`). */
+  audience?: "person";
 }
 
 /** A message held at the door until its sender is let in or blocked. */
@@ -190,6 +194,14 @@ export interface HeldMessage {
   received_at: string;
   offering: string;
   input: unknown;
+  /** SPEC.md §5.7: "person" when the sender marked the message for the person
+   *  behind this agent. The mark gives the sender no standing: it is held like
+   *  any other, and on release it goes to the person (`onPersonReleased`), or
+   *  to the inbox with the mark kept. */
+  audience?: "person";
+  /** The envelope as it arrived, kept for a message marked for the person so
+   *  the person surface can show the verified sender and the signed text. */
+  envelope?: unknown;
   task_id?: string;
   context_id?: string;
 }
@@ -395,6 +407,10 @@ export class AdmissionGate {
   private saving: Promise<void> = Promise.resolve();
   /** Agents this agent wrote to, and when: their answers are solicited. */
   private addressed = new Map<string, number>();
+  /** SPEC.md §5.7: where a held message marked for the person goes when its
+   *  sender is let in. Set by the agent that owns this gate; unset, the
+   *  message is filed in the inbox with its mark. */
+  onPersonReleased: ((held: HeldMessage) => boolean) | null = null;
 
   private constructor(
     private readonly agentId: string,
@@ -582,10 +598,12 @@ export class AdmissionGate {
     const mine = this.state.held.filter((h) => h.from === agentId);
     this.state.held = this.state.held.filter((h) => h.from !== agentId);
     for (const h of mine) {
+      if (h.audience === "person" && this.onPersonReleased?.(h)) continue;
       this.file({
         id: h.id, from: h.from, ...(w?.handle ? { handle: w.handle } : {}), text: textOfInput(h.input), received_at: h.received_at,
         kind: "message", offering: h.offering, input: h.input,
         ...(h.task_id ? { task_id: h.task_id } : {}), ...(h.context_id ? { context_id: h.context_id } : {}),
+        ...(h.audience === "person" ? { audience: "person" as const } : {}),
       });
     }
     this.state.waiting = this.state.waiting.filter((x) => x.agent_id !== agentId);
@@ -618,6 +636,21 @@ export class AdmissionGate {
   /** The messages waiting in the inbox, oldest first. */
   inbox(): InboxMessage[] {
     return this.state.inbox.map((m) => ({ ...m }));
+  }
+
+  /** The inbox as a harness reads it (SPEC.md §5.7 rule 3, §8.3a): an entry
+   *  marked for the person keeps its mark, sender and time, and its text and
+   *  input are left out, with a line saying a message is waiting for the
+   *  person so the agent can tell them. */
+  harnessListing(): InboxMessage[] {
+    return this.state.inbox.map((m) =>
+      m.audience === "person"
+        ? (() => {
+            const { input: _input, ...rest } = m;
+            return { ...rest, text: "A message for your person is waiting. Tell them it has arrived; its text is for them to read." };
+          })()
+        : { ...m },
+    );
   }
 
   /** One inbox message, by id. */

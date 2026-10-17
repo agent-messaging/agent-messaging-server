@@ -1,9 +1,9 @@
 # The A2A gateway: normative mapping between Agent Messaging and A2A
 
-**Version:** 0.3.1-draft
+**Version:** 0.4.0-draft
 **Status:** Working Draft
 **Date:** 2026-07-14
-**Revised:** 2026-10-13 (see §15)
+**Revised:** 2026-10-16 (see §15)
 **Applies to:** Agent Messaging 0.2 (SPEC.md) · Agent2Agent (A2A) Protocol v1.0, JSON-RPC and HTTP+JSON bindings · PACT 1.0 (§14)
 
 > This document specifies the translation between Agent Messaging and the
@@ -312,6 +312,50 @@ corresponding `capabilities.extensions[]` entry instead, using the same
 canonical URI with a `documentationUrl` pointing at the bridge documentation.)
 The extension URI is registered in the AgentMesh extensions registry
 (SPEC.md §17.5).
+
+### 8.4. Messages for the Person (0.4.0)
+
+SPEC.md §5.7 lets a sender mark a message for the person behind the
+receiving agent, with `meta.audience: "person"`, and an agent declares that
+it keeps §5.7's rules with the extension `mesh://extensions/audience/v1`. A2A
+has no such mark of its own. Its extension mechanism carries one: an agent
+card lists extensions in `capabilities.extensions[]`, and a message lists the
+ones it uses in `extensions` and carries their data in `metadata`.
+
+**The declaration.** A generated card (§8.1) lists the URI in
+`capabilities.extensions[]` exactly when the exposed mesh agent's manifest
+declares it. A bridged manifest (§8.2) declares the URI exactly when the
+remote card lists it. A bridge MUST NOT add the declaration in either
+direction on its own account.
+
+**Inbound (A2A client to mesh agent).** An A2A message whose `extensions`
+lists the URI and whose `metadata["agentmesh.audience"]` is `"person"` is
+carried as a request marked for the person: the bridge signs it with the
+caller's hosted identity and `meta.audience: "person"`. A value that is not a
+string is refused with `InvalidParamsError` (`-32602`). The bridge answers the
+A2A caller with a Task in state `submitted` (§5) from its own task record
+(§4.1, `GetTask`), since the mesh agent's person answers, if at all, later.
+When a reply marked for a person arrives, the bridge completes that record
+with the reply as a Message carrying `metadata["agentmesh.audience"]:
+"person"`. The task is the bridge's own record of the exchange; no mesh Task
+exists for it (SPEC.md §7.0).
+
+**Outbound (mesh agent to remote A2A server).** The bridge is the receiving
+node for the bridged agent, so §5.7's receiver rules bind it. When the remote
+card lists the URI, the bridge forwards a marked request with the URI in the
+message's `extensions` and `metadata["agentmesh.audience"]: "person"`, and
+the remote server keeps the rules it declared. When the remote card does not
+list it, the bridge MUST refuse the request with `AUDIENCE_NOT_SUPPORTED`
+(SPEC.md §12.2) and forward nothing, even when the sender chose to send
+anyway. A native receiver that does not know the mark still receives it under
+the sender's signature; forwarding over HTTP would make the bridge the party
+that drops it, and §5.7 has every carrier keep it.
+
+| Mesh | A2A |
+|---|---|
+| manifest `extensions[]` entry `mesh://extensions/audience/v1` | card `capabilities.extensions[]` entry, same URI |
+| `meta.audience: "person"` on a request or a reply | message `extensions` lists the URI; `metadata["agentmesh.audience"]: "person"` |
+| `AUDIENCE_NOT_SUPPORTED` | `-32603` with `data.agentmesh_code: "AUDIENCE_NOT_SUPPORTED"` (§7) |
 
 ## 9. Inbound Caller Identity
 

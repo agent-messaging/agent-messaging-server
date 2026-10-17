@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.62.0 (2026-10-16)
+
+Messages for the person behind an agent (Agent Messaging 0.9, SPEC.md §5.7).
+In this version the receiver's rules are an optional extension that an agent
+declares as `mesh://extensions/audience/v1`. A later version of the
+specification is planned to make them mandatory. The SDK keeps the rules on
+its receive paths whether or not the agent declares the extension.
+
+- **The receiver rules.** A `request`, a `respond` or a room `say` whose
+  `meta.audience` is "person", or any string other than "agent", is given to
+  no offering handler, no admit hook and no model. It sends no accept, runs no
+  trial, allowance, agreement or budget admission, creates no Task and meters
+  nothing, whatever offering or budget it names. The sender gets the queued
+  acknowledgement any queued message gets. A held sender stays held: the mark
+  gives no standing at the door, and a held message for the person goes to the
+  person once its sender is let in. A respond marked for a person resolves no
+  wait. A mark that is not a string (`null` included) is refused before any
+  handler with `INVALID_ENVELOPE`, `details.reason: "audience_malformed"`. A
+  marked event or Task update goes to no handler and raises
+  `onSecurityWarning` with code `audience_marked_dropped`.
+- **The person surface.** `onPersonMessage(handler)` receives each message for
+  the person with the verified sender, the time, the text and the envelope.
+  `setPersonMessages({ agentMayRead })` is the person's setting, off until
+  they turn it on, for everyone or for the senders a function accepts. With it
+  on, the message also carries `agentNote`: the text framed by §22.6's frame
+  with the new `audience:` line, for the agent to tell its person about and
+  act on in no way. With no surface registered, the message reaches nobody and
+  `onSecurityWarning` says so (`person_message_unsurfaced`).
+- **The declaration.** `register({ personMessages: true })` declares
+  `mesh://extensions/audience/v1` and requires a person surface first.
+- **Sending.** `sendToPerson(agentId, text, { sendAnyway })`,
+  `replyToPerson(original, text, { sendAnyway })` and
+  `room.sayToPeople(body, { sendAnyway })` mark the envelope, carry no budget
+  and no task id, and refuse locally with the new `AUDIENCE_NOT_SUPPORTED`
+  (`details.receivers`) when a receiver does not declare the extension or its
+  manifest cannot be read, unless the caller chose to send anyway.
+- **Rooms.** A live `say` marked for the person goes to the person surface and
+  to no `onMessage` handler. `history()` returns such a post with
+  `message: null` and `audience: "person"`.
+- **The inbox a harness reads.** `messages.inbox()` (the mesh door) lists an
+  entry marked for the person with its mark, sender and time, and leaves out
+  its text and input. `AdmissionGate.harnessListing()` is that listing.
+- Exported: `AUDIENCE_EXTENSION_URI`, `AUDIENCE_DECLARATION`,
+  `AUDIENCE_FRAME_LINE`, `readAudience`, `audienceOf`, `frameForPerson`,
+  `declaresAudience`, `audiencePreflight`, `personTextOf`, and the types.
+  `frameMessage` takes `audience: "person"` in its provenance.
+- `__tests__/unit/audience.test.ts` reads conformance/audience.json: the
+  readings, the signed envelopes and tamper cases, the frame byte for byte, the
+  declaration, the sender's pre-flight, and every receiver case through a real
+  dispatch.
+
 ## 0.61.1 (2026-10-13)
 
 Fixes. No API change.

@@ -36,6 +36,13 @@ export enum ErrorCode {
    *  the reason, the offering, what is missing, what it expects and an
    *  example that fits (input-fit.ts inputNotUnderstood). */
   INPUT_NOT_UNDERSTOOD = "INPUT_NOT_UNDERSTOOD",
+  /** SPEC.md §5.7: a message marked for the person behind the receiving
+   *  agent, to a receiver that does not declare `mesh://extensions/audience/v1`
+   *  (or whose manifest could not be read), so nothing says it will reach the
+   *  person. Raised locally by `sendToPerson` and `replyToPerson` before
+   *  anything is published, unless the caller chose to send anyway.
+   *  `details.receivers` names the receivers. */
+  AUDIENCE_NOT_SUPPORTED = "AUDIENCE_NOT_SUPPORTED",
   CONTENT_TYPE_NOT_SUPPORTED = "CONTENT_TYPE_NOT_SUPPORTED",
   UNAUTHORIZED = "UNAUTHORIZED",
   /** The recipient declares `sealing: "required"` (§8.9) and the request
