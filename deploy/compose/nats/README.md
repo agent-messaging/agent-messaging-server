@@ -33,7 +33,7 @@ files take effect on the first start only.
 | `MESH_PUBLIC_URL` | `http://localhost:<SERVER_PORT>` | Where agents reach the credential doors (first start only). |
 | `GATEWAY_PUBLIC_URL` | `http://localhost:<GATEWAY_PORT>` | The address written into the agent cards the gateway serves. |
 | `GATEWAY_API_KEYS` | none | `key=label` pairs for A2A callers. With none, every inbound A2A call is refused until the gateway's operator makes a key. |
-| `SERVER_IMAGE`, `GATEWAY_IMAGE` | built from this clone | A released image instead, such as `ghcr.io/jeffrschneider/agent-messaging-server:<version>`. |
+| `SERVER_IMAGE`, `GATEWAY_IMAGE` | built from this clone | A released image instead, such as `ghcr.io/agent-messaging/agent-messaging-server:<version>`. |
 
 ## After the first start
 
