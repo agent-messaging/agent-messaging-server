@@ -4067,7 +4067,86 @@ export interface RunsStepResult {
 /** The refusals runs.step() can answer with. */
 export type RunsStepRefusal = "INPUT_INVALID" | "NOT_FOUND" | "NO_ACCOUNT";
 
-/** The record of every piece of work that ran for an account: a solution run, a job sent to an agent, a Try, a build or a deploy. Each says who asked, on whose behalf, by which door, and what it cost. Who can call it: The account the runs belong to: the account each one ran for and paid for, whoever asked for it. Nobody else's runs come back. Cost: No model is called. A call is one read of the run accounting records, which are kept for 90 days. */
+/** What runs.solutions() sends. */
+export interface RunsSolutionsInput {
+  /** Only this solution, by its id. */
+  solution?: string;
+  /** The organization. Your own when left out, and not used when solution is given. */
+  org?: string;
+}
+
+/** What runs.solutions() answers. */
+export interface RunsSolutionsResult {
+  /** The solutions you can run. */
+  solutions: Array<{
+    /** The solution's id, for runs_start. */
+    id: string;
+    /** What it is called. */
+    name: string;
+    /** The organization it belongs to. */
+    org: string;
+    /** When it last ran, when it has. */
+    last_run_at?: string;
+    /** What its Start form asks for, in order. */
+    inputs: Array<{
+      /** What to answer it under in runs_start's answers. */
+      key: string;
+      /** What the Start form calls it. */
+      label: string;
+      /** What to hand in, in a sentence. */
+      says: string;
+      /** Whether a run needs it. A source of the run says false, because any one source will do. */
+      required: boolean;
+      /** True on a source of the run: a run needs at least one of its sources, any one of them. */
+      source?: boolean;
+      /** The forms it takes, the first the one the form offers: text, url (a web address), file, or fields (a document asked for in parts). */
+      takes: string[];
+      /** The answers it takes, when it takes only a few. */
+      choices?: string[];
+      /** An example answer. */
+      example?: string;
+      /** True when it takes several files at once, as a list. */
+      many?: boolean;
+      /** The parts to answer when it takes fields, sent as { "as": "fields", "parts": { <name>: text } }. */
+      parts?: Array<{
+        /** The part's name, as parts carries it. */
+        name: string;
+        /** What the form calls it. */
+        label: string;
+        /** An example answer. */
+        example?: string;
+      }>;
+    }>;
+  }>;
+}
+
+/** The refusals runs.solutions() can answer with. */
+export type RunsSolutionsRefusal = "INPUT_INVALID" | "NOT_FOUND" | "NO_ORG" | "NO_ACCOUNT";
+
+/** What runs.start() sends. */
+export interface RunsStartInput {
+  /** The solution's id, from runs_solutions. */
+  solution: string;
+  /** Its Start form's answers, by each input's key: words or a web address as text; a file as { "name", "media_type", "data_b64" } with its bytes in base64, or a list of them for an input that takes many; a document asked for in parts as { "as": "fields", "parts": { <name>: text } }. These are the answers schedules_create takes and Run in the app sends. The whole request is at most 1 MB, so a larger file is added in the app. */
+  answers?: Record<string, unknown>;
+}
+
+/** What runs.start() answers. */
+export interface RunsStartResult {
+  /** The run's id. */
+  run: string;
+  /** The run's page, from the moment it starts. Give it to the person; runs_show says where it stands. */
+  address: string;
+  /** The solution it is a run of. */
+  solution: string;
+  /** Where it stands now: running, waiting, done, failed or stopped. */
+  state: string;
+}
+
+/** The refusals runs.start() can answer with. */
+export type RunsStartRefusal = "INPUT_INVALID" | "NOT_FOUND" | "MISSING_INPUTS" | "CHARGES" | "NOT_STARTED" | "PAUSED" | "NO_ACCOUNT";
+
+/** The record of every piece of work that ran for an account: a solution run, a job sent to an agent, a Try, a build or a deploy. Each says who asked, on whose behalf, by which door, and what it cost. A run of one of the account's own solutions can be started here too, now, with its answers. Who can call it: The account the runs belong to: the account each one ran for and paid for, whoever asked for it. Nobody else's runs come back. A run is started only of a solution in an organization the account is in, as that account and on its account, the way Run in the app starts one. Cost: Listing runs or solutions and showing a run call no model: each is one read of the run accounting records, which are kept for 90 days, or of the solutions. A run that runs.start begins costs what the solution's steps cost, on your account. A solution that charges for its runs is started only by the person signed in, in the app or through the hosted connector. */
 export interface RunsRequests {
   /** Your account's runs, newest first: who asked, by which door, what kind of work, which agent, and what it cost. Refusals: INPUT_INVALID: A field is wrong. The words say which. NO_ACCOUNT: This agent belongs to no account, so it has no runs. */
   list(input?: RunsListInput): Promise<RunsListResult>;
@@ -4075,6 +4154,10 @@ export interface RunsRequests {
   show(input: RunsShowInput): Promise<RunsShowResult>;
   /** One step of one of your runs: where it stands, who held it, what it said, and what it delivered, each file with an address to fetch it that works for seven days. Refusals: INPUT_INVALID: That is not a run's id, or not a step number. NOT_FOUND: No run of yours by that id, or no step by that number. NO_ACCOUNT: This agent belongs to no account, so it has no runs. */
   step(input: RunsStepInput): Promise<RunsStepResult>;
+  /** The solutions in your organization that you can start a run of with runs_start, each with the inputs its Start form asks for. Give solution for one solution's inputs alone. Refusals: INPUT_INVALID: A field is wrong. The words say which. NOT_FOUND: No solution you can run by that id. A solution in an organization you are not in answers the same as one that does not exist. NO_ORG: You are not in that organization. NO_ACCOUNT: This agent belongs to no account, so it has no solutions. */
+  solutions(input?: RunsSolutionsInput): Promise<RunsSolutionsResult>;
+  /** Start one run of one of your solutions now, as you and on your account, with its Start form's answers, the way Run in the app starts one. runs_solutions says what each solution asks for. Its approval steps stop and wait for a person in the app. It answers with the run's id and its page as soon as the run starts; runs_show says where it stands after that. Refusals: INPUT_INVALID: A field is wrong, or an answer is one its input does not take, such as a file of the wrong kind or one too large. The words say which. NOT_FOUND: No solution you can run by that id. A solution in an organization you are not in answers the same as one that does not exist. MISSING_INPUTS: An input the run needs was left out. The words name each one; runs_solutions says what each takes. CHARGES: It charges for each run, so only the person signed in starts one, in the app or through the hosted connector. NOT_STARTED: The run could not be started: a run of it is already going and it runs one at a time, an agent on it is out of service, or an agent on it has an update waiting for approval. The words say which. PAUSED: Everything this account owns is paused with the Kill Switch, so nothing new starts. Resume on the Kill Switch page first. NO_ACCOUNT: This agent belongs to no account, so it cannot start a run. */
+  start(input: RunsStartInput): Promise<RunsStartResult>;
 }
 
 /** Runs, through the platform's service door. */
@@ -4088,6 +4171,12 @@ export class RunsService implements RunsRequests {
   }
   step(input: RunsStepInput): Promise<RunsStepResult> {
     return this.caller.call("runs.step", (input ?? {}) as unknown as Record<string, unknown>, "signature") as Promise<RunsStepResult>;
+  }
+  solutions(input?: RunsSolutionsInput): Promise<RunsSolutionsResult> {
+    return this.caller.call("runs.solutions", (input ?? {}) as unknown as Record<string, unknown>, "signature") as Promise<RunsSolutionsResult>;
+  }
+  start(input: RunsStartInput): Promise<RunsStartResult> {
+    return this.caller.call("runs.start", (input ?? {}) as unknown as Record<string, unknown>, "signature") as Promise<RunsStartResult>;
   }
 }
 
@@ -5502,6 +5591,20 @@ export const SDK_REQUESTS: ReadonlyArray<{ id: string; service: string; request:
     "tier": "platform"
   },
   {
+    "id": "runs.solutions",
+    "service": "runs",
+    "request": "solutions",
+    "transport": "platform",
+    "tier": "platform"
+  },
+  {
+    "id": "runs.start",
+    "service": "runs",
+    "request": "start",
+    "transport": "platform",
+    "tier": "platform"
+  },
+  {
     "id": "samples.list",
     "service": "samples",
     "request": "list",
@@ -5701,6 +5804,8 @@ export const REQUEST_TIERS: Readonly<Record<string, "core" | "platform">> = {
   "runs.list": "platform",
   "runs.show": "platform",
   "runs.step": "platform",
+  "runs.solutions": "platform",
+  "runs.start": "platform",
   "samples.list": "platform",
   "schedules.create": "platform",
   "schedules.list": "platform",
