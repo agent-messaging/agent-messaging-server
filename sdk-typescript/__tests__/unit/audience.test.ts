@@ -1,5 +1,5 @@
-// Messages for the person behind an agent (SPEC.md §5.7, Common Agent
-// Specification §4.9), asserted against conformance/audience.json.
+// Messages for the person behind an agent (SPEC.md §5.7, an optional extension
+// an agent declares), asserted against conformance/audience.json.
 //
 // Like the other conformance suites, this file iterates the fixture instead of
 // restating its cases: the readings of the mark, the really-signed envelopes

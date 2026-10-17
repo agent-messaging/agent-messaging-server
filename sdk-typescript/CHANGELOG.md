@@ -1,9 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.62.0 (2026-10-16)
 
-Messages for the person behind an agent (Agent Messaging 0.9, SPEC.md §5.7;
-Common Agent Specification §4.9).
+Messages for the person behind an agent (Agent Messaging 0.9, SPEC.md §5.7).
+In this version the receiver's rules are an optional extension that an agent
+declares as `mesh://extensions/audience/v1`. A later version of the
+specification is planned to make them mandatory. The SDK keeps the rules on
+its receive paths whether or not the agent declares the extension.
 
 - **The receiver rules.** A `request`, a `respond` or a room `say` whose
   `meta.audience` is "person", or any string other than "agent", is given to

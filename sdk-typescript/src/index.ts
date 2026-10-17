@@ -188,8 +188,8 @@ export {
   type SealingInputs,
 } from "./internal/sealing-posture.js";
 
-// Messages for the person behind an agent (SPEC.md §5.7, Common Agent
-// Specification §4.9): how the mark reads, the manifest declaration, the frame's
+// Messages for the person behind an agent (SPEC.md §5.7, an optional extension
+// an agent declares): how the mark reads, the manifest declaration, the frame's
 // audience line, the sender's pre-flight, and the shape the person surface
 // receives. AgentMesh applies them on its receive paths.
 export {

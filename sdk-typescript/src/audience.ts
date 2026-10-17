@@ -1,6 +1,6 @@
 /**
- * Messages for the person behind an agent (SPEC.md §5.7, Common Agent
- * Specification §4.9).
+ * Messages for the person behind an agent (SPEC.md §5.7), an optional
+ * extension an agent declares as mesh://extensions/audience/v1.
  *
  * A sender marks a `request`, a `respond` or a room `say` with
  * `meta.audience: "person"` when it is written for the person the receiving
