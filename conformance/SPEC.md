@@ -250,7 +250,7 @@ The transport handles routing, delivery, persistence, and node-level security; a
 
 > **The behavior is the floor's.** The four handlers and what each owes
 > are defined by the Common Agent Specification §4.5
-> (https://agentdoc.net/common-agent.html), which governs. This section
+> (https://commonagent.net/spec.html), which governs. This section
 > binds them to the mesh: the handler spellings below and the inbox
 > subject naming.
 
@@ -2747,7 +2747,7 @@ where a reader who asked the mesh question finds it.
 
 An agent that has an Agent Descriptor (its operator's standing description;
 the format is the Common Agent Specification's Descriptor chapter, §6 at
-https://agentdoc.net/common-agent.html) SHOULD carry a pointer to it on
+https://commonagent.net/spec.html) SHOULD carry a pointer to it on
 the manifest: `descriptor.digest`, the SHA-256 of the descriptor's served
 bytes. The pointer is derived from the document itself at registration,
 never typed, and it is a pointer only: the manifest does not restate
@@ -6123,11 +6123,11 @@ Revision notes from the 0.2 draft line onward, in chronological order (oldest fi
 > descriptor's subject must be the sender; an evaluation record's signature
 > must verify and be the evaluator's own), and §14.1 maps the six subjects.
 > The formats themselves stay where they live: the Descriptor at
-> agentdoc.net/descriptor-spec.html, the AgentDoc at agentdoc.net/spec.html.
+> commonagent.net/descriptor.html, the AgentDoc at agentdoc.net/spec.html.
 > Nothing on the wire changed with this entry; the words caught up.
 
 > **The agent's side moves to the Common Agent Specification (2026-09-01).**
-> The Common Agent Specification (https://agentdoc.net/common-agent.html)
+> The Common Agent Specification (https://commonagent.net/spec.html)
 > now carries the agent-side obligations this document accumulated: the
 > floor (identity, describe, the five questions, the entryway, the four
 > handlers, mechanical refusal, refusal discipline, the inbound
