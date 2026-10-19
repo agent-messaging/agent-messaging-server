@@ -36,7 +36,8 @@ function gatewayAdmin(method, path, body) {
 }
 
 const gatewayContainer = docker(["compose", "-f", composeFile, "ps", "-q", "a2a-gateway"]);
-const image = process.env.GATEWAY_IMAGE ?? "agent-messaging-a2a-gateway:local";
+// The A2A agent runs on the gateway's own image, whichever one the setup started.
+const image = process.env.GATEWAY_IMAGE ?? docker(["inspect", "-f", "{{.Config.Image}}", gatewayContainer]);
 const agentName = `example-a2a-agent-${run}`;
 
 // 1. The A2A agent, in the gateway's network, so the gateway reaches it at

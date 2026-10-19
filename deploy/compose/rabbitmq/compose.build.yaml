@@ -1,0 +1,30 @@
+# The server and the A2A gateway built from this clone, in place of the
+# released images compose.yaml pins. For working on the code, and what CI runs:
+#
+#   docker compose -f compose.yaml -f compose.build.yaml up -d
+#
+# or, with COMPOSE_FILE=compose.yaml:compose.build.yaml set (a semicolon in
+# place of the colon on Windows), plain `docker compose build` and `up`. Every
+# start builds again (from the cache when nothing changed), so the mesh always
+# runs the code in the clone. The images are tagged agent-messaging-server:local
+# and agent-messaging-a2a-gateway:local, never with a released name.
+
+services:
+  setup:
+    image: agent-messaging-server:local
+    build: &server
+      context: ../../..
+      dockerfile: server/Dockerfile
+    pull_policy: build
+
+  server:
+    image: agent-messaging-server:local
+    build: *server
+    pull_policy: build
+
+  a2a-gateway:
+    image: agent-messaging-a2a-gateway:local
+    build:
+      context: ../../..
+      dockerfile: a2a-gateway/Dockerfile
+    pull_policy: build

@@ -156,9 +156,10 @@ cd deploy/compose/nats          # or deploy/compose/rabbitmq
 docker compose up -d
 ```
 
-The first start builds the images from the clone, runs first-run setup, then
-starts the broker, the server and the gateway. To run a published release
-instead of building, set `SERVER_IMAGE` and `GATEWAY_IMAGE` to its images.
+The first start pulls the released images `compose.yaml` pins, runs first-run
+setup, then starts the broker, the server and the gateway. To run another
+release, set `SERVER_IMAGE` and `GATEWAY_IMAGE` to its images. To run images
+built from the clone, add `-f compose.yaml -f compose.build.yaml` to `up`.
 
 Read what first-run said, and copy the keystore (section 3):
 
@@ -382,8 +383,9 @@ every agent.
 
 1. Back up (section 8).
 2. Read the release notes for anything to do before or after.
-3. Pin the new images. With Compose, set `SERVER_IMAGE` and `GATEWAY_IMAGE` to
-   the new version (or pull the new release's repository and rebuild). On
+3. Pin the new images. With Compose, change the version in `compose.yaml` (a
+   newer clone of the repository has it already) or set `SERVER_IMAGE` and
+   `GATEWAY_IMAGE` to the new release's images, then `docker compose pull`. On
    Kubernetes, change the image lines in `mesh.yaml` and apply it.
 4. Restart: `docker compose up -d`. The server stops, the new one starts on the
    same `config` volume.

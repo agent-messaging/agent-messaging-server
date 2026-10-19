@@ -1,0 +1,97 @@
+name: Compose on the released images
+
+# The NATS Compose setup exactly as someone who self-hosts runs it: the images
+# compose.yaml pins, pulled from ghcr.io and never built, brought up from
+# empty, and two agents in different companies exchanging signed messages on
+# it (example 01). Every push to main and every pull request.
+#
+# Before that, a check that every image pin (both compose.yaml files, both
+# Kubernetes manifests, the READMEs and the .env.example files) names the same
+# release, so a release moves them together (docs/releasing.md).
+#
+# CI's mesh job (ci.yml) runs the same setup on images built from the commit;
+# this job is what a new user of the latest release gets.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: compose-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "22"
+
+jobs:
+  released:
+    name: compose (released images)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: deploy/compose/nats
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Every image pin names the same release
+        id: pin
+        working-directory: .
+        run: |
+          files="deploy/compose/nats/compose.yaml deploy/compose/rabbitmq/compose.yaml deploy/kubernetes/nats/mesh.yaml deploy/kubernetes/rabbitmq/mesh.yaml README.md deploy/compose/nats/README.md deploy/compose/rabbitmq/README.md deploy/compose/nats/.env.example deploy/compose/rabbitmq/.env.example"
+          pattern='ghcr\.io/agent-messaging/agent-messaging-(server|a2a-gateway):[0-9]+\.[0-9]+\.[0-9]+'
+          for f in $files; do
+            for image in agent-messaging-server agent-messaging-a2a-gateway; do
+              grep -qE "ghcr\.io/agent-messaging/$image:[0-9]+\.[0-9]+\.[0-9]+" "$f" || { echo "::error file=$f::$f does not pin ghcr.io/agent-messaging/$image"; exit 1; }
+            done
+          done
+          versions=$(grep -ohE "$pattern" $files | sed 's/.*://' | sort -u)
+          echo "the pins name: $versions"
+          if [ "$(echo "$versions" | wc -l)" != 1 ]; then
+            grep -nE "$pattern" $files
+            echo "::error::the image pins name more than one release; move them all together (docs/releasing.md)"
+            exit 1
+          fi
+          echo "version=$versions" >> "$GITHUB_OUTPUT"
+
+      - name: Pull the pinned images
+        run: |
+          docker compose config --images
+          docker compose pull
+
+      - name: Bring the mesh up from empty, without building
+        run: |
+          docker compose up -d --wait --wait-timeout 300 --no-build
+          docker compose ps
+          docker compose images
+          for i in $(seq 1 30); do curl -fsS --max-time 5 http://127.0.0.1:3005/v1/capabilities > "$RUNNER_TEMP/capabilities.json" && break; sleep 2; done
+          head -c 400 "$RUNNER_TEMP/capabilities.json"; echo
+          grep -q '"binding":"nats"' "$RUNNER_TEMP/capabilities.json" || { echo "::error::the capabilities answer does not name NATS"; exit 1; }
+          grep -q '"version":"${{ steps.pin.outputs.version }}"' "$RUNNER_TEMP/capabilities.json" || { echo "::error::the server is not release ${{ steps.pin.outputs.version }}"; exit 1; }
+          docker compose exec -T server /entrypoint.sh mesh-admin status | tee "$RUNNER_TEMP/status.log"
+          grep -q "Live revocation: on" "$RUNNER_TEMP/status.log"
+
+      # The examples use the SDK in this repository; example 01 enrolls two
+      # agents with enrollment keys and has them exchange signed requests and
+      # answers, once while both are online and once while one is away.
+      - name: Two agents exchange signed messages (example 01)
+        working-directory: .
+        run: |
+          (cd sdk-typescript && npm ci --no-audit --no-fund && npm run build)
+          (cd examples && npm ci --no-audit --no-fund)
+          node examples/run.mjs nats 01
+
+      - name: Logs, on failure
+        if: failure()
+        run: docker compose logs --tail 120
+
+      - name: Stop the mesh
+        if: always()
+        run: docker compose down -v

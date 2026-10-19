@@ -44,6 +44,9 @@ jobs:
       SHIP_DELAY_MS: ${{ github.event_name == 'schedule' && '7200000' || inputs.ship_delay_ms || '8000' }}
       OFFLINE_WINDOW_MS: ${{ github.event_name == 'schedule' && '600000' || inputs.offline_window_ms || '4000' }}
       TEST_TIMEOUT_MS: ${{ github.event_name == 'schedule' && '9000000' || '180000' }}
+      # The images built from this commit, not the release compose.yaml pins.
+      # The steps that run Compose do so in deploy/compose/<broker>.
+      COMPOSE_FILE: compose.yaml:compose.build.yaml
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

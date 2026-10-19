@@ -40,7 +40,8 @@ jobs:
         broker: [nats, rabbitmq]
     env:
       BROKER: ${{ matrix.broker }}
-      COMPOSE_FILE: deploy/compose/${{ matrix.broker }}/compose.yaml
+      # The images built from main, not the release compose.yaml pins.
+      COMPOSE_FILE: deploy/compose/${{ matrix.broker }}/compose.yaml:deploy/compose/${{ matrix.broker }}/compose.build.yaml
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
