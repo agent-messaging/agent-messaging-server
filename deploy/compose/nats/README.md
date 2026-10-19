@@ -6,6 +6,10 @@ One host, one command:
 docker compose up -d
 ```
 
+It pulls the released images, `ghcr.io/agent-messaging/agent-messaging-server:0.3.0`
+and `ghcr.io/agent-messaging/agent-messaging-a2a-gateway:0.3.0`, which
+`compose.yaml` pins.
+
 ## What starts
 
 | Service | What it does | Port on the host |
@@ -33,7 +37,22 @@ files take effect on the first start only.
 | `MESH_PUBLIC_URL` | `http://localhost:<SERVER_PORT>` | Where agents reach the credential doors (first start only). |
 | `GATEWAY_PUBLIC_URL` | `http://localhost:<GATEWAY_PORT>` | The address written into the agent cards the gateway serves. |
 | `GATEWAY_API_KEYS` | none | `key=label` pairs for A2A callers. With none, every inbound A2A call is refused until the gateway's operator makes a key. |
-| `SERVER_IMAGE`, `GATEWAY_IMAGE` | built from this clone | A released image instead, such as `ghcr.io/agent-messaging/agent-messaging-server:<version>`. |
+| `SERVER_IMAGE`, `GATEWAY_IMAGE` | `ghcr.io/agent-messaging/agent-messaging-server:0.3.0`, `ghcr.io/agent-messaging/agent-messaging-a2a-gateway:0.3.0` | The images, the latest release by default. Set both to another release's, such as `ghcr.io/agent-messaging/agent-messaging-server:<version>`. |
+
+To upgrade, change the version in `compose.yaml` or set `SERVER_IMAGE` and `GATEWAY_IMAGE` to the new release's images, then run `docker compose pull && docker compose up -d` (back up first: [operator handbook, upgrading](../../../docs/operator-handbook.md#9-upgrading)).
+
+## Running images built from this clone
+
+To work on the server or the gateway, add `compose.build.yaml`, which builds
+both images from this clone (tagged `agent-messaging-server:local` and
+`agent-messaging-a2a-gateway:local`) at every start:
+
+```sh
+docker compose -f compose.yaml -f compose.build.yaml up -d
+```
+
+`logs`, `exec` and `down` need no `-f`. A later `up` does, or it starts the
+released images again.
 
 ## After the first start
 

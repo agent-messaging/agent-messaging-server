@@ -18,6 +18,11 @@
 #                about node connections (on the Compose network only).
 #   a2a-gateway  the A2A gateway on 8090, on the credential first-run made.
 #
+# The images are the latest release, pinned by version (SERVER_IMAGE and
+# GATEWAY_IMAGE set others). To upgrade, change the version here or in those
+# settings, then `docker compose pull && docker compose up -d`. To run images
+# built from this clone instead, add compose.build.yaml (README.md says how).
+#
 # Every port is published on 127.0.0.1 only, unless BIND_ADDRESS says
 # otherwise (.env.example). Postgres and RabbitMQ's management API are not
 # published at all: only the server uses them.
@@ -26,10 +31,7 @@ name: agent-messaging-rabbitmq
 
 services:
   setup:
-    image: ${SERVER_IMAGE:-agent-messaging-server:local}
-    build:
-      context: ../../..
-      dockerfile: server/Dockerfile
+    image: ${SERVER_IMAGE:-ghcr.io/agent-messaging/agent-messaging-server:0.3.0}
     command: ["first-run"]
     environment:
       MESH_BROKER: rabbitmq
@@ -90,10 +92,7 @@ services:
     restart: unless-stopped
 
   server:
-    image: ${SERVER_IMAGE:-agent-messaging-server:local}
-    build:
-      context: ../../..
-      dockerfile: server/Dockerfile
+    image: ${SERVER_IMAGE:-ghcr.io/agent-messaging/agent-messaging-server:0.3.0}
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -130,10 +129,7 @@ services:
     restart: unless-stopped
 
   a2a-gateway:
-    image: ${GATEWAY_IMAGE:-agent-messaging-a2a-gateway:local}
-    build:
-      context: ../../..
-      dockerfile: a2a-gateway/Dockerfile
+    image: ${GATEWAY_IMAGE:-ghcr.io/agent-messaging/agent-messaging-a2a-gateway:0.3.0}
     depends_on:
       server:
         condition: service_healthy

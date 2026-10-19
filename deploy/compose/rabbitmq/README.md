@@ -6,6 +6,10 @@ One host, one command:
 docker compose up -d
 ```
 
+It pulls the released images, `ghcr.io/agent-messaging/agent-messaging-server:0.3.0`
+and `ghcr.io/agent-messaging/agent-messaging-a2a-gateway:0.3.0`, which
+`compose.yaml` pins.
+
 ## What starts
 
 | Service | What it does | Port on the host |
@@ -25,7 +29,11 @@ As for NATS ([.env.example](.env.example) lists them): `BIND_ADDRESS`,
 `SERVER_PORT`, `AMQP_PORT` (5672), `GATEWAY_PORT`, `MESH_NAME`,
 `MESH_AMQP_ENDPOINTS` (the broker addresses agents are given, default
 `amqp://localhost:<AMQP_PORT>/mesh`), `MESH_PUBLIC_URL`, `GATEWAY_PUBLIC_URL`,
-`GATEWAY_API_KEYS`, `SERVER_IMAGE` and `GATEWAY_IMAGE`.
+`GATEWAY_API_KEYS`, `SERVER_IMAGE` and `GATEWAY_IMAGE` (the images, by default
+the latest release, `ghcr.io/agent-messaging/agent-messaging-server:0.3.0` and
+`ghcr.io/agent-messaging/agent-messaging-a2a-gateway:0.3.0`).
+
+To upgrade, change the version in `compose.yaml` or set `SERVER_IMAGE` and `GATEWAY_IMAGE` to the new release's images, then run `docker compose pull && docker compose up -d` (back up first: [operator handbook, upgrading](../../../docs/operator-handbook.md#9-upgrading)).
 
 ## Using a Postgres you already run
 
@@ -45,6 +53,20 @@ server's tables in that database (they are named `ams_*`), so the user needs
 the right to create tables and functions there. The server applies the same
 schema at every start, which adds only what a new release brings. The bundled
 Postgres is not started, and its volume stays empty.
+
+## Running images built from this clone
+
+To work on the server or the gateway, add `compose.build.yaml`, which builds
+both images from this clone (tagged `agent-messaging-server:local` and
+`agent-messaging-a2a-gateway:local`) at every start:
+
+```sh
+docker compose -f compose.yaml -f compose.build.yaml up -d
+```
+
+`logs`, `exec` and `down` need no `-f`. A later `up` does, or it starts the
+released images again. With your own Postgres, add `-f compose.own-postgres.yaml`
+after the other two.
 
 ## After the first start
 

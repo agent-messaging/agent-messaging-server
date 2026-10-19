@@ -17,7 +17,10 @@ documents are changed here.
 1. Open a pull request here. CI (`.github/workflows/ci.yml`) typechecks and
    tests the server, the gateway and the SDK, checks the boundary
    (`tools/check-boundary.mjs`), and brings a mesh up from empty on each broker
-   to run the core conformance profile and every example against it.
+   to run the core conformance profile and every example against it. The
+   `compose (released images)` job (`.github/workflows/compose-e2e.yml`) starts
+   the NATS Compose setup on the released images it pins, without building,
+   and has two agents exchange signed messages on it.
 2. Merge it when CI is green. A merged change is not released yet.
 
 ## A release
@@ -43,8 +46,13 @@ without the other.
    with `read:packages`) lists them with `visibility: public`. A new package in an organization starts
    private; change it under the package's settings, or it can't be pulled
    without signing in.
-5. Write the GitHub release for the tag, then move the image pins in
-   `deploy/`, the README and `.env.example` to the new version.
+5. Write the GitHub release for the tag, then move the image pins to the new
+   version: both `deploy/compose/*/compose.yaml`, both
+   `deploy/kubernetes/*/mesh.yaml`, `README.md`, both
+   `deploy/compose/*/README.md` and both `deploy/compose/*/.env.example`. CI's
+   `compose (released images)` job checks that the Compose and Kubernetes pins
+   name the same version, and runs the Compose setup on the images it pins, as
+   someone who self-hosts would.
 
 **The move to the `agent-messaging` organization (2026-10-13).** Releases up to
 server 0.2.1 were published under `ghcr.io/jeffrschneider/`, and those images

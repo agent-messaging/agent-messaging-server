@@ -7,6 +7,8 @@ name: CI
 #   mesh      for each broker: the Compose setup brought up from empty (images
 #             built from this commit, first-run, broker, server, gateway), the
 #             core conformance profile against it with --ci, and every example
+# The Compose setup on the released images it pins, as someone who self-hosts
+# runs it, is compose-e2e.yml.
 on:
   push:
     branches: [main]
@@ -71,6 +73,12 @@ jobs:
       fail-fast: false
       matrix:
         broker: [nats, rabbitmq]
+    env:
+      # compose.yaml pins the released images. compose.build.yaml builds them
+      # from this commit instead, so this job tests this commit's code. The
+      # steps that run Compose do so in deploy/compose/<broker>, where these
+      # paths are.
+      COMPOSE_FILE: compose.yaml:compose.build.yaml
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
