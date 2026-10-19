@@ -2646,6 +2646,8 @@ export interface NamesRequests {
   confirm(input: NamesConfirmInput): Promise<NamesConfirmResult>;
 }
 
+// ── nda: Agent NDA ────────────────────────────────────────────────
+
 // ── owner: Owner ──────────────────────────────────────────────────
 
 /** What owner.ask() sends. */
@@ -5760,6 +5762,15 @@ export const REQUEST_TIERS: Readonly<Record<string, "core" | "platform">> = {
   "names.resolve": "core",
   "names.claim": "core",
   "names.confirm": "core",
+  "nda.offer": "platform",
+  "nda.accept": "platform",
+  "nda.sign": "platform",
+  "nda.amend": "platform",
+  "nda.terminate": "platform",
+  "nda.withdraw": "platform",
+  "nda.get": "platform",
+  "nda.list": "platform",
+  "nda.bound": "platform",
   "owner.ask": "platform",
   "pact.send": "platform",
   "pact.connect": "platform",
