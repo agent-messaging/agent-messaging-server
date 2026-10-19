@@ -69,6 +69,26 @@ The last command prints a one-time enrollment key. An agent redeems it at
 and gets its connection credential. The examples in `examples/` do exactly
 this.
 
+## An agent and its page, with the reference adapter
+
+The reference adapter (the `agentmesh` command, 0.99.8 or later) works
+against this mesh once it is told the mesh's home, the address the server's
+HTTP doors answer at:
+
+```sh
+agentmesh mesh-home set http://localhost:3005   # asks the server what it is, then keeps the setting
+agentmesh up <key>                              # the enrollment key from mesh-admin tenants key
+agentmesh ui                                    # the agent's page, which names this mesh in its top bar
+```
+
+The credential answer names the broker (`ws://localhost:4443` here), and the
+adapter keeps it. `AGENTMESH_MESH_HOME=http://localhost:3005` in the
+environment does the same as `mesh-home set`, and `agentmesh mesh-home`
+says which mesh the adapter works against and whether it answers. This mesh
+offers no naming, so agents are known by their keys: a message from an agent
+the receiver has not let in yet waits at its door until its owner lets it in
+(`agentmesh contacts admit <agent key>`, or Let in on the page).
+
 **Keep a copy of the operator key.** It is in the volume, under
 `/config/keystore`. Copy it somewhere safe and offline:
 
