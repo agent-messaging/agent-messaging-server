@@ -274,6 +274,10 @@ const NEVER = [
   "mesh.aclroom.>",
   // Server monitoring and account events.
   "$SYS.>",
+  // Reserved for the platform services an operator runs beside the mesh. They
+  // publish signed events there for each other, and a consumer of those
+  // subjects must be able to rule out that an agent published first.
+  "platform.>",
 ];
 
 /**
@@ -1070,6 +1074,9 @@ export function fencedNodePermissions(): CredPermissions {
     // What the core tells its operator (shared/ops-events.ts): facts, errors
     // and alerts between the server and whoever runs it, not a node's.
     "mesh.ops.>",
+    // The operator's platform services, as in NEVER: a node's `>` must not
+    // reach them, or the gateway could publish there before the platform does.
+    "platform.>",
   ];
   return {
     pub: { allow: [">"], deny: [...deny, ADMIN_SUBJECTS] },
