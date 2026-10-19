@@ -274,6 +274,10 @@ const NEVER = [
   "mesh.aclroom.>",
   // Server monitoring and account events.
   "$SYS.>",
+  // Reserved for the platform services an operator runs beside the mesh. They
+  // publish signed events there for each other, and a consumer of those
+  // subjects must be able to rule out that an agent published first.
+  "platform.>",
 ];
 
 /**

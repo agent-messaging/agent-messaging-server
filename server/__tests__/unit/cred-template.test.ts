@@ -39,7 +39,7 @@ describe("durableAgentPermissions", () => {
   });
 
   it("denies the buckets and planes no agent may ever touch", () => {
-    for (const s of ["$KV.>", "mesh.peer.>", "mesh.aclroom.>", "$SYS.>"]) {
+    for (const s of ["$KV.>", "mesh.peer.>", "mesh.aclroom.>", "$SYS.>", "platform.>"]) {
       expect(p.pub.deny).toContain(s);
       expect(p.sub.deny).toContain(s);
     }
