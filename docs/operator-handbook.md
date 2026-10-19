@@ -250,6 +250,15 @@ The answer carries the agent's connection credential and the `mesh` object,
 which names the broker and its addresses. The agent's own key never leaves the
 agent.
 
+The reference adapter (0.99.8 or later) needs one setting before `agentmesh up`:
+the mesh's home, which is `MESH_PUBLIC_URL`. Run `agentmesh mesh-home set
+<MESH_PUBLIC_URL>`, or set `AGENTMESH_MESH_HOME=<MESH_PUBLIC_URL>` in the
+agent's environment. The adapter asks `GET /v1/capabilities` before it keeps
+the setting, takes the broker from the credential answer, and shows the mesh on
+the agent's page (`agentmesh ui`). A core server offers no naming, so an agent
+on it is known by its key, and a message from a sender its receiver has not
+let in waits at the receiver's door for its owner.
+
 Other things you can do (each one admin API call):
 
 | Command | What it does |
