@@ -2547,8 +2547,8 @@ export interface MandateCheckInput {
   organization: string;
   /** The account of the person who would act. */
   account: string;
-  /** The act: form, amend or terminate a statement of work, award a request for work, or any act on an Agent NDA. */
-  power: "form" | "amend" | "terminate" | "award" | "nda";
+  /** The act: form, amend or terminate a statement of work, award a request for work, any act on an Agent NDA, or a change made through a resource the organization shares. */
+  power: "form" | "amend" | "terminate" | "award" | "nda" | "write";
   /** The mandate the act cites. Only that mandate is then checked. */
   mandate?: string;
   /** The public key the act was signed with. Check 1 fails when it is not the mandate's holder key. */
