@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { durableAgentPermissions, assertNarrow, nodePermissions, assertNarrowNode, sandboxPermissions, assertNarrowSandbox, type CredPermissions } from "../../src/keychain/cred-template.js";
+import { durableAgentPermissions, assertNarrow, nodePermissions, assertNarrowNode, sandboxPermissions, assertNarrowSandbox, fencedNodePermissions, jobWorkerPermissions, type CredPermissions } from "../../src/keychain/cred-template.js";
 import { inboxStreamName } from "../../src/registry/inbox-buffer.js";
 import { ArtifactSubjects } from "../../src/artifacts/artifacts-service.js";
 
@@ -487,5 +487,24 @@ describe("assertNarrowSandbox", () => {
     const p = sandboxPermissions(POOL);
     p.sub.deny = p.sub.deny.filter((s) => s !== "$JS.>");
     expect(() => assertNarrowSandbox(p, POOL)).toThrow(/sub\.deny is missing "\$JS\.>"/);
+  });
+});
+
+describe("platform.> is out of reach of every credential the server mints for something it does not run", () => {
+  // The operator's platform services publish signed events there for each
+  // other. Deny wins in NATS, so a deny holds even beside an allow of `>`.
+  const denies = (p: CredPermissions) => p.pub.deny?.includes("platform.>") && p.sub.deny?.includes("platform.>");
+
+  it("is denied to an agent's durable credential, a node's, a sandbox guest's and a job worker's", () => {
+    expect(denies(durableAgentPermissions(KEY))).toBe(true);
+    expect(denies(nodePermissions(KEY, [KEY, OTHER]))).toBe(true);
+    expect(denies(sandboxPermissions(KEY))).toBe(true);
+    expect(denies(jobWorkerPermissions(KEY))).toBe(true);
+  });
+
+  it("is denied to the fenced node (the A2A gateway), whose allow list is everything", () => {
+    const p = fencedNodePermissions();
+    expect(p.pub.allow).toContain(">");
+    expect(denies(p)).toBe(true);
   });
 });
