@@ -3,6 +3,7 @@ import { createEnvelope, Subjects, TERMINAL_STATES } from "../sdk.js";
 import { idOf, sealEnvelope, type ServiceIdentity } from "../shared/handler.js";
 import { keyedOf, type KeyedLike, type KeyedStore, type StorageLike } from "../storage/index.js";
 import { deadlinePassed, type BudgetTask, type BudgetEnvelope } from "./budget.js";
+import { rewriteTask } from "./task-write.js";
 
 /** Same cadence as the presence sweep (registry/heartbeat-monitor.ts). A
  *  deadline is second-granularity under a five-minute skew tolerance (§7.7,
@@ -100,11 +101,20 @@ export class OverdueSweep {
       if (!deadline) continue; // no deadline axis — nothing the mesh can enforce (§7.7)
       if (!deadlinePassed(deadline, nowMs)) continue;
 
-      // The mark: a flag and a timestamp, no state change.
-      task.overdue = true;
-      task.overdue_at = new Date(nowMs).toISOString();
-      task.updated_at = task.overdue_at;
-      await this.kv.put(key, new TextEncoder().encode(JSON.stringify(task)));
+      // The mark: a flag and a timestamp, no state change. Written against the
+      // record as stored now (task-write.ts), not the snapshot copy, so an
+      // update or an attached origin since the snapshot is kept, and a task
+      // that finished or was marked meanwhile is left alone.
+      const at = new Date(nowMs).toISOString();
+      const written = await rewriteTask<BudgetTask>(this.kv, key, (current) => {
+        if (TERMINAL_STATES.has(current.state) || current.overdue) return false;
+        current.overdue = true;
+        current.overdue_at = at;
+        current.updated_at = at;
+        return true;
+      });
+      if (!written) continue;
+      task = written;
 
       // Notify the requester via a task update (§7.7): this service's
       // signature, the task's own update subject — the one the requester's

@@ -76,6 +76,35 @@ where its work did.
   to a second late.
 - Inbox replies are unchanged. Usage receipts stay on the inbox reply only.
 
+Types and readers for two Task record fields the server now writes (server
+0.4.2). Nothing the SDK sends changes.
+
+- **`Task.origin` (`TaskOrigin`).** The request that created the Task, as the
+  server observed it routing that request: `request_id` (the id answer-derived
+  meter events carry as `request_id`), `requester`, `responder`, `offering`,
+  `observed_at` and `bound_by` (`"request"` or `"answer"`). Never taken from a
+  task update, never replaced, and kept outside `history`, so the history cap
+  cannot drop it. Absent when the server did not observe the request.
+  Optional `contested_by` (request ids, at most 256, append-only, terminal
+  Tasks included), `contested_overflow` and `contested_overflow_since` list
+  every other request the server saw answered with the Task's id (a genuine
+  resume aside): the first binding stands, and a consumer refunding the origin
+  refunds those too. On a Task with no origin, the same three fields sit on
+  the Task itself (the record's own requester's requests only). Another
+  asker's requests, when the record names a different requester, are kept
+  per asker in `contested_by_asker`, beside `origin_mismatch: { requester }`.
+  A request is tied to a Task only by the provider's answer carrying it.
+  `taskContestsOf(task)` reads the record-level fields strictly; a malformed
+  contest field is dropped on its own, never the origin around it.
+- **`Task.canceled_by` (`TaskCanceledBy`).** On a canceled Task: `party`
+  (`"requester"` or `"responder"`, whoever signed the canceled update, whatever
+  reason it gave), `requester_request` (the cancel the server observed from the
+  original requester, its own update or a `task.cancel` request, with when it
+  saw it, or `null`), and `at`.
+- **`taskOriginOf(record)` and `taskCanceledByOf(record)`** read the two fields
+  strictly and return null for anything short of the shape. Pinned by
+  `conformance/task-origin.json`.
+
 ## 0.62.2 (2026-10-20)
 
 A fix to the funds-hold admission gate. Nothing else changes.

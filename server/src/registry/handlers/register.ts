@@ -384,6 +384,22 @@ export async function handleRegister(
   // above, so everything stamped here is well-formed and the agent's own.
   manifest = withEndpoints(manifest);
 
+  // Task origins (task-manager/origin.ts) are observed on
+  // `mesh.agent.*.inbox` only. An agent whose inbox endpoint is anywhere else
+  // (legal: the endpoint need only be its own) is reached somewhere the origin
+  // tap never looks, so its Tasks will carry no `origin`. A scoped credential
+  // can only publish to `mesh.agent.*.inbox`, so this matters on meshes whose
+  // senders hold wider ones (a fenced node, an unscoped dev mesh). Said once
+  // per registration, so it is visible.
+  const inboxEndpoint = (manifest.endpoints as { inbox?: unknown } | undefined)?.inbox;
+  if (typeof inboxEndpoint === "string" && inboxEndpoint !== `mesh.agent.${manifest.id}.inbox`) {
+    console.warn(
+      `[registry] ${String(manifest.id).slice(0, 12)}… registered inbox endpoint ${inboxEndpoint}, outside ` +
+        `mesh.agent.*.inbox: its Tasks will carry no origin (task-manager/origin.ts)`,
+    );
+    metrics.event({ kind: "task_origin", status: "endpoint_outside_inbox", actor: manifest.id, meta: { inbox: inboxEndpoint } });
+  }
+
   // §8.5.2: an offering's `reporting` is the one declaration validated rather
   // than refused or passed through — a closed vocabulary feeding an integer
   // comparison. Unknown level, malformed cadence, check_ins without `every`,

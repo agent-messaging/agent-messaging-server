@@ -46,7 +46,7 @@ export type {
   Reachability,
 } from "../../sdk-typescript/src/types/manifest.js";
 
-export type { Task, TaskState } from "../../sdk-typescript/src/types/task.js";
+export type { Task, TaskState, TaskOrigin, TaskCanceledBy } from "../../sdk-typescript/src/types/task.js";
 export {
   isValidTransition,
   TERMINAL_STATES,
