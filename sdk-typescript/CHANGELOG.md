@@ -36,13 +36,17 @@ where its work did.
   id a request named.
 - **A Task still working is not resumable.** A requester naming its own
   deferred Task gets new work under a new id, not a second handler on the
-  same Task.
+  same Task. A resume claims its pause when it arrives, before admission, so
+  of two resumes a moment apart only the first resumes the Task.
 - **A request naming a Task nobody has recorded** (a `requestStream` id) runs
   as ordinary work, so a stream that falls through to a plain handler and
   answers at once still creates no Task, no receipt and no meter events. When
-  the record cannot be read (the task manager is slow or down), the request
-  runs as ordinary work under a new id rather than being refused. "No record"
-  answers are remembered for 30 seconds.
+  the record cannot be read (the task manager is slow or down, or takes over
+  a second, the cap on this read), the request is not refused: a streaming
+  request runs under the requester's own id, so its chunks and its end reach
+  the requester, but nothing is recorded on that id until a later read shows
+  it has no record or is this requester's; any other request runs under a new
+  id. "No record" answers are remembered for 30 seconds.
 - **A stream that resumes a paused Task records `working` first**, so its
   ending is a legal step on the record.
 - **Only a Task's requester cancels it.** An inbound `task.cancel` is taken

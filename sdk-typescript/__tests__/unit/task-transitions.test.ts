@@ -471,21 +471,170 @@ describe("a remembered pause is a hint", () => {
 });
 
 describe("a slow or absent task manager", () => {
-  it("a stream naming an id nobody remembers still runs, under a new id, when the record cannot be read", async () => {
+  /** One broker for several agents: callback and iterable subscriptions, a
+   *  registry that registers, and a task manager whose record reads hang
+   *  until the caller's timeout while it is `down`. */
+  function makeBus(records: Records) {
+    type M = { subject: string; data: Uint8Array; reply?: string; respond: () => boolean };
+    const cbs = new Map<string, Set<(m: M) => void>>();
+    const raws = new Map<string, Set<(m: M) => void>>();
+    const registryKp = nkeys.createUser();
+    const published: { subject: string; data: Uint8Array }[] = [];
+    const taskManager = { down: true, reads: 0 };
+    const fanOut = (subject: string, data: Uint8Array, reply?: string) => {
+      const m: M = { subject, data, reply, respond: () => true };
+      for (const cb of cbs.get(subject) ?? []) cb(m);
+      for (const push of raws.get(subject) ?? []) push(m);
+    };
+    const add = <T,>(map: Map<string, Set<T>>, subject: string, v: T) => {
+      if (!map.has(subject)) map.set(subject, new Set());
+      map.get(subject)!.add(v);
+      return () => map.get(subject)?.delete(v);
+    };
+    const answer = (req: Envelope, body: Partial<Envelope>) => ({
+      data: encode(signEnvelope(createEnvelope({ type: "respond", from: registryKp.getPublicKey(), to: req.from, in_reply_to: req.id, ...body }), registryKp)),
+    });
+    const conn = () => ({
+      publish: (subject: string, data: Uint8Array) => {
+        published.push({ subject, data });
+        fanOut(subject, data);
+      },
+      request: (subject: string, data: Uint8Array, opts?: { timeout?: number }) => {
+        const req = decodeUnverified(data);
+        if (subject.startsWith("mesh.task.get.")) {
+          taskManager.reads++;
+          const id = subject.slice("mesh.task.get.".length);
+          if (taskManager.down) {
+            return new Promise((_, reject) => setTimeout(() => reject(new Error("TIMEOUT")), opts?.timeout ?? 10_000));
+          }
+          const record = records.get(id);
+          return Promise.resolve(
+            answer(req, record ? { payload: { id, ...record } } : { error: { code: "TASK_NOT_FOUND", message: "not found", retryable: false } }),
+          );
+        }
+        if (cbs.has(subject) && cbs.get(subject)!.size > 0) {
+          // An agent's inbox: delivered, and the live wait answers at the
+          // requester's own inbox, never here.
+          fanOut(subject, data, "_INBOX.bus");
+          return new Promise(() => {});
+        }
+        return Promise.resolve(answer(req, { payload: { status: "registered" } }));
+      },
+      subscribe: (subject: string, cb: (m: M) => void) => {
+        const off = add(cbs, subject, cb);
+        return { unsubscribe: off, drain: async () => off() };
+      },
+      raw: {
+        publish: (subject: string, data: Uint8Array) => fanOut(subject, data),
+        subscribe: (subject: string) => {
+          const queue: M[] = [];
+          let wake: (() => void) | undefined;
+          let closed = false;
+          const off = add(raws, subject, (m: M) => {
+            queue.push(m);
+            wake?.();
+          });
+          return {
+            unsubscribe: () => {
+              closed = true;
+              off();
+              wake?.();
+            },
+            async *[Symbol.asyncIterator]() {
+              while (!closed) {
+                if (queue.length) {
+                  yield queue.shift()!;
+                  continue;
+                }
+                await new Promise<void>((r) => (wake = r));
+              }
+            },
+          };
+        },
+      },
+      drain: async () => {},
+      close: async () => {},
+      get isClosed() {
+        return false;
+      },
+    });
+    return { conn, published, taskManager };
+  }
+
+  async function streamPair(records: Records) {
+    const bus = makeBus(records);
+    const provider = AgentMesh.withConnection(bus.conn() as unknown as ConnectionManager, nkeys.createUser(), nkeys.createUser(), {});
+    openAgents.push(provider);
+    provider.onStreamRequest("stream", async (_input, _ctx, writer) => {
+      writer.write("a");
+      writer.write("b");
+      writer.end("done");
+    });
+    await provider.register({ name: "streamer" });
+    const caller = AgentMesh.withConnection(bus.conn() as unknown as ConnectionManager, nkeys.createUser(), nkeys.createUser(), {});
+    openAgents.push(caller);
+    return { bus, provider, caller };
+  }
+
+  const readAll = async (chunks: AsyncIterable<{ data: unknown; final: boolean }>) => {
+    const got: { data: unknown; final: boolean }[] = [];
+    for await (const c of chunks) {
+      got.push({ data: c.data, final: c.final });
+      if (c.final) break;
+    }
+    return got;
+  };
+
+  it("a requestStream caller still gets every chunk and the end when the record cannot be read, and nothing is recorded", async () => {
+    const { bus, provider, caller } = await streamPair(new Map());
+    const started = Date.now();
+    const s = await caller.requestStream(provider.agentId, "stream", {}, { timeout_ms: 8_000 });
+    // The record read is capped on the dispatch path: about a second, not ten.
+    expect(Date.now() - started).toBeLessThan(3_000);
+    expect(bus.taskManager.reads).toBeGreaterThan(0);
+    expect(await readAll(s.chunks)).toEqual([
+      { data: "a", final: false },
+      { data: "b", final: false },
+      { data: "done", final: true },
+    ]);
+    await sleep(200);
+    // The id could not be checked, so nothing is recorded on it.
+    expect(bus.published.some((p) => p.subject === Subjects.taskUpdate(s.task_id))).toBe(false);
+  }, 15_000);
+
+  it("once a later read clears the id, the stream's completion is recorded on it", async () => {
+    const { bus, provider, caller } = await streamPair(new Map());
+    const s = await caller.requestStream(provider.agentId, "stream", {}, { timeout_ms: 8_000 });
+    bus.taskManager.down = false; // the task manager is back: the id has no record, so it is nobody else's
+    expect((await readAll(s.chunks)).at(-1)).toEqual({ data: "done", final: true });
+    await vi.waitFor(() => expect(bus.published.some((p) => p.subject === Subjects.taskUpdate(s.task_id))).toBe(true), { timeout: 5_000 });
+  }, 15_000);
+
+  it("a later read that shows somebody else's Task records nothing on it", async () => {
     const records: Records = new Map();
-    const { conn, agent } = await responder(() => 1, undefined, { records });
+    const { bus, provider, caller } = await streamPair(records);
+    const s = await caller.requestStream(provider.agentId, "stream", {}, { timeout_ms: 8_000 });
+    records.set(s.task_id, { requester: nkeys.createUser().getPublicKey(), responder: provider.agentId, state: "input_required" });
+    bus.taskManager.down = false;
+    expect((await readAll(s.chunks)).at(-1)).toEqual({ data: "done", final: true });
+    await sleep(1_500);
+    expect(bus.published.some((p) => p.subject === Subjects.taskUpdate(s.task_id))).toBe(false);
+  }, 15_000);
+
+  it("a plain request naming an id it cannot check runs under a new id", async () => {
+    const records: Records = new Map();
+    const { conn, agent } = await responder(async () => { await sleep(60); return 1; }, 20, { records });
     conn.taskManager.down = true;
     const kp = nkeys.createUser();
-    const X = "requester-made-while-down";
-    deliver(conn, agent.agentId, kp, { offering: "stream", input: { step: "end" }, config: { stream: true } }, X);
-    await sleep(200);
-    const replies = repliesTo(conn, kp.getPublicKey());
-    expect(replies.some((e) => e.error)).toBe(false);
-    const opened = replies.find((e) => (e.payload as RespondPayload | undefined)?.status === "working");
-    expect(opened?.task_id).toBeTruthy();
-    expect(opened!.task_id).not.toBe(X);
+    const X = "named-while-down";
+    deliver(conn, agent.agentId, kp, { offering: "work", input: {} }, X);
+    await sleep(400);
     expect(updates(conn, X)).toEqual([]);
-    expect(statuses(updates(conn, opened!.task_id!))).toEqual(["completed"]);
+    expect(repliesTo(conn, kp.getPublicKey()).some((e) => e.error)).toBe(false);
+    const U = taskIdOf(conn, kp.getPublicKey());
+    expect(U).toBeTruthy();
+    expect(U).not.toBe(X);
+    expect(statuses(updates(conn, U!))).toEqual(["working", "completed"]);
   });
 
   it("'no record' is remembered briefly: two cancels for an unknown id read the record once", async () => {
@@ -548,5 +697,25 @@ describe("only a Task's requester cancels it", () => {
     await sleep(150);
     expect(repliesTo(conn, strangerKp.getPublicKey())[0]?.error?.code).toBe("UNAUTHORIZED");
     expect((repliesTo(conn, buyerKp.getPublicKey())[0]?.payload as RespondPayload | undefined)?.status).toBe("canceled");
+  });
+});
+
+describe("two resumes of one pause, a moment apart", () => {
+  it("only the first resumes the Task; the second is new work", async () => {
+    let calls = 0;
+    const { conn, agent, buyerKp, buyer } = await pausing(async () => {
+      calls++;
+      await sleep(80);
+      return { n: calls };
+    }, 20);
+    deliver(conn, agent.agentId, buyerKp, { offering: "work", input: {} });
+    await vi.waitFor(() => expect(taskIdOf(conn, buyer)).toBeTruthy());
+    const T = taskIdOf(conn, buyer)!;
+    deliver(conn, agent.agentId, buyerKp, { offering: "work", input: { step: "resume" } }, T);
+    deliver(conn, agent.agentId, buyerKp, { offering: "work", input: { step: "resume" } }, T);
+    await sleep(500);
+    const onT = statuses(updates(conn, T));
+    expect(onT).toEqual(["input_required", "working", "completed"]);
+    expect(replay(onT).refused).toEqual([]);
   });
 });

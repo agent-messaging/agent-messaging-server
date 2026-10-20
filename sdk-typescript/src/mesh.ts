@@ -193,6 +193,8 @@ import {
   TASK_RECORD_RECHECK_MS,
   TASK_RECORD_POLL_MAX_MS,
   TASK_RECORD_POLL_FIRST_MS,
+  DISPATCH_RECORD_TIMEOUT_MS,
+  UNCONFIRMED_TASK_READS,
 } from "./constants.js";
 import { fenceInboundInput, inboundTextLength } from "./internal/fence.js";
 import { cardText, fitCheck, inputNotUnderstood, isHelpQuestion, offeringsFromManifest } from "./input-fit.js";
@@ -622,6 +624,12 @@ export class AgentMesh {
   private readonly dispatchOwners = new ResumableTasks();
   /** Task ids the task manager recently had no record of. */
   private readonly noRecord = new NoRecordCache();
+  /** Stream task ids whose record could not be read at dispatch: nothing is
+   *  recorded on them until a re-read clears them (publishTaskUpdate). */
+  private readonly unconfirmedTasks = new Map<
+    string,
+    { requester: string; verdict: "pending" | "ours" | "theirs"; chain: Promise<void> }
+  >();
   /** The §13.5 usage-receipt ledger: declared meter reports accumulated per
    *  task until the terminal respond attaches them as `payload.usage`. */
   private meterUsage = new MeterUsageLedger();
@@ -6234,8 +6242,50 @@ export class AgentMesh {
     });
     const encoded = encode(updateEnv);
     this.noteResumable(taskId, requestEnv, body.payload.status);
-    this.conn.publish(Subjects.taskUpdate(taskId), encoded);
+    this.publishTaskUpdate(taskId, encoded);
     if (opts.outbox !== false) this.conn.publish(Subjects.agentOutbox(this.agentId), encoded);
+  }
+
+  /**
+   * Publish one statement this agent makes as a dispatch's RESPONDER on the
+   * Task's update subject, where the task manager records it.
+   *
+   * A stream that names a task id this agent could not check (the record read
+   * failed or timed out, resolveDispatchTask) runs under that id, because the
+   * requester listens only on that id's channels; but nothing may be recorded
+   * on the id until a later read says it is nobody else's Task. So while the
+   * id is `unconfirmedTasks`, statements queue (in order) behind a re-read:
+   * no record, or a record naming this requester and this agent, releases
+   * them; a record that is somebody else's drops them, and every later one.
+   * Chunks and the stream's end ride the stream subject and never wait.
+   */
+  private publishTaskUpdate(taskId: string, encoded: Uint8Array): void {
+    const pending = this.unconfirmedTasks.get(taskId);
+    if (!pending) {
+      this.conn.publish(Subjects.taskUpdate(taskId), encoded);
+      return;
+    }
+    pending.chain = pending.chain.then(async () => {
+      if (pending.verdict === "pending") pending.verdict = await this.confirmTaskId(taskId, pending.requester);
+      if (pending.verdict === "ours") this.conn.publish(Subjects.taskUpdate(taskId), encoded);
+    });
+  }
+
+  /** Whether an unconfirmed task id is free for `requester`'s work here: a few
+   *  record reads, a second apart; still unreadable after them, it is treated
+   *  as not ours (nothing recorded beats something recorded on a stranger). */
+  private async confirmTaskId(taskId: string, requester: string): Promise<"ours" | "theirs"> {
+    for (let attempt = 0; attempt < UNCONFIRMED_TASK_READS; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, DISPATCH_RECORD_TIMEOUT_MS));
+      const seen = await this.readTaskParties(taskId, DISPATCH_RECORD_TIMEOUT_MS);
+      if (seen.kind === "unreadable") continue;
+      const ours =
+        seen.kind === "none" ||
+        (seen.kind === "record" && seen.requester === requester && seen.responder === this.agentId);
+      if (ours) this.unconfirmedTasks.delete(taskId);
+      return ours ? "ours" : "theirs";
+    }
+    return "theirs";
   }
 
   /** Keep `resumableTasks` in step with what this agent records on a Task: a
@@ -6258,6 +6308,7 @@ export class AgentMesh {
    *  not read, so somebody else's. `unreadable`: no answer that says either. */
   private async readTaskParties(
     taskId: string,
+    timeoutMs: number = TASK_RECORD_TIMEOUT_MS,
   ): Promise<
     | { kind: "record"; requester: string; responder: string; state: unknown; offering: string }
     | { kind: "none" }
@@ -6267,7 +6318,7 @@ export class AgentMesh {
     if (this.noRecord.has(taskId)) return { kind: "none" };
     let record: { requester?: unknown; responder?: unknown; state?: unknown; offering?: unknown } | undefined;
     try {
-      record = (await this.serviceRequest(Subjects.taskGet(taskId), { task_id: taskId }, TASK_RECORD_TIMEOUT_MS)) as typeof record;
+      record = (await this.serviceRequest(Subjects.taskGet(taskId), { task_id: taskId }, timeoutMs)) as typeof record;
     } catch (err) {
       const code = err instanceof MeshError ? err.code : undefined;
       if (code === ErrorCode.TASK_NOT_FOUND || code === ErrorCode.NOT_FOUND) {
@@ -6315,7 +6366,8 @@ export class AgentMesh {
    */
   private async resolveDispatchTask(
     env: Envelope,
-  ): Promise<{ kind: "fresh" | "resume"; taskId: string } | { kind: "refuse"; error: ErrorObject }> {
+    stream = false,
+  ): Promise<{ kind: "fresh" | "resume"; taskId: string; unconfirmed?: boolean } | { kind: "refuse"; error: ErrorObject }> {
     const named = env.task_id;
     if (named === undefined) return { kind: "fresh", taskId: uuid7() };
     const notYours: ErrorObject = {
@@ -6328,30 +6380,48 @@ export class AgentMesh {
     const known = this.resumableTasks.get(named);
     if (known) {
       if (known.requester !== env.from) return { kind: "refuse", error: notYours };
-      if (Date.now() - known.rememberedAt < RESUME_HINT_FRESH_MS) return { kind: "resume", taskId: named };
+      // A resume CLAIMS the pause, here and before admission: a second resume
+      // arriving a moment later finds nothing paused and is new work, so two
+      // handlers never run on one Task.
+      if (Date.now() - known.rememberedAt < RESUME_HINT_FRESH_MS) {
+        this.resumableTasks.forget(named);
+        return { kind: "resume", taskId: named };
+      }
       // An older pause is a hint: the Task may have ended where this agent
       // could not see it (a cancel through the task manager, the overdue
       // sweep). The record says; when it cannot be read, the hint stands.
-      const seen = await this.readTaskParties(named);
-      if (seen.kind === "unreadable") return { kind: "resume", taskId: named };
+      const seen = await this.readTaskParties(named, DISPATCH_RECORD_TIMEOUT_MS);
+      if (seen.kind === "unreadable") {
+        this.resumableTasks.forget(named);
+        return { kind: "resume", taskId: named };
+      }
       if (seen.kind === "not_party") return { kind: "refuse", error: notYours };
       if (seen.kind === "record" && (seen.requester !== env.from || seen.responder !== this.agentId)) {
         return { kind: "refuse", error: notYours };
       }
-      if (seen.kind === "record" && seen.state === "input_required") {
-        this.resumableTasks.remember(named, env.from, known.offering);
-        return { kind: "resume", taskId: named };
-      }
       this.resumableTasks.forget(named);
+      if (seen.kind === "record" && seen.state === "input_required") return { kind: "resume", taskId: named };
       return { kind: "fresh", taskId: uuid7() };
     }
 
-    // Not paused here. A dispatch this agent ran under the id says whose it is.
+    // Not paused here. A dispatch this agent ran under the id says whose it
+    // is; its own requester's Task goes to the record, which says whether it
+    // is still paused (a resume that admission refused gave up its claim).
     const owner = this.dispatchOwners.get(named);
-    if (owner) return owner.requester === env.from ? { kind: "fresh", taskId: uuid7() } : { kind: "refuse", error: notYours };
+    if (owner) {
+      if (owner.requester !== env.from) return { kind: "refuse", error: notYours };
+      // This agent already ran work under the id, so it is never fresh again:
+      // a resume when the record shows it paused, new work under a new id
+      // otherwise (still working, ended, or no word from the task manager).
+      const mine = await this.readTaskParties(named, DISPATCH_RECORD_TIMEOUT_MS);
+      if (mine.kind === "record" && mine.requester === env.from && mine.responder === this.agentId && mine.state === "input_required") {
+        return { kind: "resume", taskId: named };
+      }
+      return { kind: "fresh", taskId: uuid7() };
+    }
 
     // Unknown here: the Task's record (§7.4) carries both parties.
-    const seen = await this.readTaskParties(named);
+    const seen = await this.readTaskParties(named, DISPATCH_RECORD_TIMEOUT_MS);
     switch (seen.kind) {
       // No record: nobody's Task. Ordinary work, under the id the requester chose.
       case "none":
@@ -6359,17 +6429,17 @@ export class AgentMesh {
       // A record this agent is not a party to: somebody else's Task.
       case "not_party":
         return { kind: "refuse", error: notYours };
-      // Could not tell: ordinary work under a new id, so a slow or absent task
-      // manager does not stop work (or streams), and nothing lands on a Task
-      // that might be somebody else's.
+      // Could not tell (no answer within DISPATCH_RECORD_TIMEOUT_MS), so a
+      // slow or absent task manager does not stop work, and nothing lands on
+      // a Task that might be somebody else's. A STREAM runs under the
+      // requester's own id, because its requester listens only on that id's
+      // channels, with nothing recorded on it until a later read clears it
+      // (publishTaskUpdate). Anything else runs under a new id.
       case "unreadable":
-        return { kind: "fresh", taskId: uuid7() };
+        return stream ? { kind: "fresh", taskId: named, unconfirmed: true } : { kind: "fresh", taskId: uuid7() };
     }
     if (seen.requester !== env.from || seen.responder !== this.agentId) return { kind: "refuse", error: notYours };
-    if (seen.state === "input_required") {
-      this.resumableTasks.remember(named, env.from, seen.offering);
-      return { kind: "resume", taskId: named };
-    }
+    if (seen.state === "input_required") return { kind: "resume", taskId: named };
     // The requester's own Task, but not paused (still working, or ended): new
     // work under a new id, so nothing lands on a record that cannot take it.
     return { kind: "fresh", taskId: uuid7() };
@@ -6389,7 +6459,7 @@ export class AgentMesh {
     };
     const owner = this.dispatchOwners.get(taskId) ?? this.resumableTasks.get(taskId);
     if (owner) return owner.requester === from ? { kind: "requester" } : { kind: "refuse", error: notYours };
-    const seen = await this.readTaskParties(taskId);
+    const seen = await this.readTaskParties(taskId, DISPATCH_RECORD_TIMEOUT_MS);
     switch (seen.kind) {
       case "none":
         return { kind: "nothing" };
@@ -6865,7 +6935,7 @@ export class AgentMesh {
     // paused work for this same requester (resolveDispatchTask): a task id is
     // public, and naming one is not owning it. Before admission, so a refused
     // request places no hold and gets no accept.
-    const resolved = await this.resolveDispatchTask(env);
+    const resolved = await this.resolveDispatchTask(env, reqPayload.config?.stream === true);
     if (resolved.kind === "refuse") {
       const refuseEnv = this.newEnvelope({
         type: "respond",
@@ -6885,6 +6955,9 @@ export class AgentMesh {
     // taken (cancelStanding), and whose later request naming it is its own.
     this.dispatchOwners.remember(dispatchTaskId, env.from, reqPayload.offering);
     this.noRecord.delete(dispatchTaskId);
+    if (resolved.kind === "fresh" && resolved.unconfirmed) {
+      this.unconfirmedTasks.set(dispatchTaskId, { requester: env.from, verdict: "pending", chain: Promise.resolve() });
+    }
 
     // ── §7.7 admission, then the §6.4a accept ──────────────────────────
     // Everything §22 refuses has been refused above. What remains before the
@@ -7421,7 +7494,7 @@ export class AgentMesh {
           payload: { status: "input_required", message: err.message, problems: err.problems, ...this.trialMark(ctx.taskId) },
         });
         this.noteResumable(ctx.taskId, env, "input_required");
-        this.conn.publish(Subjects.taskUpdate(ctx.taskId), encode(recordEnv));
+        this.publishTaskUpdate(ctx.taskId, encode(recordEnv));
         this.sendRespond(msg, env, encode(pauseEnv), { transportReply: viaReply, tap: true });
         return;
       }
@@ -8119,6 +8192,9 @@ export class AgentMesh {
     // Step 2: Create StreamWriter. It signs the final chunk (always, §11.6)
     // and every chunk when the requester asked via config.sign_chunks.
     const writer = createStreamWriter(this.conn, {
+      // The completion update goes the way every responder statement does,
+      // so an unconfirmed id records nothing until it is cleared.
+      publishUpdate: (bytes) => this.publishTaskUpdate(taskId, bytes),
       agentId: this.agentId,
       requesterId: env.from,
       requestId: env.id,
@@ -8182,7 +8258,7 @@ export class AgentMesh {
           trace: childSpan(env.trace),
           payload: { status: "failed", ...this.trialMark(taskId) },
         });
-        this.conn.publish(Subjects.taskUpdate(taskId), encode(failEnv));
+        this.publishTaskUpdate(taskId, encode(failEnv));
       }
     }
   }

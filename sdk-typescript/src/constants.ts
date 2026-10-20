@@ -63,6 +63,13 @@ export const MAX_MAILBOX_AGE_MS = 7 * 24 * 60 * 60_000;
 /** How long one read of a Task's durable record (`mesh.task.get.<id>`, §7.4)
  *  may take before it counts as unanswered. */
 export const TASK_RECORD_TIMEOUT_MS = 10_000;
+/** The same read on a RESPONDER's dispatch path (is this task id the
+ *  requester's own?), where it sits in front of every stream's start: a
+ *  slower answer counts as unreadable. */
+export const DISPATCH_RECORD_TIMEOUT_MS = 1_000;
+/** How many reads (a DISPATCH_RECORD_TIMEOUT_MS apart) clear an unconfirmed
+ *  stream task id before anything is recorded on it. */
+export const UNCONFIRMED_TASK_READS = 3;
 /** After a deferred Task's update subscription goes live and the first record
  *  read finds it still running, when the one later read happens. It covers a
  *  terminal update the task manager had not stored yet at the first read. */

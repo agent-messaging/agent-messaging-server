@@ -35,6 +35,10 @@ export interface StreamWriterParams {
   /** The work was admitted as a trial (Common Agent 7.7): the completion
    *  task update says `trial: true` so the platform gives it a trial receipt. */
   trial?: boolean;
+  /** Publishes the completion task update (default: straight to the task's
+   *  update subject). The responder routes it so that an id it could not yet
+   *  check records nothing (AgentMesh.publishTaskUpdate). */
+  publishUpdate?: (encoded: Uint8Array) => void;
 }
 
 /** Create a StreamWriter that publishes chunks to the stream subject. */
@@ -130,7 +134,8 @@ export function createStreamWriter(
         }),
       );
 
-      conn.publish(Subjects.taskUpdate(params.taskId), encode(updateEnv));
+      if (params.publishUpdate) params.publishUpdate(encode(updateEnv));
+      else conn.publish(Subjects.taskUpdate(params.taskId), encode(updateEnv));
     },
   };
 
