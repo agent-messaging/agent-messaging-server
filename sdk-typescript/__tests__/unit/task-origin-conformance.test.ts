@@ -122,6 +122,13 @@ describe("record-level contests", () => {
     })).toEqual({ contested_by_asker: { U1: { contested_by: ["a"] }, U3: { contested_by: ["b"], contested_overflow: 2 } } });
   });
 
+  it("reads the asker overflow, and drops a malformed one on its own", () => {
+    expect(taskContestsOf({ askers_overflow: 3, askers_overflow_since: "2026-10-20T09:00:00.000Z" })).toEqual({
+      askers_overflow: 3, askers_overflow_since: "2026-10-20T09:00:00.000Z",
+    });
+    expect(taskContestsOf({ askers_overflow: -1, contested_by: ["a"] })).toEqual({ contested_by: ["a"] });
+  });
+
   it("is null for a record with none", () => {
     expect(taskContestsOf({})).toBeNull();
     expect(taskContestsOf(null)).toBeNull();

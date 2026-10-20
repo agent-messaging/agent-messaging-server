@@ -170,6 +170,28 @@ export type Observation =
    *  request: refused, and listed in that origin's `contested_by`. */
   | "contested";
 
+/** An origin from an observed request. */
+function originOf(rec: ObservedRequest, by: TaskOrigin["bound_by"]): TaskOrigin {
+  return {
+    request_id: rec.request_id,
+    requester: rec.requester,
+    responder: rec.responder,
+    offering: rec.offering,
+    observed_at: rec.observed_at,
+    bound_by: by,
+  };
+}
+
+/** How many other askers a record lists; the rest are counted. */
+export const MAX_ASKERS = 64;
+
+/** The askers index for one Task: who the provider answered with its id. */
+export interface Askers {
+  requesters: string[];
+  askers_overflow?: number;
+  askers_overflow_since?: string;
+}
+
 /** One `task.cancel` request as the tap saw it. */
 export interface ObservedCancel {
   v: 1;
@@ -420,18 +442,45 @@ export class OriginLedger {
    * itself ("request", a stream) or the answer chose it ("answer").
    */
   private async bind(rec: ObservedRequest, taskId: string, by: TaskOrigin["bound_by"]): Promise<Observation> {
-    // A genuine resume: a non-stream request naming a Task whose record
-    // already existed when it was seen, answered under that Task. It neither
-    // binds nor contests, however old the Task is. A stream request answered
-    // under the Task it named is never a resume (a stream creates its Task id).
     const existing = await read<TaskParties>(this.tasks, taskId);
-    if (by === "request" && !rec.stream && existing !== null) return "recorded";
-
-    await this.noteAsker(rec.responder, taskId, rec.requester);
     const key = taskBindingKey(rec.requester, rec.responder, taskId);
 
-    // Seen well after the Task already existed: it did not create the Task,
-    // so it is evidence (unless it is the origin's own request seen again).
+    if (by === "request") {
+      // The request's OWN envelope named this Task id, and the provider
+      // answered under it. The reference SDK echoes a requester-named id, so
+      // this is the requester's choice and never evidence against the
+      // provider: on the record's own requester's Task it is part of that Task
+      // (a resume, a same-task stream), and on anyone else's it is nothing at
+      // all (#41's SDK refuses it, or answers under the id only while it could
+      // not read the record).
+      if (existing && existing.requester !== rec.requester) {
+        noteOriginMiss("foreign_task_named", { task_id: taskId, request_id: rec.request_id });
+        return "ignored";
+      }
+      // Its own Task, created long before: a resume or a same-task stream,
+      // nothing new. Recently created (the creating update raced the tap), or
+      // no record yet: the stream that creates the Task binds if nothing has;
+      // otherwise it is part of the Task, silently.
+      if (existing && seenTooLate(existing, rec.observed_at)) return "recorded";
+      if (!(await createOnce(this.store, requestBindingKey(rec.request_id), { task_id: taskId }))) {
+        const bound = await read<{ task_id?: string }>(this.store, requestBindingKey(rec.request_id));
+        if (!bound || bound.task_id !== taskId) return "recorded";
+      }
+      const origin = originOf(rec, by);
+      let stored: TaskOrigin | null = origin;
+      if (!(await createOnce(this.store, key, origin))) stored = await read<TaskOrigin>(this.store, key);
+      if (!stored || stored.request_id !== rec.request_id) return "recorded";
+      await attachOrigin(this.tasks, taskId, stored);
+      await this.mirror(taskId, rec.requester, rec.responder);
+      return "recorded";
+    }
+
+    // The provider answered a request that did NOT name this Task id with it:
+    // the provider's own doing, so everything past the first binding is
+    // evidence against the provider.
+    await this.noteAsker(rec.responder, taskId, rec.requester);
+
+    // Seen well after the Task already existed: it did not create the Task.
     if (existing && seenTooLate(existing, rec.observed_at)) {
       const stored = await read<TaskOrigin>(this.store, key);
       if (stored?.request_id === rec.request_id) return "recorded";
@@ -444,16 +493,8 @@ export class OriginLedger {
       if (!bound || bound.task_id !== taskId) return this.contest(rec, taskId, "not_first");
     }
 
-    // One request per Task id (for these two parties): the first stands, and
-    // any other request claiming it is evidence.
-    const origin: TaskOrigin = {
-      request_id: rec.request_id,
-      requester: rec.requester,
-      responder: rec.responder,
-      offering: rec.offering,
-      observed_at: rec.observed_at,
-      bound_by: by,
-    };
+    // One request per Task id (for these two parties): the first stands.
+    const origin = originOf(rec, by);
     let stored: TaskOrigin | null = origin;
     if (!(await createOnce(this.store, key, origin))) stored = await read<TaskOrigin>(this.store, key);
     if (!stored) return "ignored";
@@ -487,12 +528,27 @@ export class OriginLedger {
   /** Remember that `requester` asked `responder` about `taskId`, until written. */
   private async noteAsker(responder: string, taskId: string, requester: string): Promise<void> {
     const key = askersKey(responder, taskId);
+    let counted = false;
     for (let attempt = 0; attempt < UNTIL_WRITTEN; attempt++) {
       const e = await this.store.get(key);
       const live = e && e.operation !== "DEL" && e.operation !== "PURGE" && e.length > 0;
-      const cur = live ? e!.json<{ requesters: string[] }>() : { requesters: [] as string[] };
+      const cur: Askers = live ? e!.json<Askers>() : { requesters: [] };
       if (cur.requesters.includes(requester)) return;
-      const next = { requesters: [...cur.requesters, requester] };
+      let next: Askers;
+      if (cur.requesters.length < MAX_ASKERS) {
+        next = { ...cur, requesters: [...cur.requesters, requester] };
+      } else {
+        // Past the cap: counted once per asker, with when the first did not fit.
+        if (!counted) {
+          if (!(await createOnce(this.store, overflowKey(key, requester), { v: 1 }))) return;
+          counted = true;
+        }
+        next = {
+          ...cur,
+          askers_overflow: (cur.askers_overflow ?? 0) + 1,
+          askers_overflow_since: cur.askers_overflow_since ?? new Date().toISOString(),
+        };
+      }
       try {
         if (live) await this.store.update(key, enc(next), e!.revision);
         else await this.store.create(key, enc(next));
@@ -501,6 +557,11 @@ export class OriginLedger {
         await pause(attempt);
       }
     }
+  }
+
+  /** The askers index for this Task (listed askers, and how many did not fit). */
+  async askersIndex(responder: string, taskId: string): Promise<Askers> {
+    return (await read<Askers>(this.store, askersKey(responder, taskId))) ?? { requesters: [] };
   }
 
   /** Every asker the responder answered with this Task id. */
@@ -527,10 +588,20 @@ export class OriginLedger {
   /** {@link projectFor}, for every asker the ledger knows about this Task. */
   async projectAll(task: TaskParties & Record<string, unknown>, taskId: string): Promise<boolean> {
     if (!task.responder) return false;
-    const askers = new Set(await this.askersOf(task.responder, taskId));
+    const index = await this.askersIndex(task.responder, taskId);
+    const askers = new Set(index.requesters);
     if (task.requester) askers.add(task.requester);
     let changed = false;
     for (const a of askers) if (await this.projectFor(task, taskId, a, task.responder)) changed = true;
+    // Askers past the cap: counted on the record, append-only.
+    if (index.askers_overflow && (task.askers_overflow as number | undefined ?? 0) < index.askers_overflow) {
+      task.askers_overflow = index.askers_overflow;
+      changed = true;
+    }
+    if (index.askers_overflow_since && !task.askers_overflow_since) {
+      task.askers_overflow_since = index.askers_overflow_since;
+      changed = true;
+    }
     return changed;
   }
 
@@ -559,6 +630,31 @@ export class OriginLedger {
       }
     }
     console.error(`[task-manager] contest evidence for task ${taskId} could not be mirrored after ${UNTIL_WRITTEN} tries`);
+  }
+
+  /**
+   * The record as a reader should see it: the stored record with what the
+   * ledger holds projected onto a copy, the origin included when it was never
+   * attached (under the attach rules). Nothing is written. A terminal record
+   * whose mirror was lost (a crash between the ledger write and the record
+   * write) still shows its evidence this way.
+   */
+  async view<T extends Record<string, unknown>>(record: T, taskId: string): Promise<T> {
+    const task = JSON.parse(JSON.stringify(record)) as T & TaskParties;
+    try {
+      if (!task.origin && task.requester && task.responder) {
+        const origin = await this.originFor(task.requester, task.responder, taskId);
+        if (origin && partiesMatch(task, origin) && !seenTooLate(task, origin.observed_at)) {
+          task.origin = { ...origin };
+          foldLoose(task);
+        }
+      }
+      await this.projectAll(task, taskId);
+    } catch (err) {
+      console.warn(`[task-manager] could not read the ledger for task ${taskId}; showing the record as stored:`, err);
+      return record;
+    }
+    return task;
   }
 
   /** The contest evidence for this Task id between these parties, if any. */
@@ -693,6 +789,8 @@ export function projectOnto(
   const ids = [...(origin ? [origin.request_id] : []), ...(ev?.contested_by ?? [])];
   if (!ids.length && !ev?.contested_overflow) return false;
   const byAsker = (task.contested_by_asker ?? {}) as Record<string, Partial<ContestEvidence>>;
+  // At most MAX_ASKERS askers listed; the index counts the rest.
+  if (!(requester in byAsker) && Object.keys(byAsker).length >= MAX_ASKERS) return false;
   const mine = byAsker[requester] ?? { contested_by: [] };
   const merged = mergeEvidence(mine, {
     contested_by: ids,
@@ -709,6 +807,37 @@ export function projectOnto(
     changed = true;
   }
   return changed;
+}
+
+/** On a record that has an origin, its own requester's loose evidence moves
+ *  onto the origin (the same fold attachOrigin does). */
+function foldLoose(task: Record<string, unknown> & { origin?: TaskOrigin }): void {
+  if (!task.origin || (!task.contested_by && !task.contested_overflow)) return;
+  applyEvidence(task, {
+    contested_by: task.contested_by as string[] | undefined,
+    contested_overflow: task.contested_overflow as number | undefined,
+    contested_overflow_since: task.contested_overflow_since as string | undefined,
+  });
+  delete task.contested_by;
+  delete task.contested_overflow;
+  delete task.contested_overflow_since;
+}
+
+/**
+ * What a party other than the responder may see of a record: everything
+ * about itself, nothing the server recorded about OTHER askers. The
+ * requester's own origin, contests and cancel attribution stay; another
+ * asker's requests (`contested_by_asker`), the mismatch naming that asker,
+ * and the count of further askers are removed. The responder, and the
+ * platform's privileged read, see all of it.
+ */
+export function redactForRequester<T extends Record<string, unknown>>(record: T): T {
+  const out = { ...record };
+  delete out.contested_by_asker;
+  delete out.origin_mismatch;
+  delete out.askers_overflow;
+  delete out.askers_overflow_since;
+  return out;
 }
 
 /**

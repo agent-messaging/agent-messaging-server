@@ -51,6 +51,9 @@ export type OriginMiss =
   /** A request's first answer named a Task id already bound to another
    *  request; the meta names both request ids. */
   | "contested"
+  /** A request named somebody else's Task id and was answered under it:
+   *  the requester's choice, recorded nowhere but here. */
+  | "foreign_task_named"
   /** The ledger threw. */
   | "error";
 

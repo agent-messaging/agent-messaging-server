@@ -6,6 +6,8 @@ import { handleTaskUpdate } from "../../src/task-manager/handlers/task-update.js
 import { OriginLedger, ORIGIN_SKEW_MS, requestKey } from "../../src/task-manager/origin.js";
 import { OriginTap, flushOriginMisses, inboxAgentOf } from "../../src/task-manager/origin-tap.js";
 import { OverdueSweep } from "../../src/task-manager/overdue-sweep.js";
+import { handleTaskGet } from "../../src/task-manager/handlers/task-get.js";
+import { adminViews } from "../../src/admin/admin-views.js";
 import type { KeyedEntry, KeyedStore } from "../../src/storage/index.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1072,7 +1074,7 @@ describe("round 4: contest evidence is never dropped or hidden", () => {
     expect(record(T).origin!.contested_by).toBeUndefined();
   });
 
-  it("Q5 stream race: a stream naming a task an answer already bound is evidence", async () => {
+  it("Q5 stream race: a stream naming a task an answer already bound is the requester's choice, not evidence", async () => {
     const T = "task-q5";
     const r0 = request();
     await tap(r0);
@@ -1080,10 +1082,10 @@ describe("round 4: contest evidence is never dropped or hidden", () => {
     const stream = request({ taskId: T, input: { stream: true } });
     stream.payload = { ...(stream.payload as object), config: { stream: true } };
     signEnvelope(stream, buyerKp);
-    expect(await open(stream)).toBe("contested");
+    expect(await open(stream)).not.toBe("contested");
     await update(taskUpdate(T, { status: "failed" }));
     expectOrigin(T, r0, "answer");
-    expect(record(T).origin!.contested_by).toEqual([stream.id]);
+    expect(record(T).origin!.contested_by).toBeUndefined();
   });
 
   it("Q5, but a stream that bound its own task first: an answer naming it is the contest", async () => {
@@ -1183,29 +1185,29 @@ describe("round 5", () => {
     expect(r.origin!.contested_by).toBeUndefined();
   });
 
-  it("3. a second stream naming a stream-bound task within the minute is listed", async () => {
+  it("3. a second stream naming its own stream-bound task is part of that task, not evidence", async () => {
     const T = "task-two-streams";
     const s1 = request({ taskId: T });
     await open(s1);
     await update(taskUpdate(T, { status: "working" }));
     const s2 = request({ taskId: T });
-    expect(await open(s2)).toBe("contested");
+    expect(await open(s2)).not.toBe("contested");
     expectOrigin(T, s1, "request");
-    expect(record(T).origin!.contested_by).toEqual([s2.id]);
+    expect(record(T).origin!.contested_by).toBeUndefined();
   });
 
-  it("3. a non-stream naming the task before its record exists, while a stream bound it, is listed", async () => {
+  it("3. a non-stream naming its own task before the record exists is not evidence", async () => {
     const T = "task-early-follow-up";
     const s1 = request({ taskId: T });
     await open(s1);
     const early = request({ taskId: T, resume: true });
-    expect(await open(early)).toBe("contested");
+    expect(await open(early)).not.toBe("contested");
     await update(taskUpdate(T, { status: "failed" }));
     expectOrigin(T, s1, "request");
-    expect(record(T).origin!.contested_by).toEqual([early.id]);
+    expect(record(T).origin!.contested_by).toBeUndefined();
   });
 
-  it("3. the rule does not flip after a minute: a late second stream is listed the same way", async () => {
+  it("3. the rule does not flip after a minute: a late second stream on its own task is not evidence either", async () => {
     const T = "task-late-stream";
     const s1 = request({ taskId: T });
     await open(s1);
@@ -1214,8 +1216,8 @@ describe("round 5", () => {
     r.created_at = new Date(Date.now() - ORIGIN_SKEW_MS - 5_000).toISOString();
     tasks.map.set(T, { v: JSON.stringify(r), rev: 123_456 });
     const s2 = request({ taskId: T });
-    expect(await open(s2)).toBe("contested");
-    expect(record(T).origin!.contested_by).toEqual([s2.id]);
+    expect(await open(s2)).not.toBe("contested");
+    expect(record(T).origin!.contested_by).toBeUndefined();
   });
 
   it("4. a request past the cap seen twice is counted once", async () => {
@@ -1276,15 +1278,15 @@ describe("round 6", () => {
     expect((record(T) as Loose).contested_by).toBeUndefined();
   });
 
-  it("a stream naming the task that the provider DOES answer under it is listed", async () => {
+  it("a stream naming its own paused task, answered under it, is a resume: not listed", async () => {
     const T = "task-stream-resumed";
     const r1 = request();
     await tap(r1);
     await tap(answer(r1, T, "input_required"));
     await update(taskUpdate(T, { status: "input_required", message: "?" }));
     const s2 = request({ taskId: T });
-    expect(await open(s2)).toBe("contested");
-    expect(record(T).origin!.contested_by).toEqual([s2.id]);
+    expect(await open(s2)).not.toBe("contested");
+    expect(record(T).origin!.contested_by).toBeUndefined();
   });
 
   it("another asker's requests never move into the record requester's origin", async () => {
@@ -1324,5 +1326,153 @@ describe("round 6", () => {
       [BUYER]: { contested_by: [a1.id] },
       [third.getPublicKey()]: { contested_by: [a2.id] },
     });
+  });
+});
+
+describe("round 7: only provider-caused evidence counts; askers capped; privacy; read-time projection", () => {
+  type Loose = {
+    contested_by?: string[];
+    origin_mismatch?: { requester: string };
+    contested_by_asker?: Record<string, { contested_by: string[] }>;
+    askers_overflow?: number;
+    askers_overflow_since?: string;
+  };
+  const strangerStream = (T: string) => request({ taskId: T, from: strangerKp });
+  const answerTo = (req: Envelope, T: string) => answer(req, T, "working", sellerKp, req.from);
+  const tapStranger = (env: Envelope) => ledger.observe(decode(encode(env)), env.to ?? "");
+
+  async function buyersTask(T: string) {
+    const r1 = request();
+    await tap(r1);
+    await tap(answer(r1, T, "working"));
+    await update(taskUpdate(T, { status: "working" }));
+    return r1;
+  }
+
+  it("probe A: the buyer naming its own task, answered under it, adds nothing", async () => {
+    const T = "task-r7-a";
+    const r1 = await buyersTask(T);
+    for (const r of [request({ taskId: T }), request({ taskId: T, resume: true })]) {
+      await tap(r);
+      expect(await tap(answer(r, T, "working"))).not.toBe("contested");
+    }
+    await update(taskUpdate(T, { status: "failed" }));
+    expectOrigin(T, r1, "answer");
+    expect(record(T).origin!.contested_by).toBeUndefined();
+  });
+
+  it("probe B: a stranger naming the buyer's task, answered under it, records nothing on it", async () => {
+    flushOriginMisses();
+    const T = "task-r7-b";
+    const r1 = await buyersTask(T);
+    const s = strangerStream(T);
+    await tapStranger(s);
+    expect(await ledger.observe(decode(encode(answerTo(s, T))), STRANGER)).toBe("ignored");
+    await update(taskUpdate(T, { status: "failed" }));
+    const r = record(T) as ReturnType<typeof record> & Loose;
+    expectOrigin(T, r1, "answer");
+    expect(r.origin!.contested_by).toBeUndefined();
+    expect(r.origin_mismatch).toBeUndefined();
+    expect(r.contested_by_asker).toBeUndefined();
+    expect(flushOriginMisses()).toMatchObject({ foreign_task_named: 1 });
+  });
+
+  it("probe C: the provider answers a stranger's stream under the buyer's task while the task manager is down", async () => {
+    // #41's unconfirmed stream path: the provider could not read the record,
+    // so it answered the stream under the id it named. The tap still sees it
+    // after the task manager is back; nothing lands on the buyer's record.
+    const T = "task-r7-c";
+    const r1 = await buyersTask(T);
+    const s = strangerStream(T);
+    const opening = answerTo(s, T);
+    // Observed late, in a burst, as a tap catching up would.
+    await tapStranger(s);
+    await ledger.observe(decode(encode(opening)), STRANGER);
+    await ledger.observe(decode(encode(opening)), STRANGER);
+    await update(taskUpdate(T, { status: "failed" }));
+    const r = record(T) as ReturnType<typeof record> & Loose;
+    expectOrigin(T, r1, "answer");
+    expect(r.origin!.contested_by).toBeUndefined();
+    expect(r.origin_mismatch).toBeUndefined();
+    expect(r.contested_by_asker).toBeUndefined();
+  });
+
+  it("evidence still comes from a request that did NOT name the task, answered under it", async () => {
+    const T = "task-r7-evidence";
+    const r1 = await buyersTask(T);
+    const other = request();
+    await tap(other);
+    expect(await tap(answer(other, T, "working"))).toBe("contested");
+    expectOrigin(T, r1, "answer");
+    expect(record(T).origin!.contested_by).toEqual([other.id]);
+  });
+
+  it("askers past 64 are counted, with when the first did not fit", async () => {
+    const T = "task-r7-askers";
+    await update(taskUpdate(T, { status: "working" }, { to: STRANGER }));
+    const askers = Array.from({ length: 66 }, () => nkeys.createUser());
+    for (const kp of askers) {
+      const r = sign(kp, { type: "request", from: kp.getPublicKey(), to: SELLER, payload: { offering: "summarize", input: {} } });
+      await ledger.observe(decode(encode(r)), SELLER);
+      await ledger.observe(decode(encode(answer(r, T, "working", sellerKp, kp.getPublicKey()))), kp.getPublicKey());
+    }
+    // One asker seen again: still counted once.
+    await update(taskUpdate(T, { status: "failed" }, { to: STRANGER }));
+    const r = record(T) as ReturnType<typeof record> & Loose;
+    expect(Object.keys(r.contested_by_asker!)).toHaveLength(64);
+    expect(r.askers_overflow).toBe(2);
+    expect(Number.isFinite(Date.parse(r.askers_overflow_since!))).toBe(true);
+  });
+
+  async function get(kp: Kp, T: string) {
+    const env = sign(kp, { type: "request", from: kp.getPublicKey(), to: "task-manager", payload: { task_id: T } });
+    const resp = await handleTaskGet(env, { subject: `mesh.task.get.${T}` } as never, tasks, "task-manager", ledger);
+    return resp.payload as Record<string, unknown> & Loose & { origin?: TaskOrigin };
+  }
+
+  it("task-get: the requester sees only its own entries, the responder sees all", async () => {
+    const T = "task-r7-privacy";
+    // The record names a puppet as requester; the real buyer was answered too.
+    await update(taskUpdate(T, { status: "working" }, { to: STRANGER }));
+    const real = request();
+    await tap(real);
+    await tap(answer(real, T, "working"));
+    const asRequester = await get(strangerKp, T);
+    expect(asRequester.requester).toBe(STRANGER);
+    expect(asRequester.contested_by_asker).toBeUndefined();
+    expect(asRequester.origin_mismatch).toBeUndefined();
+    const asResponder = await get(sellerKp, T);
+    expect(asResponder.contested_by_asker).toEqual({ [BUYER]: { contested_by: [real.id] } });
+    expect(asResponder.origin_mismatch).toEqual({ requester: BUYER });
+  });
+
+  it("task-get: a requester's own origin and contests are shown to it", async () => {
+    const T = "task-r7-own";
+    const r1 = await buyersTask(T);
+    const other = request();
+    await tap(other);
+    await tap(answer(other, T, "working"));
+    const asRequester = await get(buyerKp, T);
+    expect(asRequester.origin!.request_id).toBe(r1.id);
+    expect(asRequester.origin!.contested_by).toEqual([other.id]);
+  });
+
+  it("task-get and the privileged read show evidence whose mirror was lost", async () => {
+    const T = "task-r7-lost-mirror";
+    const r1 = await buyersTask(T);
+    await update(taskUpdate(T, { status: "failed" }));
+    const other = request();
+    await tap(other);
+    await tap(answer(other, T, "working"));
+    // A crash between the ledger write and the record write: the record lost it.
+    const stored = JSON.parse(tasks.map.get(T)!.v);
+    delete stored.origin.contested_by;
+    tasks.map.set(T, { v: JSON.stringify(stored), rev: 424_242 });
+    expect((await get(buyerKp, T)).origin!.contested_by).toEqual([other.id]);
+    // The privileged read (admin-views), over the same stores.
+    const views = adminViews({ storage: { keyed: async (n: string) => (n === "mesh_tasks" ? tasks : store) } as never });
+    const answerOf = await views.handle({ method: "GET", path: `/admin/v1/tasks/${T}`, query: new URLSearchParams() } as never);
+    expect((answerOf!.body as { record: { origin: TaskOrigin } }).record.origin.contested_by).toEqual([other.id]);
+    expectOrigin(T, r1, "answer");
   });
 });

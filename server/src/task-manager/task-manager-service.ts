@@ -143,7 +143,7 @@ export class TaskManagerService {
         this.nc,
         "mesh.task.get.*",
         this.kp,
-        (env, msg) => handleTaskGet(env, msg, this.kv, this.SERVICE_ID),
+        (env, msg) => handleTaskGet(env, msg, this.kv, this.SERVICE_ID, this.origins ?? undefined),
         undefined,
         undefined,
         serviceQueue("mesh.task.get.*"),

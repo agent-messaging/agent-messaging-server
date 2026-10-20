@@ -28,6 +28,10 @@ const sellerKp = keyPairFromSeed(sellerAgent.seed);
 const buyerKp = keyPairFromSeed(buyerAgent.seed);
 
 const seller = await connect(sellerAgent);
+seller.onStreamRequest("stream-ok", async (_input, _ctx, writer) => {
+  writer.write("a");
+  writer.end("done");
+});
 seller.onStreamRequest("stream-boom", async () => {
   throw new Error("the stream handler broke");
 });
@@ -84,6 +88,7 @@ await seller.register({
   description: "Fails and pauses in the ways the SDK can.",
   offerings: [
     { id: "stream-boom", name: "Stream boom", description: "A stream whose handler throws." },
+    { id: "stream-ok", name: "Stream ok", description: "A stream that ends." },
     { id: "needs-file", name: "Needs a file", description: "Pauses for a file, then fails." },
     { id: "slow", name: "Slow", description: "Defers, then finishes." },
     { id: "quick", name: "Quick", description: "Answers at once." },
@@ -190,6 +195,32 @@ let paused;
   const rec = await until(r.task_id, (x) => (x.budget?.revision ?? -1) >= 54);
   results.push([rec?.history?.length === 50, `the history kept the newest 50 entries (${rec?.history?.length})`]);
   expectOrigin("55 revisions later", rec, r.envelope?.in_reply_to, "answer");
+}
+
+// 4b. A third agent names the buyer's task in a stream request, and the real
+// SDK provider answers it (with #41 it refuses a request naming somebody
+// else's recorded Task, and answers under the id only while it cannot read
+// the record). Either way the request was the third agent's own choice of id:
+// nothing lands on the buyer's record.
+{
+  const thirdAgent = await enroll(t, "task-origin third party");
+  const third = await connect(thirdAgent);
+  await third.register({ name: `origin-third-${run}`, description: "Names other people's tasks.", offerings: [] });
+  const thirdKp = keyPairFromSeed(thirdAgent.seed);
+  const r = await buyer.request(sellerAgent.id, "needs-file", {}, { timeout_ms: 10_000 });
+  await until(r.task_id, (x) => x.origin);
+  publishAs(third, thirdKp, Subjects.agentInbox(sellerAgent.id), {
+    type: "request",
+    from: thirdAgent.id,
+    to: sellerAgent.id,
+    task_id: r.task_id,
+    payload: { offering: "stream-ok", input: {}, config: { stream: true } },
+  });
+  await sleep(1500);
+  const rec = await record(r.task_id);
+  const clean = !rec?.contested_by_asker && !rec?.origin_mismatch && !rec?.origin?.contested_by && !rec?.contested_by;
+  results.push([clean && rec?.origin?.request_id === r.envelope?.in_reply_to, `a third agent's stream naming the buyer's task leaves its record alone (${JSON.stringify({ origin: rec?.origin?.request_id, mismatch: rec?.origin_mismatch, asker: rec?.contested_by_asker })})`]);
+  await third.close();
 }
 
 // 5. Cancels.

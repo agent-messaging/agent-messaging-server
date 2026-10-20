@@ -94,6 +94,10 @@ Types and readers for two Task record fields the server now writes (server
   asker's requests, when the record names a different requester, are kept
   per asker in `contested_by_asker`, beside `origin_mismatch: { requester }`.
   A request is tied to a Task only by the provider's answer carrying it.
+  A request whose own envelope named the Task id is the requester's choice
+  and never evidence. At most 64 other askers are listed; `askers_overflow`
+  and `askers_overflow_since` count the rest. `mesh.task.get` shows a
+  requester only its own entries; the responder sees everything.
   `taskContestsOf(task)` reads the record-level fields strictly; a malformed
   contest field is dropped on its own, never the origin around it.
 - **`Task.canceled_by` (`TaskCanceledBy`).** On a canceled Task: `party`

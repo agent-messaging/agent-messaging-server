@@ -239,6 +239,10 @@ export interface Task {
    *  provider answered with this Task's id, kept per asker key so nobody's
    *  requests are mixed with anyone else's. Same limits per asker. */
   contested_by_asker?: Record<string, { contested_by: string[]; contested_overflow?: number; contested_overflow_since?: string }>;
+  /** Askers past the 64 that `contested_by_asker` lists, counted once each,
+   *  and when the first did not fit. */
+  askers_overflow?: number;
+  askers_overflow_since?: string;
   meta?: Record<string, unknown>;
 }
 
@@ -288,8 +292,11 @@ export interface TaskContests {
   contested_overflow_since?: string;
   /** The requester the server saw ask, when the record names someone else. */
   origin_mismatch?: { requester: string };
-  /** Other askers' observed requests, per asker key. */
+  /** Other askers' observed requests, per asker key (at most 64 askers). */
   contested_by_asker?: Record<string, { contested_by: string[]; contested_overflow?: number; contested_overflow_since?: string }>;
+  /** Askers past the 64 listed, and when the first did not fit. */
+  askers_overflow?: number;
+  askers_overflow_since?: string;
 }
 
 /**
@@ -316,6 +323,10 @@ export function taskContestsOf(record: unknown): TaskContests | null {
     }
     if (Object.keys(kept).length) out.contested_by_asker = kept;
   }
+  if (typeof r.askers_overflow === "number" && Number.isInteger(r.askers_overflow) && r.askers_overflow >= 0) {
+    out.askers_overflow = r.askers_overflow;
+  }
+  if (isIso(r.askers_overflow_since)) out.askers_overflow_since = r.askers_overflow_since;
   return Object.keys(out).length ? out : null;
 }
 
