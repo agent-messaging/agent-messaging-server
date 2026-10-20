@@ -266,6 +266,9 @@ export interface ActivityEntry {
   /** Set when the first response for this exchange was counted (guards
    *  task-mode multi-respond flows against double-counting). */
   respondedAt?: string;
+  /** Set when an answer's §13.5 usage receipt was honoured for this exchange.
+   *  One receipt per request: a later one is dropped (see meterAnswer). */
+  receiptAt?: string;
 }
 
 export class ActivityService {
@@ -844,6 +847,7 @@ export class ActivityService {
 
     // The meter events, from the ring row (see meterAnswer).
     const first = !entry.respondedAt;
+    const hadReceipt = !!entry.receiptAt;
     const receiptEntries = this.meterAnswer(env, bytes, {
       from: entry.from,
       to: entry.to,
@@ -854,7 +858,10 @@ export class ActivityService {
       requestId: entry.requestId ?? env.in_reply_to ?? undefined,
       first,
       failed: entry.status === "failed",
+      receiptTaken: hadReceipt,
     });
+    const tookReceipt = !hadReceipt && receiptEntries !== undefined;
+    if (tookReceipt) entry.receiptAt = new Date().toISOString();
     if (entry.to && first) {
       // The Monitor: how the exchange came out and how long delivery took,
       // on the first answer only. The first answer from a mailbox agent is
@@ -914,6 +921,14 @@ export class ActivityService {
       }
     }
 
+    // A receipt honoured on a later answer: the index learns it too, so an
+    // answer arriving after this row leaves the ring cannot declare again.
+    // (On the first answer the write above already carried it.)
+    if (tookReceipt && !(entry.to && first)) {
+      const rec = recordOf(entry);
+      if (rec) this.index?.remember(rec);
+    }
+
     // Persist update
     const data = new TextEncoder().encode(JSON.stringify(entry));
     this.kv.put(entry.id, data).catch(() => {});
@@ -938,7 +953,16 @@ export class ActivityService {
   private meterAnswer(
     env: Envelope,
     bytes: number,
-    x: { from: string; to: string; offering: string; requestId?: string; first: boolean; failed: boolean },
+    x: {
+      from: string;
+      to: string;
+      offering: string;
+      requestId?: string;
+      first: boolean;
+      failed: boolean;
+      /** The exchange already had a receipt honoured: this one is dropped. */
+      receiptTaken: boolean;
+    },
   ): Array<{ meter: string; quantity: number }> | undefined {
     const metered = this.meteringOn && x.to !== "" && x.from !== "";
 
@@ -955,6 +979,15 @@ export class ActivityService {
     // carry the claim into the stream, where rating (§19.6) decides what it is
     // worth. Validated whether or not metering is on, because the audit chains
     // record the claim either way.
+    //
+    // ONE receipt per request: the first answer carrying a valid one — a
+    // respond or an inbox answer, first answer or not — is honoured, and any
+    // later receipt on the same request is dropped. Each answer is its own
+    // envelope, so the (meter, envelope_id) dedupe would let a provider
+    // declare usage again with every extra answer it sends. "First receipt"
+    // rather than "first answer" because a task-mode agent's receipt rides
+    // its terminal respond, which follows a `working` update. Bytes still
+    // meter on every answer, below. Returns undefined for a dropped receipt.
     let receiptEntries: Array<{ meter: string; quantity: number }> | undefined;
     // A respond is passed WITHOUT its in_reply_to: on a respond that field
     // names the request, not an inbox answer, and `usageReceiptParties` would
@@ -972,7 +1005,11 @@ export class ActivityService {
       if (dropped > 0) {
         console.warn(`[activity] dropped ${dropped} malformed usage entr(y/ies) from ${parties.provider.slice(0, 12)}…`);
       }
-      if (batch.events.length > 0) {
+      if (batch.events.length > 0 && x.receiptTaken) {
+        console.warn(
+          `[activity] dropped a second usage receipt for request ${x.requestId ?? "(unknown)"} from ${parties.provider.slice(0, 12)}… (one receipt per request)`,
+        );
+      } else if (batch.events.length > 0) {
         receiptEntries = batch.events.map((e) => ({ meter: e.meter, quantity: e.quantity }));
         if (this.meteringOn) publishMeterEvents(this.nc, this.kp, batch);
       }
@@ -1069,15 +1106,25 @@ export class ActivityService {
   private meterFromRecord(env: Envelope, bytes: number, rec: ExchangeRecord): ExchangeRecord | null {
     if (!this.rememberRespond(env.id)) return null;
     const first = !rec.respondedAt;
-    this.meterAnswer(env, bytes, {
+    // A record written before receiptAt existed reads as no receipt yet.
+    const hadReceipt = typeof rec.receiptAt === "string";
+    const receipt = this.meterAnswer(env, bytes, {
       from: rec.from,
       to: rec.to,
       offering: rec.offering,
       requestId: rec.requestId,
       first,
       failed: !!env.error,
+      receiptTaken: hadReceipt,
     });
-    return first ? { ...rec, respondedAt: new Date().toISOString() } : null;
+    const now = new Date().toISOString();
+    const tookReceipt = !hadReceipt && receipt !== undefined;
+    if (!first && !tookReceipt) return null;
+    return {
+      ...rec,
+      ...(first ? { respondedAt: now } : {}),
+      ...(tookReceipt ? { receiptAt: now } : {}),
+    };
   }
 
   /**
@@ -1701,6 +1748,7 @@ function recordOf(e: ActivityEntry): ExchangeRecord | null {
     // where the envelope can (recordRequest).
     recordedAt: agedAt(e) ?? new Date().toISOString(),
     ...(e.respondedAt ? { respondedAt: e.respondedAt } : {}),
+    ...(e.receiptAt ? { receiptAt: e.receiptAt } : {}),
   };
 }
 

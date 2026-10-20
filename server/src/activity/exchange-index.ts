@@ -68,6 +68,10 @@ export interface ExchangeRecord {
   /** When the exchange's first answer was counted. Once set, every later
    *  answer is a follow-up: bytes only, exactly as in the ring. */
   respondedAt?: string;
+  /** When an answer's §13.5 usage receipt was honoured. Once set, every later
+   *  receipt on this request is dropped (one receipt per request). Absent on
+   *  records written before the field existed: no receipt yet. */
+  receiptAt?: string;
 }
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
