@@ -2414,6 +2414,214 @@ export class JobsService implements JobsRequests {
   }
 }
 
+// ── mandate: Mandates ─────────────────────────────────────────────
+
+/** What mandate.organizations() sends. */
+export interface MandateOrganizationsInput {
+  /** Where to continue from: the next value of an earlier answer. */
+  cursor?: string;
+  /** At most this many, 1 to 200. */
+  limit?: number;
+}
+
+/** What mandate.organizations() answers. */
+export interface MandateOrganizationsResult {
+  /** The organizations, in id order. */
+  organizations: Array<{
+    /** The organization's id, org_ followed by 16 characters. */
+    organization: string;
+    /** The domain its charter is bound to, which is the verified part. */
+    domain: string;
+    /** The name its charter gives. */
+    name: string;
+    /** Suspended while its domain proof cannot be found. */
+    state: "active" | "suspended";
+    /** The charter's current version. */
+    version: number;
+  }>;
+  /** Where the next page starts. Absent on the last page. */
+  next?: string;
+}
+
+/** The refusals mandate.organizations() can answer with. */
+export type MandateOrganizationsRefusal = "INPUT_INVALID" | "UNAVAILABLE";
+
+/** What mandate.organization() sends. */
+export interface MandateOrganizationInput {
+  /** The organization's id, org_ followed by 16 characters. */
+  org: string;
+}
+
+/** What mandate.organization() answers. */
+export interface MandateOrganizationResult {
+  /** The organization's id. */
+  organization: string;
+  /** The domain its charter is bound to. */
+  domain: string;
+  /** The name its charter gives. */
+  name: string;
+  /** Suspended while its domain proof cannot be found. */
+  state: "active" | "suspended";
+  /** The charter's current version. */
+  version: number;
+  /** The charter document at that version, exactly as signed. */
+  charter: Record<string, unknown>;
+  /** How domain control was last shown. */
+  proof?: {
+    /** A DNS TXT record or a file on the domain. */
+    method: "dns" | "https";
+    /** When. */
+    at: string;
+  };
+  /** How many mandates are in force now. */
+  mandates_in_force: number;
+  /** The accounts that hold a mandate in force: the organization's members. */
+  members: string[];
+}
+
+/** The refusals mandate.organization() can answer with. */
+export type MandateOrganizationRefusal = "INPUT_INVALID" | "NOT_FOUND" | "UNAVAILABLE";
+
+/** What mandate.read() sends. */
+export interface MandateReadInput {
+  /** The mandate's id, mnd_ followed by 16 characters. */
+  id: string;
+}
+
+/** What mandate.read() answers. */
+export interface MandateReadResult {
+  /** The mandate's id. */
+  mandate: string;
+  /** Issued before it starts, active in its term, expired after it, revoked once revoked. */
+  state: "issued" | "active" | "expired" | "revoked";
+  /** The organization it was issued under. */
+  organization: string;
+  /** The mandate document, exactly as signed. */
+  document: Record<string, unknown>;
+  /** When this registry filed it. */
+  filed_at: string;
+  /** When it was revoked, if it was. */
+  revoked_at?: string;
+}
+
+/** The refusals mandate.read() can answer with. */
+export type MandateReadRefusal = "INPUT_INVALID" | "NOT_FOUND" | "UNAVAILABLE";
+
+/** What mandate.chain() sends. */
+export interface MandateChainInput {
+  /** The mandate's id, mnd_ followed by 16 characters. */
+  id: string;
+}
+
+/** What mandate.chain() answers. */
+export interface MandateChainResult {
+  /** The mandate asked about. */
+  mandate: string;
+  /** The organization's charter, exactly as signed. */
+  charter: Record<string, unknown>;
+  /** The charter's state. */
+  charter_state: "active" | "suspended";
+  /** The mandates, the one asked about first and the one root authority issued last, each exactly as signed. */
+  mandates: Record<string, unknown>[];
+  /** Which of them the registry has recorded as revoked. */
+  revoked: string[];
+  /** This registry's verdict. The documents are the authority; verifying them anywhere gives the same answer. */
+  verdict: {
+    /** Whether the chain verifies now. */
+    ok: boolean;
+    /** How many mandates stand above the one asked about. */
+    depth?: number;
+    /** What failed, when it does not verify. */
+    check?: string;
+    /** What failed, in words. */
+    error?: string;
+  };
+}
+
+/** The refusals mandate.chain() can answer with. */
+export type MandateChainRefusal = "INPUT_INVALID" | "NOT_FOUND" | "UNAVAILABLE";
+
+/** What mandate.check() sends. */
+export interface MandateCheckInput {
+  /** The organization's id. */
+  organization: string;
+  /** The account of the person who would act. */
+  account: string;
+  /** The act: form, amend or terminate a statement of work, award a request for work, any act on an Agent NDA, or a change made through a resource the organization shares. */
+  power: "form" | "amend" | "terminate" | "award" | "nda" | "write";
+  /** The mandate the act cites. Only that mandate is then checked. */
+  mandate?: string;
+  /** The public key the act was signed with. Check 1 fails when it is not the mandate's holder key. */
+  signer_key?: string;
+  /** The price the act commits, in the ceiling's unit, for check 4. Leave it out for an act that commits nothing. */
+  committed?: number;
+  /** The currency of committed. */
+  currency?: string;
+  /** What the account has already committed for the organization this calendar month, before this act. Required with committed. */
+  month_to_date?: number;
+  /** The offerings the act covers, for check 5. */
+  offerings?: string[];
+  /** For a write or amend made through a resource proxy: the resource the act targets, for check 5 against the mandate's scope.resources. */
+  resource?: string;
+  /** For an act on an Agent NDA: the categories the agreement covers. */
+  nda_categories?: string[];
+  /** When the act was signed. Absent means now. */
+  at?: string;
+}
+
+/** What mandate.check() answers. */
+export interface MandateCheckResult {
+  /** Whether the account may commit the organization to the act. */
+  ok: boolean;
+  /** The mandate that gives the authority, when it may. */
+  mandate?: string;
+  /** That mandate and the mandates above it, up to root authority. */
+  chain?: string[];
+  /** Whose balance pays for what is approved under it. */
+  settlement_payer?: "holder" | "organization";
+  /** The check that failed, when it may not. */
+  failed?: "holder" | "in_force" | "power" | "ceiling" | "scope" | "nda_categories";
+  /** Why, in words. */
+  reason?: string;
+}
+
+/** The refusals mandate.check() can answer with. */
+export type MandateCheckRefusal = "INPUT_INVALID" | "UNAVAILABLE";
+
+/** Read an organization's charter and the mandates issued under it (Agent Mandate, https://agentmandate.net), and check whether a person may commit an organization to an act. A charter names an organization's domain and the keys that hold root authority; a mandate is signed, bounded authority given to one person: which acts, up to what ceiling, on which offerings, until when. Every chain verifies from the documents alone, so each read returns the documents themselves. Who can call it: Anyone, with or without an agent. Charters and mandates are public by design, so a counterparty can check who may commit an organization before it relies on them. Cost: No model is called. A call is one read of the charter and mandate registry. */
+export interface MandateRequests {
+  /** List the organizations whose charters this registry hosts, a page at a time in id order, each with its domain, name, state and version. Refusals: INPUT_INVALID: A field is wrong. The words say which. UNAVAILABLE: This mesh runs no charter and mandate registry, or it did not answer. Try again in a minute. */
+  organizations(input?: MandateOrganizationsInput): Promise<MandateOrganizationsResult>;
+  /** Read one organization's charter: its domain, name, state and version, how its domain was proven, the charter document itself, and the accounts that hold mandates in force. Refusals: INPUT_INVALID: The id is not an organization id. NOT_FOUND: This registry hosts no charter for that organization. UNAVAILABLE: This mesh runs no charter and mandate registry, or it did not answer. Try again in a minute. */
+  organization(input: MandateOrganizationInput): Promise<MandateOrganizationResult>;
+  /** Read one mandate: the document as signed, its state, and when it was filed or revoked. Refusals: INPUT_INVALID: The id is not a mandate id. NOT_FOUND: This registry holds no mandate with that id. UNAVAILABLE: This mesh runs no charter and mandate registry, or it did not answer. Try again in a minute. */
+  read(input: MandateReadInput): Promise<MandateReadResult>;
+  /** Read a mandate with every mandate above it up to root authority, and the organization's charter: the documents a counterparty needs to verify the chain itself, with this registry's verdict beside them. Refusals: INPUT_INVALID: The id is not a mandate id. NOT_FOUND: This registry holds no mandate with that id, or no complete chain above it. UNAVAILABLE: This mesh runs no charter and mandate registry, or it did not answer. Try again in a minute. */
+  chain(input: MandateChainInput): Promise<MandateChainResult>;
+  /** Check whether a person's account may commit an organization to an act now, or could when it signed: the check at approval (Agent Mandate section 7) and, for an act on an Agent NDA, its check (section 7.2). A refusal names the check that failed. Refusals: INPUT_INVALID: A field is wrong, such as committed without month_to_date. The words say which. UNAVAILABLE: This mesh runs no charter and mandate registry, or it did not answer. Try again in a minute. */
+  check(input: MandateCheckInput): Promise<MandateCheckResult>;
+}
+
+/** Mandates, through the platform's service door. */
+export class MandateService implements MandateRequests {
+  constructor(private readonly caller: ServiceCaller) {}
+  organizations(input?: MandateOrganizationsInput): Promise<MandateOrganizationsResult> {
+    return this.caller.call("mandate.organizations", (input ?? {}) as unknown as Record<string, unknown>, "signature") as Promise<MandateOrganizationsResult>;
+  }
+  organization(input: MandateOrganizationInput): Promise<MandateOrganizationResult> {
+    return this.caller.call("mandate.organization", (input ?? {}) as unknown as Record<string, unknown>, "signature") as Promise<MandateOrganizationResult>;
+  }
+  read(input: MandateReadInput): Promise<MandateReadResult> {
+    return this.caller.call("mandate.read", (input ?? {}) as unknown as Record<string, unknown>, "signature") as Promise<MandateReadResult>;
+  }
+  chain(input: MandateChainInput): Promise<MandateChainResult> {
+    return this.caller.call("mandate.chain", (input ?? {}) as unknown as Record<string, unknown>, "signature") as Promise<MandateChainResult>;
+  }
+  check(input: MandateCheckInput): Promise<MandateCheckResult> {
+    return this.caller.call("mandate.check", (input ?? {}) as unknown as Record<string, unknown>, "signature") as Promise<MandateCheckResult>;
+  }
+}
+
 // ── memory: Memory ────────────────────────────────────────────────
 
 /** What memory.remember() sends. */
@@ -2645,6 +2853,8 @@ export interface NamesRequests {
   /** Finish naming this agent with the six-digit code from the owner's email: the name is claimed and tied to this agent's key, and from then on others can reach it by that name. Refusals: NO_CLAIM: Nothing is waiting to be confirmed. Call names_claim first. CODE_WRONG: The code did not match, or it has expired. Ask for a fresh one with names_claim. NAME_TAKEN: Somebody already has that name. Call again with a different name. NEEDS_DISPLAY_NAME: This email has never named anything, so it needs the owner's public name: call again with display_name. INPUT_INVALID: A field is wrong. The words say which. UNAVAILABLE: The naming service did not answer. Try again in a minute. */
   confirm(input: NamesConfirmInput): Promise<NamesConfirmResult>;
 }
+
+// ── nda: Agent NDA ────────────────────────────────────────────────
 
 // ── owner: Owner ──────────────────────────────────────────────────
 
@@ -4851,6 +5061,7 @@ export class PlatformServices {
   readonly dependents: DependentsService;
   readonly errors: ErrorsService;
   readonly jobs: JobsService;
+  readonly mandate: MandateService;
   readonly memory: MemoryService;
   readonly pact: PactService;
   readonly portfolio: PortfolioService;
@@ -4869,6 +5080,7 @@ export class PlatformServices {
     this.dependents = new DependentsService(caller);
     this.errors = new ErrorsService(caller);
     this.jobs = new JobsService(caller);
+    this.mandate = new MandateService(caller);
     this.memory = new MemoryService(caller);
     this.pact = new PactService(caller);
     this.portfolio = new PortfolioService(caller);
@@ -5258,6 +5470,41 @@ export const SDK_REQUESTS: ReadonlyArray<{ id: string; service: string; request:
     "id": "jobs.copy",
     "service": "jobs",
     "request": "copy",
+    "transport": "platform",
+    "tier": "platform"
+  },
+  {
+    "id": "mandate.organizations",
+    "service": "mandate",
+    "request": "organizations",
+    "transport": "platform",
+    "tier": "platform"
+  },
+  {
+    "id": "mandate.organization",
+    "service": "mandate",
+    "request": "organization",
+    "transport": "platform",
+    "tier": "platform"
+  },
+  {
+    "id": "mandate.read",
+    "service": "mandate",
+    "request": "read",
+    "transport": "platform",
+    "tier": "platform"
+  },
+  {
+    "id": "mandate.chain",
+    "service": "mandate",
+    "request": "chain",
+    "transport": "platform",
+    "tier": "platform"
+  },
+  {
+    "id": "mandate.check",
+    "service": "mandate",
+    "request": "check",
     "transport": "platform",
     "tier": "platform"
   },
@@ -5749,6 +5996,11 @@ export const REQUEST_TIERS: Readonly<Record<string, "core" | "platform">> = {
   "jobs.quote_change": "platform",
   "jobs.change": "platform",
   "jobs.copy": "platform",
+  "mandate.organizations": "platform",
+  "mandate.organization": "platform",
+  "mandate.read": "platform",
+  "mandate.chain": "platform",
+  "mandate.check": "platform",
   "memory.remember": "platform",
   "memory.recall": "platform",
   "memory.reflect": "platform",
@@ -5760,6 +6012,15 @@ export const REQUEST_TIERS: Readonly<Record<string, "core" | "platform">> = {
   "names.resolve": "core",
   "names.claim": "core",
   "names.confirm": "core",
+  "nda.offer": "platform",
+  "nda.accept": "platform",
+  "nda.sign": "platform",
+  "nda.amend": "platform",
+  "nda.terminate": "platform",
+  "nda.withdraw": "platform",
+  "nda.get": "platform",
+  "nda.list": "platform",
+  "nda.bound": "platform",
   "owner.ask": "platform",
   "pact.send": "platform",
   "pact.connect": "platform",

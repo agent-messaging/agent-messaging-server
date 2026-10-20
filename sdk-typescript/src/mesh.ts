@@ -94,6 +94,7 @@ import {
   type RunsRequests,
   type SamplesRequests,
   type SchedulesRequests,
+  type MandateRequests,
 } from "./services.generated.js";
 import { platformCaller } from "./service-caller.js";
 import type {
@@ -3897,6 +3898,13 @@ export class AgentMesh {
    *  (platform-services/debt.json). */
   get debt(): DebtRequests {
     return this.platformServices().debt;
+  }
+
+  /** Charters and mandates (platform-services/mandate.json): read an
+   *  organization's charter and the mandates issued under it, and check
+   *  whether a person may commit the organization to an act. */
+  get mandate(): MandateRequests {
+    return this.platformServices().mandate;
   }
 
   /** PACT (platform-services/pact.json): have this agent talk to a
