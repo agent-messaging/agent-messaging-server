@@ -45,8 +45,19 @@ where its work did.
   a second, the cap on this read), the request is not refused: a streaming
   request runs under the requester's own id, so its chunks and its end reach
   the requester, but nothing is recorded on that id until a later read shows
-  it has no record or is this requester's; any other request runs under a new
-  id. "No record" answers are remembered for 30 seconds.
+  it has no record or is this requester's. A request that is not a stream
+  and names a task id is a resume, so when the record cannot be read it is
+  refused with a retryable `AGENT_UNAVAILABLE` rather than started as new
+  work with a second hold; so is a request naming a Task this agent already
+  ran for the same requester whose record does not answer. "No record"
+  answers are remembered for 30 seconds.
+- **A stream reads only the chunks that answer its own request.** Besides
+  the responder and the task id, every chunk (the signed final and its
+  `chunk_count` included) must be `in_reply_to` the request this agent sent
+  and addressed `to` this agent. Otherwise a stranger naming a buyer's stream
+  id, while the responder could not read the task record, got the honest
+  responder to sign chunks onto the buyer's stream subject, which joined the
+  buyer's stream or made it read as tampered.
 - **A stream that resumes a paused Task records `working` first**, so its
   ending is a legal step on the record.
 - **Only a Task's requester cancels it.** An inbound `task.cancel` is taken

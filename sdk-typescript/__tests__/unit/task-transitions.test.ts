@@ -561,13 +561,15 @@ describe("a slow or absent task manager", () => {
     return { conn, published, taskManager };
   }
 
-  async function streamPair(records: Records) {
+  async function streamPair(records: Records, gapMs = 0) {
     const bus = makeBus(records);
     const provider = AgentMesh.withConnection(bus.conn() as unknown as ConnectionManager, nkeys.createUser(), nkeys.createUser(), {});
     openAgents.push(provider);
     provider.onStreamRequest("stream", async (_input, _ctx, writer) => {
       writer.write("a");
+      if (gapMs) await sleep(gapMs);
       writer.write("b");
+      if (gapMs) await sleep(gapMs);
       writer.end("done");
     });
     await provider.register({ name: "streamer" });
@@ -608,6 +610,8 @@ describe("a slow or absent task manager", () => {
     bus.taskManager.down = false; // the task manager is back: the id has no record, so it is nobody else's
     expect((await readAll(s.chunks)).at(-1)).toEqual({ data: "done", final: true });
     await vi.waitFor(() => expect(bus.published.some((p) => p.subject === Subjects.taskUpdate(s.task_id))).toBe(true), { timeout: 5_000 });
+    // Cleared: the id is no longer being checked.
+    expect((provider as unknown as { unconfirmedTasks: Map<string, unknown> }).unconfirmedTasks.size).toBe(0);
   }, 15_000);
 
   it("a later read that shows somebody else's Task records nothing on it", async () => {
@@ -619,22 +623,101 @@ describe("a slow or absent task manager", () => {
     expect((await readAll(s.chunks)).at(-1)).toEqual({ data: "done", final: true });
     await sleep(1_500);
     expect(bus.published.some((p) => p.subject === Subjects.taskUpdate(s.task_id))).toBe(false);
+    // The verdict is in: the entry is gone, and the stranger's run under the
+    // id did not make it the id's owner here (the real requester is not refused).
+    const inner = provider as unknown as { unconfirmedTasks: Map<string, unknown>; dispatchOwners: { get(id: string): unknown } };
+    await vi.waitFor(() => expect(inner.unconfirmedTasks.size).toBe(0), { timeout: 6_000 });
+    expect(inner.dispatchOwners.get(s.task_id)).toBeUndefined();
+    expect(bus.published.some((p) => p.subject === Subjects.taskUpdate(s.task_id))).toBe(false);
   }, 15_000);
 
-  it("a plain request naming an id it cannot check runs under a new id", async () => {
+  it("an id the task manager never answers for reaches a verdict too, and its entry goes", async () => {
+    const { bus, provider, caller } = await streamPair(new Map());
+    const s = await caller.requestStream(provider.agentId, "stream", {}, { timeout_ms: 8_000 });
+    expect((await readAll(s.chunks)).at(-1)).toEqual({ data: "done", final: true });
+    const inner = provider as unknown as { unconfirmedTasks: Map<string, unknown>; dispatchOwners: { get(id: string): unknown } };
+    await vi.waitFor(() => expect(inner.unconfirmedTasks.size).toBe(0), { timeout: 8_000 });
+    expect(inner.dispatchOwners.get(s.task_id)).toBeUndefined();
+    expect(bus.published.some((p) => p.subject === Subjects.taskUpdate(s.task_id))).toBe(false);
+  }, 15_000);
+
+  it("chunks the honest responder signs for a stranger naming the stream's id are not the stream", async () => {
+    // The buyer's stream runs. The provider then forgets it (a restart, a
+    // replica, an eviction) and the task manager does not answer, so a
+    // stranger's stream request naming the buyer's id runs under it: signed
+    // chunks from the same responder land on the buyer's stream subject.
+    const { bus, provider, caller } = await streamPair(new Map(), 800);
+    bus.taskManager.down = false;
+    const s = await caller.requestStream(provider.agentId, "stream", {}, { timeout_ms: 8_000 });
+    (provider as unknown as { dispatchOwners: { forget(id: string): void } }).dispatchOwners.forget(s.task_id);
+    bus.taskManager.down = true;
+    const strangerKp = nkeys.createUser();
+    const stranger = strangerKp.getPublicKey();
+    const theirs = signEnvelope(
+      createEnvelope({
+        type: "request",
+        from: stranger,
+        to: provider.agentId,
+        task_id: s.task_id,
+        payload: { offering: "stream", input: {}, config: { stream: true } },
+      }),
+      strangerKp,
+    );
+    bus.conn().publish(Subjects.agentInbox(provider.agentId), encode(theirs));
+    const got = await readAll(s.chunks);
+    expect(got).toEqual([
+      { data: "a", final: false },
+      { data: "b", final: false },
+      { data: "done", final: true },
+    ]);
+    // The stranger's run did put signed chunks on the subject: the filter, not
+    // luck, kept them out.
+    await vi.waitFor(() =>
+      expect(
+        bus.published.some((p) => p.subject === Subjects.taskStream(s.task_id) && decodeUnverified(p.data).to === stranger),
+      ).toBe(true),
+    );
+  }, 15_000);
+
+  it("a plain request naming an id it cannot check is refused, retryably, and nothing runs", async () => {
     const records: Records = new Map();
-    const { conn, agent } = await responder(async () => { await sleep(60); return 1; }, 20, { records });
+    let calls = 0;
+    const { conn, agent } = await responder(async () => { calls++; await sleep(60); return 1; }, 20, { records });
     conn.taskManager.down = true;
     const kp = nkeys.createUser();
     const X = "named-while-down";
     deliver(conn, agent.agentId, kp, { offering: "work", input: {} }, X);
     await sleep(400);
-    expect(updates(conn, X)).toEqual([]);
-    expect(repliesTo(conn, kp.getPublicKey()).some((e) => e.error)).toBe(false);
-    const U = taskIdOf(conn, kp.getPublicKey());
-    expect(U).toBeTruthy();
-    expect(U).not.toBe(X);
-    expect(statuses(updates(conn, U!))).toEqual(["working", "completed"]);
+    expect(calls).toBe(0);
+    expect(taskTraffic(conn)).toEqual([]);
+    const refusal = repliesTo(conn, kp.getPublicKey()).find((e) => e.error);
+    expect(refusal?.error?.code).toBe("AGENT_UNAVAILABLE");
+    expect(refusal?.error?.retryable).toBe(true);
+  });
+
+  it("a resume this agent cannot confirm (the record does not answer) is refused, retryably, not started as new work", async () => {
+    const records: Records = new Map();
+    let calls = 0;
+    const { conn, agent } = await responder(() => {
+      if (calls++ === 0) throw new InputProblemsError(problem);
+      return { ok: true };
+    }, undefined, { records });
+    const kp = nkeys.createUser();
+    const buyer = kp.getPublicKey();
+    deliver(conn, agent.agentId, kp, { offering: "work", input: {} });
+    await vi.waitFor(() => expect(taskIdOf(conn, buyer)).toBeTruthy());
+    const T = taskIdOf(conn, buyer)!;
+    // The pause is no longer remembered (a resume that admission refused gave
+    // up its claim), and the task manager does not answer.
+    (agent as unknown as { resumableTasks: { forget(id: string): void } }).resumableTasks.forget(T);
+    conn.taskManager.down = true;
+    deliver(conn, agent.agentId, kp, { offering: "work", input: { step: "resume" } }, T);
+    await sleep(300);
+    expect(calls).toBe(1);
+    const refusal = repliesTo(conn, buyer).find((e) => e.error);
+    expect(refusal?.error?.code).toBe("AGENT_UNAVAILABLE");
+    expect(refusal?.error?.retryable).toBe(true);
+    expect(repliesTo(conn, buyer).filter((e) => e.task_id && e.task_id !== T)).toEqual([]);
   });
 
   it("'no record' is remembered briefly: two cancels for an unknown id read the record once", async () => {

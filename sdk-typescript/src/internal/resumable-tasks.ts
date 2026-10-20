@@ -131,4 +131,8 @@ export class NoRecordCache {
   delete(taskId: string): void {
     this.until.delete(taskId);
   }
+
+  get size(): number {
+    return this.until.size;
+  }
 }

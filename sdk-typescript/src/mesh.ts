@@ -630,6 +630,10 @@ export class AgentMesh {
     string,
     { requester: string; verdict: "pending" | "ours" | "theirs"; chain: Promise<void> }
   >();
+  /** Unconfirmed stream ids a later read showed (or could not show) to be
+   *  nobody this agent may record for: their remaining updates are dropped.
+   *  Short-lived and bounded (the stream's own tail). */
+  private readonly foreignTasks = new NoRecordCache(5 * 60_000);
   /** The §13.5 usage-receipt ledger: declared meter reports accumulated per
    *  task until the terminal respond attaches them as `payload.usage`. */
   private meterUsage = new MeterUsageLedger();
@@ -2848,6 +2852,9 @@ export class AgentMesh {
       streamTimeoutMs,
       config?.sign_chunks ?? false,
       initialEnv.from,
+      // …and answer THIS request, to this agent: the responder may be
+      // answering a stranger's request on the same subject (stream.ts).
+      { id: envelope.id, from: this.agentId },
     );
 
     return {
@@ -6260,13 +6267,28 @@ export class AgentMesh {
    * Chunks and the stream's end ride the stream subject and never wait.
    */
   private publishTaskUpdate(taskId: string, encoded: Uint8Array): void {
+    if (this.foreignTasks.has(taskId)) return;
     const pending = this.unconfirmedTasks.get(taskId);
     if (!pending) {
       this.conn.publish(Subjects.taskUpdate(taskId), encoded);
       return;
     }
     pending.chain = pending.chain.then(async () => {
-      if (pending.verdict === "pending") pending.verdict = await this.confirmTaskId(taskId, pending.requester);
+      if (pending.verdict === "pending") {
+        pending.verdict = await this.confirmTaskId(taskId, pending.requester);
+        // A verdict is final: the entry goes, so the map holds only ids still
+        // being checked. Updates already queued behind it read `pending`, and
+        // later ones (no entry) for a cleared id publish directly; for an id
+        // that is somebody else's, `foreignTasks` keeps dropping them.
+        this.unconfirmedTasks.delete(taskId);
+        if (pending.verdict === "theirs") {
+          this.foreignTasks.add(taskId);
+          // This agent ran the stranger's work under the id, which made it
+          // the dispatch's owner here. It is not: the real requester must not
+          // be refused under it.
+          if (this.dispatchOwners.get(taskId)?.requester === pending.requester) this.dispatchOwners.forget(taskId);
+        }
+      }
       if (pending.verdict === "ours") this.conn.publish(Subjects.taskUpdate(taskId), encoded);
     });
   }
@@ -6282,7 +6304,6 @@ export class AgentMesh {
       const ours =
         seen.kind === "none" ||
         (seen.kind === "record" && seen.requester === requester && seen.responder === this.agentId);
-      if (ours) this.unconfirmedTasks.delete(taskId);
       return ours ? "ours" : "theirs";
     }
     return "theirs";
@@ -6377,6 +6398,13 @@ export class AgentMesh {
         `Send the request without a task_id to start new work.`,
       retryable: false,
     };
+    const cannotCheck = (reason: string): ErrorObject => ({
+      code: ErrorCode.AGENT_UNAVAILABLE,
+      message:
+        `This request names Task ${named}, and its record could not be read to confirm it can be resumed ` +
+        `(${reason}). Send it again shortly.`,
+      retryable: true,
+    });
     const known = this.resumableTasks.get(named);
     if (known) {
       if (known.requester !== env.from) return { kind: "refuse", error: notYours };
@@ -6417,6 +6445,9 @@ export class AgentMesh {
       if (mine.kind === "record" && mine.requester === env.from && mine.responder === this.agentId && mine.state === "input_required") {
         return { kind: "resume", taskId: named };
       }
+      // No answer: this may be a resume of its paused Task, and new work under
+      // a new id (with a second hold) would be the wrong guess. Retry.
+      if (mine.kind === "unreadable") return { kind: "refuse", error: cannotCheck(mine.reason) };
       return { kind: "fresh", taskId: uuid7() };
     }
 
@@ -6435,8 +6466,11 @@ export class AgentMesh {
       // requester's own id, because its requester listens only on that id's
       // channels, with nothing recorded on it until a later read clears it
       // (publishTaskUpdate). Anything else runs under a new id.
+      // A request that is not a stream and names a task id is a resume (only
+      // requestStream makes its own ids), so it is refused, retryably, rather
+      // than started as new work with a second hold.
       case "unreadable":
-        return stream ? { kind: "fresh", taskId: named, unconfirmed: true } : { kind: "fresh", taskId: uuid7() };
+        return stream ? { kind: "fresh", taskId: named, unconfirmed: true } : { kind: "refuse", error: cannotCheck(seen.reason) };
     }
     if (seen.requester !== env.from || seen.responder !== this.agentId) return { kind: "refuse", error: notYours };
     if (seen.state === "input_required") return { kind: "resume", taskId: named };

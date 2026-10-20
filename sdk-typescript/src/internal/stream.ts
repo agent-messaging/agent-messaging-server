@@ -156,7 +156,18 @@ export function createStreamWriter(
  *  substitute a whole streamed answer with self-signed chunks (setting
  *  `chunk_count` to its own count so the truncation check passed too), or kill
  *  a stream at will. Binding every chunk to the opener closes that: the stream
- *  is what the responder said, or it is not the stream. */
+ *  is what the responder said, or it is not the stream.
+ *
+ *  `request` binds every chunk to THIS exchange as well: its `in_reply_to`
+ *  must be the request envelope this agent sent and its `to` this agent.
+ *  The opener check alone is not enough, because the honest responder can be
+ *  made to sign chunks onto this stream's subject for somebody else: a
+ *  stranger that names this stream's task id in its own stream request
+ *  (while the responder cannot read the task record to see whose it is) gets
+ *  the responder to answer the stranger, signed, on the same subject. Those
+ *  chunks are dropped before they are counted, the signed final and its
+ *  `chunk_count` included, so they can neither join the stream nor make the
+ *  real one read as tampered. */
 export function createChunkIterable(
   sub: Subscription,
   taskId: string,
@@ -165,6 +176,7 @@ export function createChunkIterable(
   streamTimeoutMs: number,
   requireSignedChunks = false,
   responderId?: string,
+  request?: { id: string; from: string },
 ): AsyncIterable<StreamChunk> {
   async function* generate(): AsyncGenerator<StreamChunk> {
     const iter = sub[Symbol.asyncIterator]();
@@ -228,6 +240,8 @@ export function createChunkIterable(
         // the stream, which is the attack, not the defence.
         if (responderId !== undefined && env.from !== responderId) continue;
         if (env.task_id !== taskId) continue;
+        // …nor a chunk answering somebody else's request on the same subject.
+        if (request !== undefined && (env.in_reply_to !== request.id || env.to !== request.from)) continue;
 
         // An error frame reports a fault rather than carrying a chunk, so it is
         // read before the chunk-shape check below and needs no payload at all.
