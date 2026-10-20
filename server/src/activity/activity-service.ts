@@ -48,6 +48,7 @@ import {
 import { MeteringFold } from "./metering-fold.js";
 import { tapOutcome, unansweredReason } from "./monitor-classify.js";
 import { WitnessFold } from "./witness-fold.js";
+import { ExchangeIndex, type ExchangeRecord } from "./exchange-index.js";
 import { dataDbPath } from "../data-dir.js";
 import { coreUrl } from "../shared/settings.js";
 
@@ -316,13 +317,20 @@ export class ActivityService {
   private sandboxKeys: ReadonlySet<string> = new Set();
 
   private kv: KeyedStore;
+  /** The durable, content-free request index (exchange-index.ts) an answer is
+   *  correlated through when its request has left the ring. Null when the
+   *  store could not be opened at boot: answers to evicted requests then go
+   *  unmetered, as they did before the index existed, and boot said so. */
+  private index: ExchangeIndex | null;
 
   constructor(
     private nc: Messaging,
     private js: StorageLike,
     kv: KeyedLike,
+    index?: KeyedLike,
   ) {
     this.kv = keyedOf(kv, js);
+    this.index = index ? new ExchangeIndex(keyedOf(index, js)) : null;
   }
 
   static async create(
@@ -330,7 +338,17 @@ export class ActivityService {
     js: StorageLike,
   ): Promise<ActivityService> {
     const kv = await storageOf(js).keyed("mesh_activity");
-    const service = new ActivityService(messagingOf(nc), js, kv);
+    let index: KeyedStore | undefined;
+    try {
+      index = await storageOf(js).keyed("mesh_activity_requests");
+    } catch (err) {
+      console.error(
+        "[activity] EXCHANGE INDEX UNAVAILABLE — an answer whose request has left the " +
+          "activity ring will record no meter events:",
+        err instanceof Error ? err.message : err,
+      );
+    }
+    const service = new ActivityService(messagingOf(nc), js, kv, index);
 
     // Which keys are shared sandbox credentials: the operator's attestations.
     service.sandboxKeys = sandboxKeysOf(process.env.NODE_ATTESTATIONS);
@@ -358,6 +376,13 @@ export class ActivityService {
       // front of the ring and push genuine rows out of it. Same defect as the
       // age bound's, same fix.
       service.entries.sort((a, b) => (agedAt(b) ?? "").localeCompare(agedAt(a) ?? ""));
+      // Rows written before the exchange index existed have no record there.
+      // Seed one (never overwriting) BEFORE the trim below, so a request the
+      // trim pushes out of the ring can still have its answer metered.
+      for (const e of service.entries) {
+        const rec = recordOf(e);
+        if (rec) service.index?.seed(rec);
+      }
       // Trim to max (the count bound; the age bound is swept, not applied here —
       // see `sweepExpired` on why load deliberately deletes nothing by age).
       if (service.entries.length > MAX_ENTRIES) {
@@ -642,6 +667,18 @@ export class ActivityService {
       status: "completed", // optimistic — updated if we see a failure response
     };
 
+    // The durable twin of the ring row, without the content: what an answer
+    // needs to be metered after the row has been evicted (exchange-index.ts).
+    this.index?.remember({
+      v: 1,
+      requestId: env.id,
+      from: entry.from,
+      to: entry.to,
+      offering,
+      ...(env.task_id ? { taskId: env.task_id } : {}),
+      recordedAt: entry.recordedAt!,
+    });
+
     this.addEntry(entry);
   }
 
@@ -684,7 +721,13 @@ export class ActivityService {
         (env.in_reply_to !== undefined && e.requestId === env.in_reply_to) ||
         (env.task_id !== undefined && e.taskId === env.task_id),
     );
-    if (!entry) return;
+    if (!entry) {
+      // Not in the ring — evicted by the count bound (500 exchanges MESH-WIDE),
+      // the age bound, or a restart's trim. The answer is still traffic and
+      // still billable, so it is metered from the durable index instead.
+      this.recordFromIndex(env, bytes);
+      return;
+    }
 
     // Only the responder of record answers its own exchange. A respond signed
     // by ANYONE ELSE - the admission service's benign ack, a node's queued
@@ -718,56 +761,20 @@ export class ActivityService {
       entry.error = env.error.message ?? "Unknown error";
     }
 
-    // Usage accounting: a response left this agent (entry.to is the agent).
-    // Count once per exchange — task-mode agents respond multiple times —
-    // but bytes count on every response, because every response is traffic.
-    // Same normal/degraded split as recordRequest; the fold reconstructs the
-    // once-per-exchange rule from which events the batch carries.
-    const metered = this.meteringOn && entry.to !== "" && entry.from !== "";
-    // §13.5 request_id: every event derived from this answer names the request
-    // it answers, so a reader joins the request's batch (keyed by its own
-    // envelope_id) to this one without the correlation held here. The entry's
-    // own id first: a task-mode respond correlated by task_id carries no
-    // in_reply_to. Pre-fix KV entries have no requestId; in_reply_to covers them.
-    const requestId = entry.requestId ?? env.in_reply_to ?? undefined;
-
-    // §13.5 usage receipt, lifted into DECLARED meter events. Two shapes
-    // carry one, and `usageReceiptParties` decides which and who is which:
-    // a terminal respond (the responder did the work) and an inbox-mode
-    // answer, which is a fresh request carrying `in_reply_to` (the SENDER did
-    // the work). The second was harvested by nothing until 2026-08-02, so
-    // every inbox agent on the fleet metered zero — including the one live
-    // priced agent, which enforced its price at admission and then charged
-    // for nothing.
-    //
-    // The receipt rode the reporter's own envelope signature; these events
-    // carry the claim into the stream, where rating (§19.6) decides what it is
-    // worth. Validated whether or not metering is on, because the audit chains
-    // record the claim either way.
-    let receiptEntries: Array<{ meter: string; quantity: number }> | undefined;
-    {
-      const parties = usageReceiptParties(env, entry);
-      if (parties) {
-        const { batch, dropped } = declaredUsage(
-          parties.provider, parties.consumer, env.id, parties.raw, entry.offering, env.task_id, requestId,
-        );
-        if (dropped > 0) {
-          console.warn(`[activity] dropped ${dropped} malformed usage entr(y/ies) from ${parties.provider.slice(0, 12)}…`);
-        }
-        if (batch.events.length > 0) {
-          receiptEntries = batch.events.map((e) => ({ meter: e.meter, quantity: e.quantity }));
-          if (this.meteringOn) publishMeterEvents(this.nc, this.kp, batch);
-        }
-      }
-    }
-    if (entry.to && entry.respondedAt) {
-      if (metered) {
-        publishMeterEvents(this.nc, this.kp, observedResponseBytes(entry.to, entry.from, env.id, bytes, requestId));
-      } else {
-        this.usage.recordOutBytes(entry.to, bytes);
-      }
-    }
-    if (entry.to && !entry.respondedAt) {
+    // The meter events, from the ring row (see meterAnswer).
+    const first = !entry.respondedAt;
+    const receiptEntries = this.meterAnswer(env, bytes, {
+      from: entry.from,
+      to: entry.to,
+      offering: entry.offering,
+      // The entry's own id first: a task-mode respond correlated by task_id
+      // carries no in_reply_to. Pre-fix KV entries have no requestId;
+      // in_reply_to covers them.
+      requestId: entry.requestId ?? env.in_reply_to ?? undefined,
+      first,
+      failed: entry.status === "failed",
+    });
+    if (entry.to && first) {
       // The Monitor: how the exchange came out and how long delivery took,
       // on the first answer only. The first answer from a mailbox agent is
       // its receipt that the message was filed, so the time is send to inbox.
@@ -783,27 +790,11 @@ export class ActivityService {
           });
         }
       }
-      if (metered) {
-        publishMeterEvents(
-          this.nc,
-          this.kp,
-          observedResponse(entry.to, entry.from, env.id, bytes, entry.status === "failed", entry.offering, env.task_id, requestId),
-        );
-        // §13.5 refusal events: an admission refusal is declined demand, and
-        // both parties reasonably want it recorded. Derives from the REFUSING
-        // respond's id (metering.ts says why not the request's).
-        const code = env.error?.code;
-        if (code !== undefined && ADMISSION_REFUSAL_CODES.has(code)) {
-          publishMeterEvents(
-            this.nc,
-            this.kp,
-            observedRefusal(entry.to, entry.from, env.id, code, entry.offering, requestId),
-          );
-        }
-      } else {
-        this.usage.recordOut(entry.to, entry.status === "failed", bytes);
-      }
       entry.respondedAt = new Date().toISOString();
+      // The index learns the exchange has been answered, so a follow-up that
+      // arrives after this row leaves the ring counts bytes only, as here.
+      const rec = recordOf(entry);
+      if (rec) this.index?.remember(rec);
       // Durable history: one event per completed exchange. Metadata only —
       // parties, offering, outcome, duration; never content.
       metrics.event({
@@ -845,6 +836,140 @@ export class ActivityService {
     // Persist update
     const data = new TextEncoder().encode(JSON.stringify(entry));
     this.kv.put(entry.id, data).catch(() => {});
+  }
+
+  /**
+   * The §13.5 meter events an answer produces — the one place they are built,
+   * whether the exchange was found in the ring or in the exchange index.
+   * Returns the declared usage receipt's entries, for the audit row.
+   *
+   * Usage accounting: a response left this agent (`x.to` is the agent). The
+   * exchange counts once — task-mode agents respond multiple times, so only
+   * the `first` answer is a `responses` event — but bytes count on every
+   * answer, because every answer is traffic. Same normal/degraded split as
+   * recordRequest; the fold reconstructs the once-per-exchange rule from which
+   * events the batch carries.
+   *
+   * §13.5 request_id: every event derived from an answer names the request it
+   * answers, so a reader joins the request's batch (keyed by its own
+   * envelope_id) to this one without the correlation held here.
+   */
+  private meterAnswer(
+    env: Envelope,
+    bytes: number,
+    x: { from: string; to: string; offering: string; requestId?: string; first: boolean; failed: boolean },
+  ): Array<{ meter: string; quantity: number }> | undefined {
+    const metered = this.meteringOn && x.to !== "" && x.from !== "";
+
+    // §13.5 usage receipt, lifted into DECLARED meter events. Two shapes
+    // carry one, and `usageReceiptParties` decides which and who is which:
+    // a terminal respond (the responder did the work) and an inbox-mode
+    // answer, which is a fresh request carrying `in_reply_to` (the SENDER did
+    // the work). The second was harvested by nothing until 2026-08-02, so
+    // every inbox agent on the fleet metered zero — including the one live
+    // priced agent, which enforced its price at admission and then charged
+    // for nothing.
+    //
+    // The receipt rode the reporter's own envelope signature; these events
+    // carry the claim into the stream, where rating (§19.6) decides what it is
+    // worth. Validated whether or not metering is on, because the audit chains
+    // record the claim either way.
+    let receiptEntries: Array<{ meter: string; quantity: number }> | undefined;
+    const parties = usageReceiptParties(env, x);
+    if (parties) {
+      const { batch, dropped } = declaredUsage(
+        parties.provider, parties.consumer, env.id, parties.raw, x.offering, env.task_id, x.requestId,
+      );
+      if (dropped > 0) {
+        console.warn(`[activity] dropped ${dropped} malformed usage entr(y/ies) from ${parties.provider.slice(0, 12)}…`);
+      }
+      if (batch.events.length > 0) {
+        receiptEntries = batch.events.map((e) => ({ meter: e.meter, quantity: e.quantity }));
+        if (this.meteringOn) publishMeterEvents(this.nc, this.kp, batch);
+      }
+    }
+    if (x.to && !x.first) {
+      if (metered) {
+        publishMeterEvents(this.nc, this.kp, observedResponseBytes(x.to, x.from, env.id, bytes, x.requestId));
+      } else {
+        this.usage.recordOutBytes(x.to, bytes);
+      }
+    }
+    if (x.to && x.first) {
+      if (metered) {
+        publishMeterEvents(
+          this.nc,
+          this.kp,
+          observedResponse(x.to, x.from, env.id, bytes, x.failed, x.offering, env.task_id, x.requestId),
+        );
+        // §13.5 refusal events: an admission refusal is declined demand, and
+        // both parties reasonably want it recorded. Derives from the REFUSING
+        // respond's id (metering.ts says why not the request's).
+        const code = env.error?.code;
+        if (code !== undefined && ADMISSION_REFUSAL_CODES.has(code)) {
+          publishMeterEvents(
+            this.nc,
+            this.kp,
+            observedRefusal(x.to, x.from, env.id, code, x.offering, x.requestId),
+          );
+        }
+      } else {
+        this.usage.recordOut(x.to, x.failed, bytes);
+      }
+    }
+    return receiptEntries;
+  }
+
+  /**
+   * Meter an answer whose request is no longer in the ring, from the exchange
+   * index (exchange-index.ts) — the same events, under the same
+   * (meter, envelope_id) keys, as if the row had still been there.
+   *
+   * The guards are the ring path's, applied to the stored request: only the
+   * responder of record answers its own exchange, and one envelope counts
+   * once however many subjects delivered it. "First answer" is the record's
+   * `respondedAt`, which the ring path writes too, so an exchange answered
+   * while its row was in the ring and followed up after it left counts its
+   * `responses` once.
+   *
+   * What it does NOT do is everything the ring row exists for beyond billing:
+   * no duration (the start time was the row's), no Monitor pair, no history
+   * event, no audit row. Those describe the exchange for the activity views
+   * and the account's audit chains, which have their own backstop for what
+   * the tap missed (the witness fold); the meter stream is what bills.
+   */
+  private recordFromIndex(env: Envelope, bytes: number): void {
+    const index = this.index;
+    if (!index) return;
+    const viaRequest = (requestId: string) =>
+      index.update(requestId, (rec) => {
+        if (!rec) return null;
+        if (rec.to !== "" && env.from !== rec.to) return null;
+        if (!this.rememberRespond(env.id)) return null;
+        const first = !rec.respondedAt;
+        this.meterAnswer(env, bytes, {
+          from: rec.from,
+          to: rec.to,
+          offering: rec.offering,
+          requestId: rec.requestId,
+          first,
+          failed: !!env.error,
+        });
+        return first ? { ...rec, respondedAt: new Date().toISOString() } : null;
+      });
+    (async () => {
+      // in_reply_to names the request outright (bare mode, and task-mode
+      // answers that carry it). A task-mode answer with only a task id goes
+      // through the requester-scoped task alias; the requester is the
+      // respond's `to`.
+      let requestId: string | undefined = env.in_reply_to ?? undefined;
+      if (requestId === undefined && env.task_id !== undefined && env.to) {
+        requestId = await index.requestForTask(env.to, env.task_id);
+      }
+      if (requestId !== undefined) await viaRequest(requestId);
+    })().catch((err) =>
+      console.error("[activity] metering an evicted exchange failed:", err instanceof Error ? err.message : err),
+    );
   }
 
   /**
@@ -1419,6 +1544,24 @@ export class ActivityService {
       payload: { agents, day: new Date().toISOString().slice(0, 10) },
     });
   }
+}
+
+/** A ring row's content-free twin in the exchange index; null for a row that
+ *  predates `requestId` (nothing to key it by). */
+function recordOf(e: ActivityEntry): ExchangeRecord | null {
+  if (!e.requestId) return null;
+  return {
+    v: 1,
+    requestId: e.requestId,
+    from: e.from,
+    to: e.to,
+    offering: e.offering,
+    // No taskId: the row's is minted when the request carried none, and the
+    // row cannot say which. The task alias is written once, at request time,
+    // where the envelope can (recordRequest).
+    recordedAt: agedAt(e) ?? new Date().toISOString(),
+    ...(e.respondedAt ? { respondedAt: e.respondedAt } : {}),
+  };
 }
 
 /** The keys an operator attests as sandbox nodes (NODE_ATTESTATIONS). */

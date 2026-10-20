@@ -69,6 +69,10 @@ export const KEYED_STORES = {
   mesh_artifacts_index: { history: 1 },
   // Activity: the request log and the audit backstop's watch.
   mesh_activity: { history: 1 },
+  // The exchange index (activity/exchange-index.ts): who asked whom, per request
+  // id, no content, so an answer meters after its ring row is gone. A week, the
+  // Task horizon: deferred work answered inside it still meters.
+  mesh_activity_requests: { history: 1, ttlMs: 7 * DAY_MS },
   mesh_witness_watch: { history: 1 },
   // Feeds: the latest state of each state feed.
   mesh_feed_state: { history: 1 },

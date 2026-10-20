@@ -95,7 +95,10 @@ describe("the bridge marker on the activity row", () => {
     const kv = createMockKv();
     const h = fakeJs();
     const bucket = Object.assign(kv, { status: h.bucket("mesh_activity", () => [...kv.store.keys()]) });
-    const js = { views: { kv: async () => bucket }, jetstreamManager: h.jetstreamManager };
+    const js = {
+      views: { kv: async (name: string) => (name === "mesh_activity" ? bucket : createMockKv()) },
+      jetstreamManager: h.jetstreamManager,
+    };
     const svc = await mod.ActivityService.create(createMockNc() as never, js as never);
     live.push(svc);
     return { svc, kv };

@@ -136,7 +136,12 @@ describe("activity ring retention", () => {
     // stream's subject list, so the fake needs `status()` and a manager. The key
     // list is read at call time, so the sweep sees the bucket as it is then.
     const bucket = Object.assign(kv, { status: h.bucket("mesh_activity", () => [...kv.store.keys()]) });
-    const js = { views: { kv: async () => bucket }, jetstreamManager: h.jetstreamManager };
+    // Every other bucket (the exchange index) is a bucket of its own, so this
+    // suite's counts are the activity ring's alone.
+    const js = {
+      views: { kv: async (name: string) => (name === "mesh_activity" ? bucket : createMockKv()) },
+      jetstreamManager: h.jetstreamManager,
+    };
     const svc = await mod.ActivityService.create(createMockNc() as never, js as never);
     live.push(svc);
     return svc;
