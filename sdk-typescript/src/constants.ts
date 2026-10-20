@@ -68,9 +68,15 @@ export const TASK_RECORD_TIMEOUT_MS = 10_000;
  *  terminal update the task manager had not stored yet at the first read. */
 export const TASK_RECORD_RECHECK_MS = 1_500;
 /** While awaitTask waits, the task record is read again at growing intervals
- *  (1 s, 2 s, 4 s, ...) up to this one, so a terminal update lost in transit
- *  is still found. */
+ *  (from TASK_RECORD_POLL_FIRST_MS, doubling) up to this one, so a terminal
+ *  update lost in transit is still found. */
 export const TASK_RECORD_POLL_MAX_MS = 30_000;
+/** The first of those re-reads. Short, because the commonest miss is a
+ *  deferred Task that finished just as it deferred: its terminal update went
+ *  out before the requester's subscription was live, and the first record
+ *  read came a moment before the task manager stored it (a deferral records
+ *  `working` first, so the terminal is the second update it applies). */
+export const TASK_RECORD_POLL_FIRST_MS = 250;
 
 /** How many mailbox messages one §16.4 drain pull asks for. Bounds client-side
  *  buffering: a 25 MB backlog is drained in batches, never pulled into memory

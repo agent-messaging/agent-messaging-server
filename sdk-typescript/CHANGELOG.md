@@ -23,20 +23,42 @@ where its work did.
   reply, so a requester that acts on the reply at once finds the Task.
 - **Only a Task's own requester resumes it.** Naming a task id is not owning
   it: ids are broadcast on `mesh.event.task.*`. A responder now remembers, for
-  every Task it pauses or defers, who asked for it (for as long as the task
-  manager keeps the record), and a request naming a Task is a resume only when
-  it comes from that requester. When the responder does not remember the Task
-  (after a restart), it reads the Task's record and checks that `env.from` is
-  its requester, this agent its responder, and the Task still paused. A
-  request naming somebody else's Task is refused with `UNAUTHORIZED` and
-  nothing is recorded on that Task. This also closes the same hole on the
-  deferred and streaming paths, which recorded on any task id a request
-  named. A request naming a Task nobody has recorded (a `requestStream` id)
-  runs as ordinary work, so a stream that falls through to a plain handler
-  and answers at once still creates no Task, no receipt and no meter events.
+  every Task it pauses, who asked for it (for as long as the task manager
+  keeps the record), and a request naming a Task is a resume only when it
+  comes from that requester. A remembered pause is a hint: it is forgotten
+  when the Task is canceled or ended here, and one older than 30 seconds is
+  confirmed on the Task's record before it resumes. When the responder does
+  not remember the Task (after a restart), it reads the record and checks
+  that `env.from` is its requester, this agent its responder, and the Task
+  still paused. A request naming somebody else's Task is refused with
+  `UNAUTHORIZED` and nothing is recorded on that Task. This also closes the
+  same hole on the deferred and streaming paths, which recorded on any task
+  id a request named.
+- **A Task still working is not resumable.** A requester naming its own
+  deferred Task gets new work under a new id, not a second handler on the
+  same Task.
+- **A request naming a Task nobody has recorded** (a `requestStream` id) runs
+  as ordinary work, so a stream that falls through to a plain handler and
+  answers at once still creates no Task, no receipt and no meter events. When
+  the record cannot be read (the task manager is slow or down), the request
+  runs as ordinary work under a new id rather than being refused. "No record"
+  answers are remembered for 30 seconds.
+- **A stream that resumes a paused Task records `working` first**, so its
+  ending is a legal step on the record.
+- **Only a Task's requester cancels it.** An inbound `task.cancel` is taken
+  only from the agent that asked for the Task (what this agent remembers of
+  its dispatches, or else the Task's record). Anybody else's is refused with
+  `UNAUTHORIZED` and does nothing: no hold released, no subcontracted Task
+  canceled.
 - **A queued ack does not complete a resumed Task.** An interactive agent
   that queues a resume for its session leaves the record `working` until the
   real answer.
+- **`awaitTask` re-reads the record sooner** (250 ms, then doubling, was
+  1 s). A deferred Task that finished just as it deferred could have its
+  terminal update go out before the requester's subscription was live, and,
+  now that a deferral records `working` first, the first record read could
+  land just before the task manager stored the terminal. The answer came up
+  to a second late.
 - Inbox replies are unchanged. Usage receipts stay on the inbox reply only.
 
 ## 0.62.2 (2026-10-20)

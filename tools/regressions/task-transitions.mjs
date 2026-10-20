@@ -16,6 +16,10 @@
 //   - a third agent naming the buyer's paused Task: refused, the Task untouched
 //     (failed on the first #41 head, which took any request naming a Task as
 //     its resume and recorded the stranger's outcome on the buyer's Task)
+//   - a third agent sending task.cancel for the buyer's paused Task: refused
+//     with UNAUTHORIZED, and the buyer still resumes it (failed on 52454b2,
+//     which took a cancel from anyone, releasing the hold and cancelling the
+//     Task's subcontracts)
 //   - a streaming request that falls through to a plain handler and answers
 //     at once: no Task record (the first #41 head created one, and with it a
 //     §19.2 receipt and meter events)
@@ -155,6 +159,15 @@ function sendNaming(via, from, kp, taskId, payload) {
   const after = await record(r.task_id);
   const untouched = after?.state === "input_required" && (after?.history ?? []).length === seen;
   results.push([untouched, `a stranger naming the buyer's paused Task leaves it alone (${statesOf(after).join(" → ")})`]);
+  // The stranger's task.cancel for it: refused, and it does nothing.
+  let cancelAnswer;
+  try {
+    const c = await stranger.request(sellerAgent.id, "task.cancel", { task_id: r.task_id, reason: "user_requested" }, { timeout_ms: 10_000 });
+    cancelAnswer = c.payload?.status ?? "no status";
+  } catch (e) {
+    cancelAnswer = e?.code ?? String(e);
+  }
+  results.push([cancelAnswer === "UNAUTHORIZED", `a stranger's task.cancel for the buyer's paused Task is refused (${cancelAnswer})`]);
   // The buyer still resumes it.
   sendNaming(buyer, buyerAgent, buyerKp, r.task_id, { offering: "needs-file", input: { file: "here", then: "complete" } });
   const rec = await until(r.task_id, (x) => x.state === "completed");

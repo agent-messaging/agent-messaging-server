@@ -192,6 +192,7 @@ import {
   TASK_RECORD_TIMEOUT_MS,
   TASK_RECORD_RECHECK_MS,
   TASK_RECORD_POLL_MAX_MS,
+  TASK_RECORD_POLL_FIRST_MS,
 } from "./constants.js";
 import { fenceInboundInput, inboundTextLength } from "./internal/fence.js";
 import { cardText, fitCheck, inputNotUnderstood, isHelpQuestion, offeringsFromManifest } from "./input-fit.js";
@@ -231,7 +232,7 @@ import { derivedSealing } from "./internal/sealing-posture.js";
 import { AdmissionGate, readKnockInput, textOfInput, type AdmissionControl, type AdmissionOptions, type DescribeDocument, type SenderFacts } from "./admission.js";
 import { describeDocumentOf } from "./interview.js";
 import { registrarNameLookup } from "./naming-gate.js";
-import { ResumableTasks } from "./internal/resumable-tasks.js";
+import { NoRecordCache, RESUME_HINT_FRESH_MS, ResumableTasks } from "./internal/resumable-tasks.js";
 import {
   StorefrontAdopter,
   type StorefrontAdoption,
@@ -616,6 +617,11 @@ export class AgentMesh {
   /** The Tasks this agent paused or deferred, and who asked for each: the
    *  only requests that resume one (resolveDispatchTask). */
   private readonly resumableTasks = new ResumableTasks();
+  /** Who asked for each dispatch this agent ran under a task id: the only
+   *  agent whose task.cancel for it is taken (cancelStanding). */
+  private readonly dispatchOwners = new ResumableTasks();
+  /** Task ids the task manager recently had no record of. */
+  private readonly noRecord = new NoRecordCache();
   /** The §13.5 usage-receipt ledger: declared meter reports accumulated per
    *  task until the terminal respond attaches them as `payload.usage`. */
   private meterUsage = new MeterUsageLedger();
@@ -4730,7 +4736,7 @@ export class AgentMesh {
         // a terminal published from then on arrives on it. One published
         // before is in the local store or in the task manager's record.
         await this.connFlushed();
-        let wait = 1_000;
+        let wait = TASK_RECORD_POLL_FIRST_MS;
         while (!done) {
           if (fromLocal()) return;
           const recorded = await this.terminalFromRecord(taskId);
@@ -5291,6 +5297,7 @@ export class AgentMesh {
     this.tasks.transition(taskId, "canceled");
     this.unwatchTaskUpdates(taskId);
     this.forgetDelegation(taskId);
+    this.resumableTasks.forget(taskId);
 
     // The notification: tell the counterparty to stop, §10.8's composed
     // request. Fire-and-forget by design — the requester does not wait, and
@@ -5376,6 +5383,8 @@ export class AgentMesh {
     this.tasks.transition(taskId, "failed");
     this.unwatchTaskUpdates(taskId);
     this.forgetDelegation(taskId);
+    // Ended: no request resumes it any more.
+    this.resumableTasks.forget(taskId);
   }
 
   /** Record the sub-request a running handler just issued (§10.8): if there
@@ -6230,15 +6239,55 @@ export class AgentMesh {
   }
 
   /** Keep `resumableTasks` in step with what this agent records on a Task: a
-   *  pause or a deferral (`input_required`, `working`) leaves it resumable by
-   *  the requester that asked for it, and a terminal statement ends that. */
+   *  pause (`input_required`) leaves it resumable by the requester that asked
+   *  for it, and anything else (`working` on a resume or a deferral, or a
+   *  terminal statement) ends that. A Task still working is not resumable: a
+   *  second request naming it would run a second handler beside the first. */
   private noteResumable(taskId: string, requestEnv: Envelope, status: string | undefined): void {
-    if (status === "input_required" || status === "working") {
+    if (status === "input_required") {
       const offering = (requestEnv.payload as RequestPayload | undefined)?.offering;
       this.resumableTasks.remember(taskId, requestEnv.from, typeof offering === "string" ? offering : "");
-    } else if (status && TERMINAL_STATES.has(status as TaskState)) {
+      this.noRecord.delete(taskId);
+    } else if (status) {
       this.resumableTasks.forget(taskId);
     }
+  }
+
+  /** What the task manager's record (§7.4) says about a Task's parties.
+   *  `none`: no record (cached briefly). `not_party`: a record this agent may
+   *  not read, so somebody else's. `unreadable`: no answer that says either. */
+  private async readTaskParties(
+    taskId: string,
+  ): Promise<
+    | { kind: "record"; requester: string; responder: string; state: unknown; offering: string }
+    | { kind: "none" }
+    | { kind: "not_party" }
+    | { kind: "unreadable"; reason: string }
+  > {
+    if (this.noRecord.has(taskId)) return { kind: "none" };
+    let record: { requester?: unknown; responder?: unknown; state?: unknown; offering?: unknown } | undefined;
+    try {
+      record = (await this.serviceRequest(Subjects.taskGet(taskId), { task_id: taskId }, TASK_RECORD_TIMEOUT_MS)) as typeof record;
+    } catch (err) {
+      const code = err instanceof MeshError ? err.code : undefined;
+      if (code === ErrorCode.TASK_NOT_FOUND || code === ErrorCode.NOT_FOUND) {
+        this.noRecord.add(taskId);
+        return { kind: "none" };
+      }
+      if (code === ErrorCode.UNAUTHORIZED) return { kind: "not_party" };
+      return { kind: "unreadable", reason: err instanceof Error ? err.message : "no answer" };
+    }
+    if (!record || typeof record.requester !== "string" || typeof record.responder !== "string") {
+      this.noRecord.add(taskId);
+      return { kind: "none" };
+    }
+    return {
+      kind: "record",
+      requester: record.requester,
+      responder: record.responder,
+      state: record.state,
+      offering: typeof record.offering === "string" ? record.offering : "",
+    };
   }
 
   /**
@@ -6249,18 +6298,20 @@ export class AgentMesh {
    * `mesh.event.task.*`, so a third party can name somebody else's paused
    * Task. And the task manager would take what this agent recorded on it,
    * because this agent is a party to that Task. So a request is a resume only
-   * when this agent paused or deferred that Task for `env.from`
-   * (`resumableTasks`), or, when it does not remember it (a restart, an
-   * evicted entry), when the Task's own record names `env.from` as the
-   * requester and this agent as the responder and is still paused.
+   * when this agent paused that Task for `env.from` (`resumableTasks`; an
+   * entry older than RESUME_HINT_FRESH_MS is confirmed on the record first),
+   * or, when it does not remember it (a restart, an evicted entry), when the
+   * Task's own record names `env.from` as the requester and this agent as the
+   * responder and is still paused.
    *
-   * - `fresh`: ordinary work under `taskId` (the request's own id when it names
-   *   a Task nobody has recorded, such as a requestStream's requester-made id;
-   *   a new one when it names a Task this request may not touch). Nothing is
-   *   recorded on a Task the request named unless the work itself creates it.
+   * - `fresh`: ordinary work under `taskId`: the request's own id when it
+   *   names a Task nobody has recorded (a requestStream's requester-made id),
+   *   a NEW id when it names a Task that is not paused (still working, or
+   *   ended) or whose record could not be read. Nothing is recorded on a Task
+   *   the request named unless the work itself creates it.
    * - `resume`: the paused Task, resumed by its own requester.
-   * - `refuse`: the request names a Task that belongs to someone else, or one
-   *   whose parties could not be read. Answered with the error, never worked.
+   * - `refuse`: the request names a Task that positively belongs to someone
+   *   else. Answered with the error, never worked.
    */
   private async resolveDispatchTask(
     env: Envelope,
@@ -6275,40 +6326,86 @@ export class AgentMesh {
       retryable: false,
     };
     const known = this.resumableTasks.get(named);
-    if (known) return known.requester === env.from ? { kind: "resume", taskId: named } : { kind: "refuse", error: notYours };
+    if (known) {
+      if (known.requester !== env.from) return { kind: "refuse", error: notYours };
+      if (Date.now() - known.rememberedAt < RESUME_HINT_FRESH_MS) return { kind: "resume", taskId: named };
+      // An older pause is a hint: the Task may have ended where this agent
+      // could not see it (a cancel through the task manager, the overdue
+      // sweep). The record says; when it cannot be read, the hint stands.
+      const seen = await this.readTaskParties(named);
+      if (seen.kind === "unreadable") return { kind: "resume", taskId: named };
+      if (seen.kind === "not_party") return { kind: "refuse", error: notYours };
+      if (seen.kind === "record" && (seen.requester !== env.from || seen.responder !== this.agentId)) {
+        return { kind: "refuse", error: notYours };
+      }
+      if (seen.kind === "record" && seen.state === "input_required") {
+        this.resumableTasks.remember(named, env.from, known.offering);
+        return { kind: "resume", taskId: named };
+      }
+      this.resumableTasks.forget(named);
+      return { kind: "fresh", taskId: uuid7() };
+    }
 
-    // Not remembered: read the Task's record (§7.4), which carries both parties.
-    let record: { requester?: unknown; responder?: unknown; state?: unknown; offering?: unknown } | undefined;
-    try {
-      record = (await this.serviceRequest(Subjects.taskGet(named), { task_id: named }, TASK_RECORD_TIMEOUT_MS)) as typeof record;
-    } catch (err) {
-      const code = err instanceof MeshError ? err.code : undefined;
+    // Not paused here. A dispatch this agent ran under the id says whose it is.
+    const owner = this.dispatchOwners.get(named);
+    if (owner) return owner.requester === env.from ? { kind: "fresh", taskId: uuid7() } : { kind: "refuse", error: notYours };
+
+    // Unknown here: the Task's record (§7.4) carries both parties.
+    const seen = await this.readTaskParties(named);
+    switch (seen.kind) {
       // No record: nobody's Task. Ordinary work, under the id the requester chose.
-      if (code === ErrorCode.TASK_NOT_FOUND || code === ErrorCode.NOT_FOUND) return { kind: "fresh", taskId: named };
+      case "none":
+        return { kind: "fresh", taskId: named };
       // A record this agent is not a party to: somebody else's Task.
-      if (code === ErrorCode.UNAUTHORIZED) return { kind: "refuse", error: notYours };
-      return {
-        kind: "refuse",
-        error: {
-          code: ErrorCode.AGENT_UNAVAILABLE,
-          message:
-            `This request names Task ${named}, and its record could not be read to check who it belongs to ` +
-            `(${err instanceof Error ? err.message : "no answer"}). Send it again shortly, or without a task_id to start new work.`,
-          retryable: true,
-        },
-      };
+      case "not_party":
+        return { kind: "refuse", error: notYours };
+      // Could not tell: ordinary work under a new id, so a slow or absent task
+      // manager does not stop work (or streams), and nothing lands on a Task
+      // that might be somebody else's.
+      case "unreadable":
+        return { kind: "fresh", taskId: uuid7() };
     }
-    if (!record || typeof record.requester !== "string" || typeof record.responder !== "string") {
-      return { kind: "fresh", taskId: named };
-    }
-    if (record.requester !== env.from || record.responder !== this.agentId) return { kind: "refuse", error: notYours };
-    if (record.state === "input_required") {
-      this.resumableTasks.remember(named, env.from, typeof record.offering === "string" ? record.offering : "");
+    if (seen.requester !== env.from || seen.responder !== this.agentId) return { kind: "refuse", error: notYours };
+    if (seen.state === "input_required") {
+      this.resumableTasks.remember(named, env.from, seen.offering);
       return { kind: "resume", taskId: named };
     }
     // The requester's own Task, but not paused (still working, or ended): new
     // work under a new id, so nothing lands on a record that cannot take it.
     return { kind: "fresh", taskId: uuid7() };
+  }
+
+  /** Whether `env.from` may cancel `taskId` here (§10.8): only the Task's
+   *  requester, by what this agent remembers or else by the Task's record.
+   *  `nothing`: no dispatch here and no record, so there is nothing to cancel. */
+  private async cancelStanding(
+    taskId: string,
+    from: string,
+  ): Promise<{ kind: "requester" | "nothing" } | { kind: "refuse"; error: ErrorObject }> {
+    const notYours: ErrorObject = {
+      code: ErrorCode.UNAUTHORIZED,
+      message: `Task ${taskId} was not opened by you with this agent, so you cannot cancel it (§10.8).`,
+      retryable: false,
+    };
+    const owner = this.dispatchOwners.get(taskId) ?? this.resumableTasks.get(taskId);
+    if (owner) return owner.requester === from ? { kind: "requester" } : { kind: "refuse", error: notYours };
+    const seen = await this.readTaskParties(taskId);
+    switch (seen.kind) {
+      case "none":
+        return { kind: "nothing" };
+      case "not_party":
+        return { kind: "refuse", error: notYours };
+      case "unreadable":
+        return {
+          kind: "refuse",
+          error: {
+            code: ErrorCode.AGENT_UNAVAILABLE,
+            message: `Task ${taskId}'s record could not be read to check who may cancel it (${seen.reason}). Send the cancel again shortly.`,
+            retryable: true,
+          },
+        };
+    }
+    return seen.requester === from && seen.responder === this.agentId ? { kind: "requester" } : { kind: "refuse", error: notYours };
   }
 
   /**
@@ -6709,7 +6806,7 @@ export class AgentMesh {
     // agent honours cancels whether or not the application registered
     // anything. The note is sender text; the §22.5 cap above already bounded it.
     if (audience === "agent" && reqPayload.offering === "task.cancel") {
-      this.handleInboundCancel(msg, env, reqPayload, viaReply);
+      await this.handleInboundCancel(msg, env, reqPayload, viaReply);
       return;
     }
 
@@ -6784,6 +6881,10 @@ export class AgentMesh {
     }
     const dispatchTaskId = resolved.taskId;
     const resuming = resolved.kind === "resume";
+    // Who asked for this dispatch: the only agent whose task.cancel for it is
+    // taken (cancelStanding), and whose later request naming it is its own.
+    this.dispatchOwners.remember(dispatchTaskId, env.from, reqPayload.offering);
+    this.noRecord.delete(dispatchTaskId);
 
     // ── §7.7 admission, then the §6.4a accept ──────────────────────────
     // Everything §22 refuses has been refused above. What remains before the
@@ -6918,6 +7019,11 @@ export class AgentMesh {
     if (isStreamRequest) {
       const streamHandler = this.router.resolveStream(reqPayload.offering);
       if (streamHandler) {
+        // §7.3: a stream that resumes a paused Task takes it back to working
+        // on the record first, so the stream's own ending (completed, failed)
+        // is a legal step from there. A fresh stream's first update creates
+        // its record, so it needs none.
+        if (resuming) this.publishDeferredTerminal(dispatchTaskId, env, { payload: { status: "working" } }, { outbox: false });
         await this.handleStreamRequest(
           msg,
           env,
@@ -7383,12 +7489,12 @@ export class AgentMesh {
    *  state. Best-effort on the work by design — there is no responder-side
    *  task registry, so the acknowledgement reports the cancel as taken, and a
    *  completion that crossed it in flight stands on the update subject. */
-  private handleInboundCancel(
+  private async handleInboundCancel(
     msg: Msg,
     env: Envelope,
     reqPayload: RequestPayload,
     transportReply: boolean,
-  ): void {
+  ): Promise<void> {
     let taskId: string;
     let reason: CancelReason;
     let note: string | undefined;
@@ -7414,10 +7520,32 @@ export class AgentMesh {
       return;
     }
 
+    // Only the Task's requester cancels it. A task id is public (it is
+    // broadcast on mesh.event.task.*), and a cancel releases the funds hold
+    // and cancels every Task this one subcontracted, so anybody else's cancel
+    // is refused and does nothing.
+    const standing = await this.cancelStanding(taskId, env.from);
+    if (standing.kind === "refuse") {
+      const errEnv = this.newEnvelope({
+        type: "respond",
+        from: this.agentId,
+        to: env.from,
+        in_reply_to: env.id,
+        trace: childSpan(env.trace),
+        error: standing.error,
+      });
+      this.sendRespond(msg, env, encode(errEnv), { transportReply, tap: true });
+      return;
+    }
+    // A canceled Task is not resumable.
+    this.resumableTasks.forget(taskId);
+
     // §10.8 propagation MUST: forward to every still-live delegate of this
     // task as `upstream_cancelled`, original reason in the note — unless the
     // handler that delegated opted out (HandlerOptions.propagateCancel).
-    this.propagateCancel(taskId, reason, note);
+    // (`nothing`: no dispatch ran here under the id and it has no record, so
+    // there are no delegates and no hold, and the acknowledgement stands.)
+    if (standing.kind === "requester") this.propagateCancel(taskId, reason, note);
 
     // A canceled task will not be delivered, so its hold goes back. Cancels
     // are best-effort on the WORK — there is no responder-side task registry,
@@ -7426,7 +7554,7 @@ export class AgentMesh {
     // place we can settle it. A completion that raced the cancel releases
     // nothing, because a delivered task has already forgotten its hold; a
     // cancel for a task this agent never ran finds no entry and does nothing.
-    this.releaseHold(taskId, FundsReleaseReason.CANCELED);
+    if (standing.kind === "requester") this.releaseHold(taskId, FundsReleaseReason.CANCELED);
 
     const respEnv = this.newEnvelope({
       type: "respond",
@@ -8001,7 +8129,9 @@ export class AgentMesh {
       trial: this.trialTasks.has(taskId),
     });
 
-    // Step 3: Call the handler
+    // Step 3: Call the handler. However it ends, the Task is not resumable
+    // from this dispatch's pause any more (it never paused: streams end).
+    this.resumableTasks.forget(taskId);
     try {
       await runWithDispatch({ taskId, offering: reqPayload.offering }, () =>
         runWithTrace(env.trace, () => handler(input, ctx, writer)),

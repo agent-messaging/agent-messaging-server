@@ -40,10 +40,13 @@ function makeConn(records?: Records) {
   const registryKp = nkeys.createUser();
   const published: { subject: string; data: Uint8Array }[] = [];
   const taskGets: string[] = [];
+  /** Set to make the task manager unreachable: every record read times out. */
+  const taskManager = { down: false };
   return {
     subs,
     published,
     taskGets,
+    taskManager,
     publish: vi.fn((subject: string, data: Uint8Array) => {
       published.push({ subject, data });
       subs.get(subject)?.({ subject, data, reply: undefined, respond: () => true });
@@ -53,6 +56,7 @@ function makeConn(records?: Records) {
       if (records && subject.startsWith("mesh.task.get.")) {
         const id = subject.slice("mesh.task.get.".length);
         taskGets.push(id);
+        if (taskManager.down) throw new Error("TIMEOUT");
         const record = records.get(id);
         const answer = !record
           ? { error: { code: "TASK_NOT_FOUND", message: `Task ${id} not found`, retryable: false } }
@@ -393,5 +397,156 @@ describe("an interactive agent that answers a resume with a queued ack", () => {
     deliver(conn, agent.agentId, buyerKp, { offering: "work", input: { step: "resume" } }, T);
     await sleep(200);
     expect(statuses(updates(conn, T))).toEqual(["input_required", "working"]);
+  });
+});
+
+/** A signed task.cancel for `taskId`, from `kp`. */
+const cancelFrom = (conn: Conn, agentId: string, kp: KeyPair, taskId: string) =>
+  deliver(conn, agentId, kp, { offering: "task.cancel", input: { task_id: taskId, reason: "user_requested" } });
+
+describe("only a paused Task is resumable", () => {
+  it("a requester naming its own deferred, still-working Task gets new work, not a second handler on that Task", async () => {
+    let calls = 0;
+    const { conn, agent, kp, buyer } = await run(async () => {
+      calls++;
+      await sleep(250);
+      return { n: calls };
+    }, 20);
+    deliver(conn, agent.agentId, kp, { offering: "work", input: {} });
+    await vi.waitFor(() => expect(taskIdOf(conn, buyer)).toBeTruthy());
+    const T = taskIdOf(conn, buyer)!;
+    deliver(conn, agent.agentId, kp, { offering: "work", input: { step: "again" } }, T);
+    await sleep(700);
+    // One working, one terminal, on T: the second request ran under its own id.
+    const onT = statuses(updates(conn, T));
+    expect(onT).toEqual(["working", "completed"]);
+    expect(replay(onT).refused).toEqual([]);
+    const ids = new Set(repliesTo(conn, buyer).map((e) => e.task_id).filter(Boolean));
+    expect(ids.size).toBe(2);
+  });
+});
+
+describe("a remembered pause is a hint", () => {
+  it("is forgotten when its requester cancels the Task: a later request naming it is new work", async () => {
+    const { conn, agent, buyerKp, buyer } = await pausing(() => ({ ok: true }));
+    deliver(conn, agent.agentId, buyerKp, { offering: "work", input: {} });
+    await vi.waitFor(() => expect(taskIdOf(conn, buyer)).toBeTruthy());
+    const T = taskIdOf(conn, buyer)!;
+    cancelFrom(conn, agent.agentId, buyerKp, T);
+    await sleep(100);
+    expect(repliesTo(conn, buyer).some((e) => (e.payload as RespondPayload | undefined)?.status === "canceled")).toBe(true);
+    deliver(conn, agent.agentId, buyerKp, { offering: "work", input: { step: "resume" } }, T);
+    await sleep(200);
+    expect(statuses(updates(conn, T))).toEqual(["input_required"]);
+  });
+
+  it("an old one is checked against the record: a Task that ended elsewhere is not resumed", async () => {
+    const records: Records = new Map();
+    const { conn, agent, buyerKp, buyer } = await pausing(() => ({ ok: true }), undefined, { records });
+    deliver(conn, agent.agentId, buyerKp, { offering: "work", input: {} });
+    await vi.waitFor(() => expect(taskIdOf(conn, buyer)).toBeTruthy());
+    const T = taskIdOf(conn, buyer)!;
+    // The requester canceled through the task manager, which this agent did
+    // not see; and the pause was remembered a minute ago.
+    records.set(T, { requester: buyer, responder: agent.agentId, state: "canceled" });
+    (agent as unknown as { resumableTasks: { get(id: string): { rememberedAt: number } } }).resumableTasks.get(T).rememberedAt -= 60_000;
+    deliver(conn, agent.agentId, buyerKp, { offering: "work", input: { step: "resume" } }, T);
+    await sleep(200);
+    expect(conn.taskGets).toContain(T);
+    expect(statuses(updates(conn, T))).toEqual(["input_required"]);
+  });
+
+  it("an old one the record confirms still resumes", async () => {
+    const records: Records = new Map();
+    const { conn, agent, buyerKp, buyer } = await pausing(() => ({ ok: true }), undefined, { records });
+    deliver(conn, agent.agentId, buyerKp, { offering: "work", input: {} });
+    await vi.waitFor(() => expect(taskIdOf(conn, buyer)).toBeTruthy());
+    const T = taskIdOf(conn, buyer)!;
+    records.set(T, { requester: buyer, responder: agent.agentId, state: "input_required" });
+    (agent as unknown as { resumableTasks: { get(id: string): { rememberedAt: number } } }).resumableTasks.get(T).rememberedAt -= 60_000;
+    deliver(conn, agent.agentId, buyerKp, { offering: "work", input: { step: "resume" } }, T);
+    await vi.waitFor(() => expect(statuses(updates(conn, T))).toEqual(["input_required", "working", "completed"]));
+    expect(conn.taskGets).toContain(T);
+  });
+});
+
+describe("a slow or absent task manager", () => {
+  it("a stream naming an id nobody remembers still runs, under a new id, when the record cannot be read", async () => {
+    const records: Records = new Map();
+    const { conn, agent } = await responder(() => 1, undefined, { records });
+    conn.taskManager.down = true;
+    const kp = nkeys.createUser();
+    const X = "requester-made-while-down";
+    deliver(conn, agent.agentId, kp, { offering: "stream", input: { step: "end" }, config: { stream: true } }, X);
+    await sleep(200);
+    const replies = repliesTo(conn, kp.getPublicKey());
+    expect(replies.some((e) => e.error)).toBe(false);
+    const opened = replies.find((e) => (e.payload as RespondPayload | undefined)?.status === "working");
+    expect(opened?.task_id).toBeTruthy();
+    expect(opened!.task_id).not.toBe(X);
+    expect(updates(conn, X)).toEqual([]);
+    expect(statuses(updates(conn, opened!.task_id!))).toEqual(["completed"]);
+  });
+
+  it("'no record' is remembered briefly: two cancels for an unknown id read the record once", async () => {
+    const records: Records = new Map();
+    const { conn, agent } = await responder(() => 1, undefined, { records });
+    const kp = nkeys.createUser();
+    cancelFrom(conn, agent.agentId, kp, "never-ran-here");
+    await sleep(100);
+    cancelFrom(conn, agent.agentId, kp, "never-ran-here");
+    await sleep(100);
+    expect(conn.taskGets.filter((id) => id === "never-ran-here")).toHaveLength(1);
+  });
+});
+
+describe("a stream that resumes a paused Task", () => {
+  it("records working first, so its ending is legal on the record", async () => {
+    const { conn, agent, buyerKp, buyer } = await pausing(() => ({ ok: true }));
+    deliver(conn, agent.agentId, buyerKp, { offering: "work", input: {} });
+    await vi.waitFor(() => expect(taskIdOf(conn, buyer)).toBeTruthy());
+    const T = taskIdOf(conn, buyer)!;
+    deliver(conn, agent.agentId, buyerKp, { offering: "stream", input: { step: "end" }, config: { stream: true } }, T);
+    await vi.waitFor(() => expect(replay(statuses(updates(conn, T))).state).toBe("completed"));
+    expect(statuses(updates(conn, T))).toEqual(["input_required", "working", "completed"]);
+    expect(replay(statuses(updates(conn, T))).refused).toEqual([]);
+  });
+});
+
+describe("only a Task's requester cancels it", () => {
+  it("a stranger's cancel of a paused Task is refused, releases nothing, and leaves it resumable", async () => {
+    const { conn, agent, buyerKp, buyer } = await pausing(() => ({ ok: true }));
+    const releases = vi.spyOn(agent as unknown as { releaseHold: (...a: unknown[]) => void }, "releaseHold");
+    const propagations = vi.spyOn(agent as unknown as { propagateCancel: (...a: unknown[]) => void }, "propagateCancel");
+    deliver(conn, agent.agentId, buyerKp, { offering: "work", input: {} });
+    await vi.waitFor(() => expect(taskIdOf(conn, buyer)).toBeTruthy());
+    const T = taskIdOf(conn, buyer)!;
+    releases.mockClear();
+
+    const strangerKp = nkeys.createUser();
+    cancelFrom(conn, agent.agentId, strangerKp, T);
+    await sleep(100);
+    const answer = repliesTo(conn, strangerKp.getPublicKey())[0];
+    expect(answer?.error?.code).toBe("UNAUTHORIZED");
+    expect((answer?.payload as RespondPayload | undefined)?.status).not.toBe("canceled");
+    expect(releases).not.toHaveBeenCalled();
+    expect(propagations).not.toHaveBeenCalled();
+
+    deliver(conn, agent.agentId, buyerKp, { offering: "work", input: { step: "resume" } }, T);
+    await vi.waitFor(() => expect(statuses(updates(conn, T))).toEqual(["input_required", "working", "completed"]));
+  });
+
+  it("after a restart, the record decides who may cancel", async () => {
+    const records: Records = new Map();
+    const { conn, agent } = await responder(() => 1, undefined, { records });
+    const buyerKp = nkeys.createUser();
+    const T = "paused-before-restart-cancel";
+    records.set(T, { requester: buyerKp.getPublicKey(), responder: agent.agentId, state: "input_required" });
+    const strangerKp = nkeys.createUser();
+    cancelFrom(conn, agent.agentId, strangerKp, T);
+    cancelFrom(conn, agent.agentId, buyerKp, T);
+    await sleep(150);
+    expect(repliesTo(conn, strangerKp.getPublicKey())[0]?.error?.code).toBe("UNAUTHORIZED");
+    expect((repliesTo(conn, buyerKp.getPublicKey())[0]?.payload as RespondPayload | undefined)?.status).toBe("canceled");
   });
 });
