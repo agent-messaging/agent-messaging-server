@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.62.2 (2026-10-20)
+
+A fix to the funds-hold admission gate. Nothing else changes.
+
+- **`BUDGET_INSUFFICIENT` reaches the buyer (#33).** When `mesh.funds.hold`
+  (or an `onFundsHold` hook) refuses with `BUDGET_INSUFFICIENT`, because a
+  fixed-fee engagement's period ceiling would be passed (Agent SoW §5.5.1),
+  the buyer is now refused with `BUDGET_INSUFFICIENT`, not retryable, with the
+  platform's message and its `details` unchanged: the estimate (the price
+  quote), the ceiling, what remains of it, the engagement and the `sku`. The
+  gate adds `sku` only when the platform left it out, as it does for
+  `INSUFFICIENT_FUNDS`. Before, this refusal became the retryable
+  `AGENT_UNAVAILABLE` with `details: { sku }` only, and the buyer lost the
+  quote. Every other code keeps its existing mapping.
+
 ## 0.62.1 (2026-10-19)
 
 Generated platform service definitions only. Nothing that is there changes.
