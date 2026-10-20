@@ -3587,6 +3587,8 @@ export class PortfolioService implements PortfolioRequests {
   }
 }
 
+// ── postings: Postings ────────────────────────────────────────────
+
 // ── registry: Registry ────────────────────────────────────────────
 
 /** What registry.list() sends. */
@@ -6043,6 +6045,8 @@ export const REQUEST_TIERS: Readonly<Record<string, "core" | "platform">> = {
   "portfolio.transition": "platform",
   "portfolio.derivations": "platform",
   "portfolio.review": "platform",
+  "postings.respond": "platform",
+  "postings.award": "platform",
   "registry.list": "core",
   "reviews.file": "platform",
   "reviews.rate": "platform",
