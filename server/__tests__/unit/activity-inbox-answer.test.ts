@@ -25,6 +25,11 @@ import { KEYED_STORE } from "../../src/storage/jetstream/keyed.js";
 import type { KeyedEntry, KeyedStore } from "../../src/storage/index.js";
 import { requestKey } from "../../src/activity/exchange-index.js";
 
+
+// Each test re-imports the service and opens SQLite files, a few seconds under
+// a full parallel suite; the default 20s left no headroom there.
+vi.setConfig({ testTimeout: 60_000 });
+
 const AGENT = "UAGENTAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const CALLER = "UCALLERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const FLOODER = "UFLOODERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
