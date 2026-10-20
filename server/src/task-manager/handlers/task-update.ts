@@ -648,7 +648,10 @@ export async function handleTaskUpdate(
         responder: task.responder,
         offering: task.offering,
         // The creating request as this service observed it, when it did.
-        ...(task.origin ? { origin: task.origin } : {}),
+        // Without its contest lists and its multiple_requests: request ids are
+        // the record's business (and the platform's privileged read), not a
+        // broadcast's.
+        ...(task.origin ? { origin: broadcastOrigin(task.origin) } : {}),
         // §7.7: the late-completion record, on the platform-signed event the
         // requester can hold. Present only when a deadline was actually missed.
         ...(task.completed_late
@@ -853,6 +856,19 @@ export async function handleTaskUpdate(
   }
 
   console.log(`[task-manager] task ${taskId}: ${newState}`);
+}
+
+/** An origin as the broadcast lifecycle event carries it: no request ids
+ *  beyond the origin's own. */
+function broadcastOrigin(origin: TaskOrigin): TaskOrigin {
+  const {
+    contested_by: _c,
+    contested_overflow: _o,
+    contested_overflow_since: _s,
+    multiple_requests: _m,
+    ...rest
+  } = origin as TaskOrigin & { multiple_requests?: string[] };
+  return rest;
 }
 
 /** The ledger's binding for these parties, or null (also on a read failure:

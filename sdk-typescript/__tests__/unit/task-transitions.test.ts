@@ -802,3 +802,35 @@ describe("two resumes of one pause, a moment apart", () => {
     expect(replay(onT).refused).toEqual([]);
   });
 });
+
+describe("two requests naming the same new task id at once", () => {
+  for (const withRecords of [true, false]) {
+    it(`only one runs under the id; the other is refused${withRecords ? "" : " (no task manager to ask)"}`, async () => {
+      const ran: string[] = [];
+      const conn = makeConn(withRecords ? new Map() : undefined);
+      const agent = AgentMesh.withConnection(conn as unknown as ConnectionManager, nkeys.createUser(), nkeys.createUser(), {});
+      openAgents.push(agent);
+      agent.onStreamRequest("expensive-ok", async (_i, _c, w) => { ran.push("expensive"); w.write("x"); await sleep(50); w.end("done"); });
+      agent.onStreamRequest("cheap-fail", async () => { ran.push("cheap"); await sleep(10); throw new Error("bad input"); });
+      await agent.register({ name: "claims" });
+      const kp = nkeys.createUser();
+      const T = "new-stream-id-" + (withRecords ? "r" : "n");
+      // Back to back, as the reviewer's probe sends them: both name T, neither waits.
+      const first = deliver(conn, agent.agentId, kp, { offering: "expensive-ok", input: {}, config: { stream: true } }, T);
+      const second = deliver(conn, agent.agentId, kp, { offering: "cheap-fail", input: {}, config: { stream: true } }, T);
+      await sleep(250);
+      expect(ran).toEqual(["expensive"]);
+      const replies = repliesTo(conn, kp.getPublicKey());
+      const refusal = replies.find((e) => e.in_reply_to === second.id && e.error);
+      expect(refusal?.error?.code).toBe("TASK_INVALID_TRANSITION");
+      // Everything on T's channels answers the first request only.
+      const onT = conn.published
+        .filter((x) => x.subject === Subjects.taskUpdate(T) || x.subject === Subjects.taskStream(T))
+        .map((x) => JSON.parse(new TextDecoder().decode(x.data)) as Envelope); // chunks may be unsigned (§11.6)
+      expect(onT.length).toBeGreaterThan(0);
+      expect(onT.every((e) => e.in_reply_to === undefined || e.in_reply_to === first.id)).toBe(true);
+      // The claim is released: a later request naming T is decided as before.
+      expect((agent as unknown as { claimingTasks: Set<string> }).claimingTasks.size).toBe(0);
+    });
+  }
+});

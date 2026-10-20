@@ -6,7 +6,7 @@
     "origin": {
       "comment": "Present only when the server observed the creating request. Absent means unknown, never 'no request'. Never taken from a task update, never replaced once set, and never part of `history`, so the history cap cannot remove it. `request_id` is the id answer-derived meter events carry as `request_id` (13.5).",
       "required": ["request_id", "requester", "responder", "offering", "observed_at", "bound_by"],
-      "optional": ["contested_by", "contested_overflow", "contested_overflow_since"],
+      "optional": ["contested_by", "contested_overflow", "contested_overflow_since", "multiple_requests"],
       "types": {
         "request_id": "string",
         "requester": "agent-key",
@@ -16,7 +16,8 @@
         "bound_by": "enum",
         "contested_by": "array of request ids, at most 256, append-only",
         "contested_overflow": "non-negative integer",
-        "contested_overflow_since": "ISO-8601"
+        "contested_overflow_since": "ISO-8601",
+        "multiple_requests": "array of request ids, the origin's first, at most 256"
       },
       "bound_by": {
         "request": "the request itself named the Task id (a requester-chosen id, as a stream request carries)",
@@ -33,6 +34,8 @@
         "only provider-caused evidence counts: a request whose own envelope named the Task id and was answered under it is the requester's choice (the reference SDK echoes a requester-named id); from the Task's own requester it is part of that Task and lists nothing, and from anyone else it records nothing on that Task's record at all; evidence comes only from a request that did NOT name the Task, answered under it",
         "every OTHER request the provider answered with the Task id is appended, append-only and on terminal records too: a second request's first answer naming a bound Task, a request answered with the Task after its first answer said something else, a first answer seen more than the skew after the Task existed, a stream request answered under an already-bound Task, and a non-stream request naming the Task before its record exists and answered under it; the one exception is a genuine resume, a non-stream request naming a Task whose record already existed when it was seen and answered under it, and the rule does not change with the Task's age",
         "origin.contested_by and the record-level contested_by hold only the record requester's own requests; another asker's are kept apart in contested_by_asker",
+        "when more than one of the requester's requests NAMED a stream-created Task id and was answered under it, origin.multiple_requests lists them all, the origin's first; the first stays the origin and none of them is evidence against the provider (the reference SDK refuses a second request naming an id it is still starting, so this is what a non-reference provider does)",
+        "the broadcast lifecycle event (mesh.event.task.<state>) carries the origin without contested_by, its overflow fields or multiple_requests; those are on the record and the privileged read only",
         "recording a contest never waits for a record that does not exist yet; the update creating a record reads and applies the evidence after its create",
         "a request past the cap is counted in contested_overflow exactly once however often it is seen",
         "contested_by holds at most 256 ids; past that contested_overflow counts the rest and contested_overflow_since records when the first did not fit, and a consumer then treats every exchange between the two parties since the Task's creation as contested",
@@ -44,7 +47,7 @@
     },
     "record_contested_by": {
       "comment": "Record-level contest evidence. contested_by (and its overflow fields) holds the record's OWN requester's requests answered with this Task's id while the Task has no origin; with an origin they are on origin.contested_by. Requests from any OTHER asker the provider answered with this Task's id (the record names a requester other than the one the server saw ask) are kept per asker in contested_by_asker, never mixed into anyone else's list, with origin_mismatch naming the first such asker; a consumer treats a mismatch as the provider's fault. A reader drops a malformed field on its own, never the origin or the rest.",
-      "optional": ["contested_by", "contested_overflow", "contested_overflow_since", "origin_mismatch", "contested_by_asker", "askers_overflow", "askers_overflow_since"],
+      "optional": ["contested_by", "contested_overflow", "contested_overflow_since", "multiple_requests", "origin_mismatch", "contested_by_asker", "askers_overflow", "askers_overflow_since"],
       "origin_mismatch": { "required": ["requester"] },
       "contested_by_asker": { "keys": "asker agent keys, at most 64", "values": { "required": ["contested_by"], "optional": ["contested_overflow", "contested_overflow_since"] } },
       "askers_overflow": "non-negative integer: askers past the 64 listed, each counted once",
@@ -139,8 +142,10 @@
       { "case": "own_task_named_and_answered", "path": "the buyer names its own T in a stream or a resume, answered under T", "contested_by": "none" },
       { "case": "askers_past_the_cap", "path": "66 askers are answered under T, which names someone else", "contested_by_asker": "64 askers", "askers_overflow": 2 },
       { "case": "lost_mirror_read", "path": "a contest is in the ledger but its copy on the terminal record was lost", "task_get_and_privileged_read": "show the contest" },
-      { "case": "second_stream_on_its_own_task", "path": "stream S1 binds T; the same requester's stream S2 names T and is answered under T", "origin": "S1", "contested_by": "none" },
-      { "case": "follow_up_before_the_record", "path": "stream S1 binds T; the same requester's non-stream request names T before T's record exists and is answered under T", "origin": "S1", "contested_by": "none" },
+      { "case": "second_stream_on_its_own_task", "path": "stream S1 binds T; the same requester's stream S2 names T and is answered under T", "origin": "S1", "contested_by": "none", "multiple_requests": ["S1", "S2"] },
+      { "case": "follow_up_before_the_record", "path": "stream S1 binds T; the same requester's non-stream request names T before T's record exists and is answered under T", "origin": "S1", "contested_by": "none", "multiple_requests": ["S1", "the follow-up"] },
+      { "case": "two_streams_back_to_back", "path": "the requester sends two stream requests naming the same new T at once, an expensive one and a cheap one", "reference_sdk": "the second is refused (TASK_INVALID_TRANSITION) and never runs; the record's origin is the first", "any_provider_answering_both_under_T": "origin is the first seen, multiple_requests lists both" },
+      { "case": "broadcast_event", "path": "a lifecycle event for a contested Task", "event_origin": "without contested_by, contested_overflow, contested_overflow_since or multiple_requests" },
       { "case": "request_naming_a_task_run_fresh", "path": "a request names the buyer's failed T; the provider answers it under a new U, which completes", "origin_of_T": "unchanged", "contested_by_on_T": "none", "origin_of_U": "the request" },
       { "case": "request_only_naming_a_task", "path": "requests name T but are answered with no Task", "record": "unchanged" },
       { "case": "overflow_seen_twice", "path": "the 257th contesting request is seen twice", "contested_overflow": 1 },

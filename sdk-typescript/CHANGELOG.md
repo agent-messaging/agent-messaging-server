@@ -51,6 +51,12 @@ where its work did.
   work with a second hold; so is a request naming a Task this agent already
   ran for the same requester whose record does not answer. "No record"
   answers are remembered for 30 seconds.
+- **One task id runs one piece of work.** A request naming a task id claims
+  it synchronously, before the record read, so a second request naming the
+  same id while the first is still being started is refused with
+  `TASK_INVALID_TRANSITION` and never runs. Before, two stream requests sent
+  back to back naming the same new id both read "no record" and both ran
+  under it.
 - **A stream reads only the chunks that answer its own request.** Besides
   the responder and the task id, every chunk (the signed final and its
   `chunk_count` included) must be `in_reply_to` the request this agent sent
@@ -98,6 +104,9 @@ Types and readers for two Task record fields the server now writes (server
   and never evidence. At most 64 other askers are listed; `askers_overflow`
   and `askers_overflow_since` count the rest. `mesh.task.get` shows a
   requester only its own entries; the responder sees everything.
+  `multiple_requests` (on the origin, or the record while it has none) lists
+  every request that named a stream-created Task and ran under it, when there
+  was more than one.
   `taskContestsOf(task)` reads the record-level fields strictly; a malformed
   contest field is dropped on its own, never the origin around it.
 - **`Task.canceled_by` (`TaskCanceledBy`).** On a canceled Task: `party`

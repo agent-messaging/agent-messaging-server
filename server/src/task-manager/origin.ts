@@ -105,6 +105,9 @@
  *  - `a.<sha(request id)>` → {@link FirstAnswer}: the request's first answer
  *  - `c.<sha(task id \n sender \n addressee)>` → {@link ObservedCancel}
  *  - `k.<sha(requester \n responder \n task id)>` → {@link ContestEvidence}
+ *  - `m.<sha(requester \n responder \n task id)>` → `{ multiple_requests }`:
+ *    every request that NAMED a stream-created Task id and was answered
+ *    under it, when there was more than one (see `bind`)
  *  - `p.<sha(responder \n task id)>` → `{ requesters }`: every asker the
  *    responder ANSWERED with this Task id, so a record naming someone else
  *    can still be given what was seen (a third party's own request naming
@@ -249,6 +252,8 @@ export const taskBindingKey = (requester: string, responder: string, taskId: str
 export const firstAnswerKey = (requestId: string) => `a.${sha(requestId)}`;
 /** How many contesting request ids a record lists; the rest are counted. */
 export const MAX_CONTESTED_BY = 256;
+export const multipleKey = (requester: string, responder: string, taskId: string) =>
+  `m.${sha(`${requester}\n${responder}\n${taskId}`)}`;
 export const askersKey = (responder: string, taskId: string) => `p.${sha(`${responder}\n${taskId}`)}`;
 export const overflowKey = (evidenceKey: string, requestId: string) => `n.${sha(`${evidenceKey}\n${requestId}`)}`;
 export const contestKey = (requester: string, responder: string, taskId: string) =>
@@ -461,7 +466,14 @@ export class OriginLedger {
       // nothing new. Recently created (the creating update raced the tap), or
       // no record yet: the stream that creates the Task binds if nothing has;
       // otherwise it is part of the Task, silently.
-      if (existing && seenTooLate(existing, rec.observed_at)) return "recorded";
+      if (existing && seenTooLate(existing, rec.observed_at)) {
+        const stored = await read<TaskOrigin>(this.store, key);
+        if (stored && stored.bound_by === "request" && stored.request_id !== rec.request_id) {
+          await appendMultiple(this.store, multipleKey(rec.requester, rec.responder, taskId), stored.request_id, rec.request_id);
+          await this.mirror(taskId, rec.requester, rec.responder);
+        }
+        return "recorded";
+      }
       if (!(await createOnce(this.store, requestBindingKey(rec.request_id), { task_id: taskId }))) {
         const bound = await read<{ task_id?: string }>(this.store, requestBindingKey(rec.request_id));
         if (!bound || bound.task_id !== taskId) return "recorded";
@@ -469,7 +481,19 @@ export class OriginLedger {
       const origin = originOf(rec, by);
       let stored: TaskOrigin | null = origin;
       if (!(await createOnce(this.store, key, origin))) stored = await read<TaskOrigin>(this.store, key);
-      if (!stored || stored.request_id !== rec.request_id) return "recorded";
+      if (!stored) return "recorded";
+      if (stored.request_id !== rec.request_id) {
+        // A second request naming the Task a stream created, answered under
+        // it: two of the requester's requests ran as one Task. Not the origin
+        // (the first stands) and not evidence against the provider (the
+        // requester chose the id), but the refund consumer must see that more
+        // than one request is in this Task.
+        if (stored.bound_by === "request") {
+          await appendMultiple(this.store, multipleKey(rec.requester, rec.responder, taskId), stored.request_id, rec.request_id);
+          await this.mirror(taskId, rec.requester, rec.responder);
+        }
+        return "recorded";
+      }
       await attachOrigin(this.tasks, taskId, stored);
       await this.mirror(taskId, rec.requester, rec.responder);
       return "recorded";
@@ -578,11 +602,22 @@ export class OriginLedger {
     // the responder answered the asker about this Task (askersOf).
     const mismatch = task.requester !== requester;
     if (mismatch && !(await this.askersOf(responder, taskId)).includes(requester)) return false;
-    const [origin, ev] = await Promise.all([
+    const [origin, ev, multiple] = await Promise.all([
       read<TaskOrigin>(this.store, taskBindingKey(requester, responder, taskId)),
       read<ContestEvidence>(this.store, contestKey(requester, responder, taskId)),
+      read<{ multiple_requests: string[] }>(this.store, multipleKey(requester, responder, taskId)),
     ]);
-    return projectOnto(task, requester, responder, origin, ev);
+    const changed = projectOnto(task, requester, responder, origin, ev);
+    // Its own requester's several requests in one Task: on the origin, or on
+    // the record while it has none. Append-only. Never for another asker.
+    if (!multiple?.multiple_requests?.length || task.requester !== requester || task.responder !== responder) return changed;
+    const target = (task.origin ?? task) as { multiple_requests?: string[] };
+    const have = target.multiple_requests ?? [];
+    const next = [...have];
+    for (const id of multiple.multiple_requests) if (!next.includes(id)) next.push(id);
+    if (next.length === have.length) return changed;
+    target.multiple_requests = next;
+    return true;
   }
 
   /** {@link projectFor}, for every asker the ledger knows about this Task. */
@@ -733,6 +768,28 @@ export function applyEvidence(task: Record<string, unknown> & { origin?: TaskOri
   return true;
 }
 
+/** At most this many request ids in `multiple_requests`. */
+export const MAX_MULTIPLE = 256;
+
+/** Record that `requestId` also named and ran under a stream-created Task
+ *  whose origin is `originId`: the list starts with the origin. Until written. */
+async function appendMultiple(store: KeyedStore, key: string, originId: string, requestId: string): Promise<void> {
+  for (let attempt = 0; attempt < UNTIL_WRITTEN; attempt++) {
+    const e = await store.get(key);
+    const live = e && e.operation !== "DEL" && e.operation !== "PURGE" && e.length > 0;
+    const cur = live ? e!.json<{ multiple_requests: string[] }>() : { multiple_requests: [originId] };
+    if (cur.multiple_requests.includes(requestId) || cur.multiple_requests.length >= MAX_MULTIPLE) return;
+    const next = { multiple_requests: [...cur.multiple_requests, requestId] };
+    try {
+      if (live) await store.update(key, enc(next), e!.revision);
+      else await store.create(key, enc(next));
+      return;
+    } catch {
+      await pause(attempt);
+    }
+  }
+}
+
 /** Append one contesting request to the evidence, until written. A request
  *  past the cap is counted once however often it is seen (a marker per
  *  request), so `contested_overflow` is exact. */
@@ -812,6 +869,13 @@ export function projectOnto(
 /** On a record that has an origin, its own requester's loose evidence moves
  *  onto the origin (the same fold attachOrigin does). */
 function foldLoose(task: Record<string, unknown> & { origin?: TaskOrigin }): void {
+  if (task.origin && Array.isArray(task.multiple_requests)) {
+    const have = (task.origin as { multiple_requests?: string[] }).multiple_requests ?? [];
+    const next = [...have];
+    for (const id of task.multiple_requests as string[]) if (!next.includes(id)) next.push(id);
+    (task.origin as { multiple_requests?: string[] }).multiple_requests = next;
+    delete task.multiple_requests;
+  }
   if (!task.origin || (!task.contested_by && !task.contested_overflow)) return;
   applyEvidence(task, {
     contested_by: task.contested_by as string[] | undefined,
@@ -879,6 +943,10 @@ export async function attachOrigin(tasks: KeyedStore, taskId: string, origin: Ta
       delete task.contested_by;
       delete task.contested_overflow;
       delete task.contested_overflow_since;
+    }
+    if (Array.isArray(task.multiple_requests) && task.multiple_requests.length) {
+      task.origin = { ...task.origin, multiple_requests: task.multiple_requests as string[] } as TaskOrigin;
+      delete task.multiple_requests;
     }
     try {
       await tasks.update(taskId, enc(task), e.revision);

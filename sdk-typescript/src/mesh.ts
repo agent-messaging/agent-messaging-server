@@ -622,6 +622,12 @@ export class AgentMesh {
   /** Who asked for each dispatch this agent ran under a task id: the only
    *  agent whose task.cancel for it is taken (cancelStanding). */
   private readonly dispatchOwners = new ResumableTasks();
+  /** Task ids a request named that are being resolved right now (claimed
+   *  synchronously, before the record read): a second request naming the
+   *  same id while the first is in flight is refused, so two handlers never
+   *  run under one task id. Released once the first is remembered in
+   *  `dispatchOwners`, which decides every later request naming the id. */
+  private readonly claimingTasks = new Set<string>();
   /** Task ids the task manager recently had no record of. */
   private readonly noRecord = new NoRecordCache();
   /** Stream task ids whose record could not be read at dispatch: nothing is
@@ -6969,7 +6975,33 @@ export class AgentMesh {
     // paused work for this same requester (resolveDispatchTask): a task id is
     // public, and naming one is not owning it. Before admission, so a refused
     // request places no hold and gets no accept.
-    const resolved = await this.resolveDispatchTask(env, reqPayload.config?.stream === true);
+    // The named id is CLAIMED here, synchronously, before the record read
+    // inside resolveDispatchTask: two requests naming the same new id a
+    // moment apart (both reads would answer "no record") must not both run
+    // under it. The second is refused; once the first is remembered as the
+    // id's dispatch, later requests naming it go through dispatchOwners.
+    const named = env.task_id;
+    let resolved: Awaited<ReturnType<AgentMesh["resolveDispatchTask"]>>;
+    if (named !== undefined && this.claimingTasks.has(named)) {
+      resolved = {
+        kind: "refuse",
+        error: {
+          code: ErrorCode.TASK_INVALID_TRANSITION,
+          message:
+            `Task ${named} is already being started here by another request; one task id runs one piece of work. ` +
+            `Send new work without a task_id, or wait for that Task.`,
+          retryable: false,
+        },
+      };
+    } else {
+      if (named !== undefined) this.claimingTasks.add(named);
+      try {
+        resolved = await this.resolveDispatchTask(env, reqPayload.config?.stream === true);
+        if (resolved.kind !== "refuse") this.dispatchOwners.remember(resolved.taskId, env.from, reqPayload.offering);
+      } finally {
+        if (named !== undefined) this.claimingTasks.delete(named);
+      }
+    }
     if (resolved.kind === "refuse") {
       const refuseEnv = this.newEnvelope({
         type: "respond",

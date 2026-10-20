@@ -1194,6 +1194,7 @@ describe("round 5", () => {
     expect(await open(s2)).not.toBe("contested");
     expectOrigin(T, s1, "request");
     expect(record(T).origin!.contested_by).toBeUndefined();
+    expect((record(T).origin as { multiple_requests?: string[] }).multiple_requests).toEqual([s1.id, s2.id]);
   });
 
   it("3. a non-stream naming its own task before the record exists is not evidence", async () => {
@@ -1205,6 +1206,7 @@ describe("round 5", () => {
     await update(taskUpdate(T, { status: "failed" }));
     expectOrigin(T, s1, "request");
     expect(record(T).origin!.contested_by).toBeUndefined();
+    expect((record(T).origin as { multiple_requests?: string[] }).multiple_requests).toEqual([s1.id, early.id]);
   });
 
   it("3. the rule does not flip after a minute: a late second stream on its own task is not evidence either", async () => {
@@ -1474,5 +1476,71 @@ describe("round 7: only provider-caused evidence counts; askers capped; privacy;
     const answerOf = await views.handle({ method: "GET", path: `/admin/v1/tasks/${T}`, query: new URLSearchParams() } as never);
     expect((answerOf!.body as { record: { origin: TaskOrigin } }).record.origin.contested_by).toEqual([other.id]);
     expectOrigin(T, r1, "answer");
+  });
+});
+
+describe("round 8: several requests in one task; the broadcast event", () => {
+  type WithMultiple = TaskOrigin & { multiple_requests?: string[] };
+
+  it("two streams naming the same new task, both answered under it: the first is the origin, both are listed, neither is evidence", async () => {
+    const T = "task-r8-double";
+    const expensive = request({ taskId: T, input: { work: "expensive" } });
+    const cheap = request({ taskId: T, input: { work: "cheap" } });
+    // Back to back, both seen before the provider answers either.
+    await tap(expensive);
+    await tap(cheap);
+    await tap(answer(expensive, T, "working"));
+    await tap(answer(cheap, T, "working"));
+    await update(taskUpdate(T, { status: "failed" }));
+    expectOrigin(T, expensive, "request");
+    const o = record(T).origin as WithMultiple;
+    expect(o.multiple_requests).toEqual([expensive.id, cheap.id]);
+    expect(o.contested_by).toBeUndefined();
+  });
+
+  it("the same when the second is answered after the record exists", async () => {
+    const T = "task-r8-double-late";
+    const s1 = request({ taskId: T });
+    await open(s1);
+    await update(taskUpdate(T, { status: "working" }));
+    const s2 = request({ taskId: T });
+    await open(s2);
+    expect((record(T).origin as WithMultiple).multiple_requests).toEqual([s1.id, s2.id]);
+  });
+
+  it("multiple_requests is the requester's own: a request bound by an answer has none, and resumes add none", async () => {
+    const T = "task-r8-answer-bound";
+    const r1 = request();
+    await tap(r1);
+    await tap(answer(r1, T, "input_required"));
+    await update(taskUpdate(T, { status: "input_required", message: "?" }));
+    const resume = request({ taskId: T, resume: true });
+    await open(resume);
+    expect((record(T).origin as WithMultiple).multiple_requests).toBeUndefined();
+  });
+
+  it("the broadcast lifecycle event carries no contest lists and no multiple_requests", async () => {
+    const T = "task-r8-event";
+    const s1 = request({ taskId: T });
+    await open(s1);
+    await update(taskUpdate(T, { status: "working" }));
+    const s2 = request({ taskId: T });
+    await open(s2);
+    const rival = request();
+    await tap(rival);
+    await tap(answer(rival, T, "working"));
+    nc.publish.mockClear();
+    await update(taskUpdate(T, { status: "failed" }));
+    const ev = nc.publish.mock.calls.map((c) => [c[0] as string, decode(c[1] as Uint8Array)] as const)
+      .find(([subject]) => subject === "mesh.event.task.failed")![1];
+    const o = (ev.payload as { data: { origin: WithMultiple } }).data.origin;
+    expect(o.request_id).toBe(s1.id);
+    expect(o.contested_by).toBeUndefined();
+    expect(o.contested_overflow).toBeUndefined();
+    expect(o.multiple_requests).toBeUndefined();
+    // ...while the record keeps them.
+    const r = record(T).origin as WithMultiple;
+    expect(r.contested_by).toEqual([rival.id]);
+    expect(r.multiple_requests).toEqual([s1.id, s2.id]);
   });
 });

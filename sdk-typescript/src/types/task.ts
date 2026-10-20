@@ -174,6 +174,12 @@ export interface TaskOrigin {
   contested_by?: string[];
   /** How many contesting requests did not fit in `contested_by`. */
   contested_overflow?: number;
+  /** On a Task a stream created (`bound_by: "request"`): every request of
+   *  the requester's that NAMED this Task id and was answered under it, when
+   *  there was more than one, the origin's first. Not evidence against the
+   *  provider (the requester chose the id); a refund consumer reads it as
+   *  "these requests ran as one Task". At most 256. */
+  multiple_requests?: string[];
   /** When the first contesting request did not fit (the server's clock). A
    *  consumer then treats every exchange between the two parties since the
    *  Task's creation as contested. */
@@ -230,6 +236,8 @@ export interface Task {
   contested_by?: string[];
   contested_overflow?: number;
   contested_overflow_since?: string;
+  /** `origin.multiple_requests`, while the Task has no origin yet. */
+  multiple_requests?: string[];
   /** Set when the record names a requester other than the one the server
    *  saw ask the responder about this Task (the responder claimed another
    *  buyer): `requester` is the asker the server saw, whose observed requests
@@ -275,19 +283,21 @@ export function taskOriginOf(record: unknown): TaskOrigin | null {
 }
 
 /** The well-formed contest fields of an object; each malformed one is left out. */
-function contestFieldsOf(o: Record<string, unknown>): Partial<Pick<TaskOrigin, "contested_by" | "contested_overflow" | "contested_overflow_since">> {
-  const out: Partial<Pick<TaskOrigin, "contested_by" | "contested_overflow" | "contested_overflow_since">> = {};
+function contestFieldsOf(o: Record<string, unknown>): Partial<Pick<TaskOrigin, "contested_by" | "contested_overflow" | "contested_overflow_since" | "multiple_requests">> {
+  const out: Partial<Pick<TaskOrigin, "contested_by" | "contested_overflow" | "contested_overflow_since" | "multiple_requests">> = {};
   if (Array.isArray(o.contested_by) && o.contested_by.every(isStr)) out.contested_by = [...(o.contested_by as string[])];
   if (typeof o.contested_overflow === "number" && Number.isInteger(o.contested_overflow) && o.contested_overflow >= 0) {
     out.contested_overflow = o.contested_overflow;
   }
   if (isIso(o.contested_overflow_since)) out.contested_overflow_since = o.contested_overflow_since;
+  if (Array.isArray(o.multiple_requests) && o.multiple_requests.every(isStr)) out.multiple_requests = [...(o.multiple_requests as string[])];
   return out;
 }
 
 /** A Task record's record-level contest evidence: see {@link taskContestsOf}. */
 export interface TaskContests {
   contested_by?: string[];
+  multiple_requests?: string[];
   contested_overflow?: number;
   contested_overflow_since?: string;
   /** The requester the server saw ask, when the record names someone else. */
