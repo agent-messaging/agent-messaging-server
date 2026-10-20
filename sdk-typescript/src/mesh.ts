@@ -448,6 +448,10 @@ const MANIFEST_CACHE_MAX = 512;
  *  again. Five minutes: an agent's owner effectively never changes, and this
  *  keeps a busy seller from a registry round trip per request. */
 const AGREEMENT_TTL_MS = 300_000;
+/** Requests naming one task id that may wait to be resolved here at once. */
+const TASK_ID_QUEUE_MAX = 8;
+/** Requests naming any task id that may wait to be resolved here at once. */
+const TASK_ID_WAITING_MAX = 256;
 
 /** Where the platform answers "has this account accepted my terms?" (§19.5).
  *  The seller is the verified envelope `from`; the answer is filtered to it. */
@@ -622,6 +626,19 @@ export class AgentMesh {
   /** Who asked for each dispatch this agent ran under a task id: the only
    *  agent whose task.cancel for it is taken (cancelStanding). */
   private readonly dispatchOwners = new ResumableTasks();
+  /** Requests naming a task id, resolved ONE AT A TIME per id, in arrival
+   *  order (see handleInboxMessage): each waits for the one before it, then
+   *  goes through the ordinary ownership checks, so contention never decides
+   *  who may resume a Task and a stranger cannot hold an id away from its
+   *  requester. Bounded: TASK_ID_QUEUE_MAX waiting per id, TASK_ID_WAITING_MAX
+   *  for the whole agent; past either, a retryable AGENT_UNAVAILABLE. */
+  private readonly taskIdQueues = new Map<string, { tail: Promise<void>; waiting: number }>();
+  private taskIdWaiting = 0;
+  /** Stream dispatches running right now under the id their requester named
+   *  (a stream creating its Task), by id, with that requester. The same
+   *  requester's second request naming the id while it runs is refused: one
+   *  task id runs one piece of work. Anyone else is decided as usual. */
+  private readonly streamsInFlight = new Map<string, string>();
   /** Task ids the task manager recently had no record of. */
   private readonly noRecord = new NoRecordCache();
   /** Stream task ids whose record could not be read at dispatch: nothing is
@@ -6617,6 +6634,17 @@ export class AgentMesh {
    *  drain, whose messages are old by construction and whose reply subject the
    *  drain synthesised rather than the transport minting it. */
   private async handleInboxMessage(msg: Msg, buffered = false): Promise<void> {
+    const dispatch: { streamInFlight?: string } = {};
+    try {
+      await this.handleInboxMessageOnce(msg, buffered, dispatch);
+    } finally {
+      // The stream this message started under its named id has ended (or the
+      // dispatch stopped before it): the id is no longer in flight.
+      if (dispatch.streamInFlight !== undefined) this.streamsInFlight.delete(dispatch.streamInFlight);
+    }
+  }
+
+  private async handleInboxMessageOnce(msg: Msg, buffered: boolean, dispatch: { streamInFlight?: string }): Promise<void> {
     let env: Envelope;
     try {
       env = decode(msg.data);
@@ -6969,7 +6997,70 @@ export class AgentMesh {
     // paused work for this same requester (resolveDispatchTask): a task id is
     // public, and naming one is not owning it. Before admission, so a refused
     // request places no hold and gets no accept.
-    const resolved = await this.resolveDispatchTask(env, reqPayload.config?.stream === true);
+    // Requests naming the same id are resolved one at a time, in arrival
+    // order: each waits for the one before it, then is decided by the
+    // ordinary checks (a remembered owner, or the record). Two requests naming
+    // the same new id a moment apart therefore cannot both read "no record"
+    // and both run under it, and a stranger naming a paused Task only delays
+    // its requester's resume by one record read, never refuses it.
+    const named = env.task_id;
+    const isStream = reqPayload.config?.stream === true;
+    let resolved: Awaited<ReturnType<AgentMesh["resolveDispatchTask"]>>;
+    if (named === undefined) {
+      resolved = await this.resolveDispatchTask(env, isStream);
+      if (resolved.kind !== "refuse") this.dispatchOwners.remember(resolved.taskId, env.from, reqPayload.offering);
+    } else {
+      const queue = this.taskIdQueues.get(named) ?? { tail: Promise.resolve(), waiting: 0 };
+      if (queue.waiting >= TASK_ID_QUEUE_MAX || this.taskIdWaiting >= TASK_ID_WAITING_MAX) {
+        resolved = {
+          kind: "refuse",
+          error: {
+            code: ErrorCode.AGENT_UNAVAILABLE,
+            message: `Too many requests name Task ${named} (or task ids at all) here right now. Send it again shortly.`,
+            retryable: true,
+          },
+        };
+      } else {
+        queue.waiting++;
+        this.taskIdWaiting++;
+        this.taskIdQueues.set(named, queue);
+        let release!: () => void;
+        const mine = new Promise<void>((r) => (release = r));
+        const before = queue.tail;
+        queue.tail = before.then(() => mine);
+        try {
+          await before;
+          if (this.streamsInFlight.get(named) === env.from) {
+            // The same requester, while its own stream still runs under this
+            // id: a second piece of work under one task id. Refused for good.
+            resolved = {
+              kind: "refuse",
+              error: {
+                code: ErrorCode.TASK_INVALID_TRANSITION,
+                message:
+                  `Your stream under Task ${named} is still running here; one task id runs one piece of work. ` +
+                  `Send new work without a task_id, or wait for that Task.`,
+                retryable: false,
+              },
+            };
+          } else {
+            resolved = await this.resolveDispatchTask(env, isStream);
+            if (resolved.kind !== "refuse") {
+              this.dispatchOwners.remember(resolved.taskId, env.from, reqPayload.offering);
+              if (isStream && resolved.taskId === named && resolved.kind === "fresh") {
+                this.streamsInFlight.set(named, env.from);
+                dispatch.streamInFlight = named;
+              }
+            }
+          }
+        } finally {
+          queue.waiting--;
+          this.taskIdWaiting--;
+          if (queue.waiting === 0) this.taskIdQueues.delete(named);
+          release();
+        }
+      }
+    }
     if (resolved.kind === "refuse") {
       const refuseEnv = this.newEnvelope({
         type: "respond",

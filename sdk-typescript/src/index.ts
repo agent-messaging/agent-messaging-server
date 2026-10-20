@@ -320,7 +320,7 @@ export { dialWithRetry, isCredentialRefusal, type ConnectRetry } from "./interna
 export { detectDeviceProfile, withDetectedDevice, SDK_CLIENT } from "./internal/device-profile.js";
 
 // Task types
-export type { Task, TaskState, CancelReason } from "./types/task.js";
+export type { Task, TaskState, CancelReason, TaskOrigin, TaskCanceledBy, TaskContests } from "./types/task.js";
 export {
   isValidTransition,
   TERMINAL_STATES,
@@ -332,6 +332,9 @@ export {
   isUnmetNeedRef,
   parseUnmetNeedRef,
   needRefOf,
+  taskOriginOf,
+  taskCanceledByOf,
+  taskContestsOf,
 } from "./types/task.js";
 
 // Primitive payload types

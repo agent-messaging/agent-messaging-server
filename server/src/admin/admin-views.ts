@@ -11,7 +11,8 @@
  *   GET    /admin/v1/files                          every file's index record (metadata, never bytes)
  *   GET    /admin/v1/boards[?room=]                 every work board item, lease expiry applied
  *   GET    /admin/v1/tasks[?updated_after=]         every stored task record, with when it was written
- *   GET    /admin/v1/tasks/:id                      one stored task record
+ *   GET    /admin/v1/tasks/:id                      one task record, with the origin ledger projected onto it:
+ *                                                   the platform's privileged read (see `task` below)
  *   GET    /admin/v1/mailboxes                      every mailbox: agent, messages, first_seq, last_seq
  *   GET    /admin/v1/mailboxes/:agent               { pending, last_arrival }
  *   GET    /admin/v1/mailboxes/:agent/senders?from=&to=   each envelope's from and ts in that range, never a payload (500 at most)
@@ -27,6 +28,7 @@ import type { AdminRequest } from "./admin-api.js";
 import type { KeyedStore, Storage, StreamFamily } from "../storage/index.js";
 import { roomAccountOf, type AgentOwnerRecord } from "../keychain/agent-owners.js";
 import { viewItem, type BoardItem } from "../rooms/board-store.js";
+import { OriginLedger } from "../task-manager/origin.js";
 
 const NKEY = /^U[A-Z2-7]{55}$/;
 const ROOM_ID = /^[A-Za-z0-9_-]{1,128}$/;
@@ -132,15 +134,36 @@ export function adminViews(deps: AdminViewDeps) {
     return ok({ tasks: out, total });
   }
 
+  /**
+   * One task record: the platform's PRIVILEGED read, the one a refund
+   * consumer (AgentMesh's engagement ledger) uses. Unlike `mesh.task.get`,
+   * which a requester may call and which shows it only its own entries, this
+   * shows everything: the origin and its contests, every other asker's
+   * requests (`contested_by_asker`), `origin_mismatch`, the asker overflow.
+   * The origin ledger (`mesh_task_origins`) is projected onto the record at
+   * read time, so a terminal record whose mirror was lost still shows its
+   * evidence; nothing is written. The list read above returns records as
+   * stored (mirrored and append-only, so normally complete); a consumer
+   * deciding a refund reads the task here.
+   */
   async function task(id: string): Promise<DoorAnswer> {
-    const entry = await (await keyed("mesh_tasks")).get(id);
+    const tasks = await keyed("mesh_tasks");
+    const entry = await tasks.get(id);
     if (!entry || entry.operation !== "PUT" || !entry.value.length) return no(404, "No task record is stored under that id.");
     const written = entry.created instanceof Date && !Number.isNaN(entry.created.getTime()) ? entry.created.toISOString() : null;
+    let record: Json;
     try {
-      return ok({ task_id: id, written_at: written, record: entry.json<Json>() });
+      record = entry.json<Json>();
     } catch {
       return no(404, "The stored task record is not readable.");
     }
+    try {
+      const ledger = new OriginLedger(await keyed("mesh_task_origins"), tasks);
+      record = await ledger.view(record, id);
+    } catch {
+      /* the ledger could not be opened: the record as stored */
+    }
+    return ok({ task_id: id, written_at: written, record });
   }
 
   /** Every mailbox that exists: its agent, how many messages it holds, and

@@ -61,6 +61,11 @@ export const KEYED_STORES = {
   mesh_workload_ids: { history: 1 },
   // Tasks.
   mesh_tasks: { history: 10, ttlMs: 7 * DAY_MS },
+  // Task origins (task-manager/origin.ts): each request the server routed, by
+  // id, and which request each Task id was bound to, so a Task record carries
+  // the request that created it as the server saw it. No content; the Task
+  // horizon.
+  mesh_task_origins: { history: 1, ttlMs: 7 * DAY_MS },
   // Rooms: records, the work board and notes.
   mesh_rooms: { history: 1 },
   mesh_board_items: { history: 1 },

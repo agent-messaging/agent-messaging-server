@@ -32,6 +32,18 @@ import {
   type TaskCancelFields,
 } from "../cancel.js";
 import type { LoadTaskEntries } from "../overdue-sweep.js";
+import {
+  applyEvidence,
+  attachOrigin,
+  mergeEvidence,
+  partiesMatch,
+  ORIGIN_SKEW_MS,
+  type ContestEvidence,
+  type OriginLedger,
+} from "../origin.js";
+import { rewriteTask } from "../task-write.js";
+import { noteOriginMiss } from "../origin-tap.js";
+import type { TaskCanceledBy, TaskOrigin } from "../../sdk.js";
 
 /** The stored record, with every additive field family this service writes. */
 type TaskRecord = BudgetTask & TaskCancelFields & {
@@ -40,6 +52,13 @@ type TaskRecord = BudgetTask & TaskCancelFields & {
    *  update and is the responder's claim. A trial task gets a `trial`
    *  receipt in place of the completed or canceled one. */
   trial?: boolean;
+  /** The request that created the task, as the server observed it routing
+   *  that request (origin.ts). Written by this service only, never from an
+   *  update's contents, never replaced, and kept outside `history`, so the
+   *  history cap cannot drop it. Absent when the request was not observable. */
+  origin?: TaskOrigin;
+  /** On `canceled`: who asked for it, as this service observed it. */
+  canceled_by?: TaskCanceledBy;
 };
 
 const MAX_TASK_HISTORY = 50;
@@ -53,8 +72,96 @@ function appendHistory(task: BudgetTask, env: Envelope): void {
   }
 }
 
-async function persist(kv: KeyedStore, taskId: string, task: BudgetTask): Promise<void> {
-  await kv.put(taskId, new TextEncoder().encode(JSON.stringify(task)));
+/**
+ * Write a record this handler read at the start of its update (`read`, or
+ * null for a record this update creates).
+ *
+ * Compare-and-set against what was read, so a write the origin tap made in
+ * between (attaching an origin, or appending to its `contested_by`) is never
+ * lost: on a lost race the stored record is read again, its `origin` (written
+ * only by this service, never by a party) and its `canceled_by` when this
+ * copy has none are taken over, and the write is tried again. The happy path
+ * costs no extra read. A store whose entries carry no revisions (a test stub)
+ * is written plainly.
+ */
+async function persist(
+  kv: KeyedStore,
+  taskId: string,
+  task: BudgetTask,
+  read: { revision?: number } | null = null,
+): Promise<void> {
+  const data = () => new TextEncoder().encode(JSON.stringify(task));
+  const casable = typeof kv.update === "function" && typeof kv.create === "function" &&
+    (read === null || typeof read.revision === "number");
+  if (!casable) {
+    await kv.put(taskId, data());
+    return;
+  }
+  let revision = read?.revision;
+  // Until written: every lost race is another writer's progress, and a plain
+  // write here could wipe the contest evidence the origin tap appends.
+  for (let attempt = 0; attempt < 10_000; attempt++) {
+    try {
+      if (revision === undefined) await kv.create(taskId, data());
+      else await kv.update(taskId, data(), revision);
+      return;
+    } catch {
+      const cur = await kv.get(taskId).catch(() => null);
+      if (!cur || cur.operation === "DEL" || cur.operation === "PURGE" || !cur.value?.length) {
+        revision = undefined;
+        continue;
+      }
+      try {
+        const stored = cur.json<TaskRecord>();
+        const t = task as TaskRecord;
+        // The service's own fields take the stored record's side: the origin
+        // (never replaced) and its evidence (append-only, merged both ways).
+        const ours = evidenceOf(t as unknown as Record<string, unknown>);
+        if (stored.origin) t.origin = stored.origin;
+        foldLooseEvidence(t as unknown as Record<string, unknown> & { origin?: TaskOrigin });
+        applyEvidence(t as unknown as Record<string, unknown> & { origin?: TaskOrigin }, evidenceOf(stored as unknown as Record<string, unknown>));
+        applyEvidence(t as unknown as Record<string, unknown> & { origin?: TaskOrigin }, ours);
+        if (!t.canceled_by && stored.canceled_by) t.canceled_by = stored.canceled_by;
+        const tm = t as unknown as Record<string, unknown>;
+        const sm = stored as unknown as Record<string, unknown>;
+        if (!tm.origin_mismatch && sm.origin_mismatch) tm.origin_mismatch = sm.origin_mismatch;
+        // Other askers' evidence, per asker, append-only both ways.
+        const theirs = (sm.contested_by_asker ?? {}) as Record<string, Partial<ContestEvidence>>;
+        const mine = { ...((tm.contested_by_asker ?? {}) as Record<string, Partial<ContestEvidence>>) };
+        for (const [asker, ev] of Object.entries(theirs)) {
+          const m = mergeEvidence(mine[asker] ?? { contested_by: [] }, ev);
+          if (m) mine[asker] = m;
+        }
+        if (Object.keys(mine).length) tm.contested_by_asker = mine;
+      } catch { /* an unreadable record has nothing to keep */ }
+      revision = cur.revision;
+      if (attempt > 2) await new Promise((r) => setTimeout(r, Math.min(50, attempt) * Math.random()));
+    }
+  }
+  console.error(`[task-manager] task ${taskId} could not be written after 10000 tries`);
+}
+
+/** All contest evidence a record holds, on its origin and loose on itself. */
+function evidenceOf(task: Record<string, unknown>): ContestEvidence | null {
+  const o = (task.origin ?? {}) as Partial<ContestEvidence>;
+  const l = task as Partial<ContestEvidence>;
+  const merged = mergeEvidence({ contested_by: o.contested_by, contested_overflow: o.contested_overflow, contested_overflow_since: o.contested_overflow_since }, l);
+  return merged ?? (o.contested_by?.length || o.contested_overflow ? (o as ContestEvidence) : null);
+}
+
+/** On a record that has an origin, evidence left loose moves onto the origin. */
+function foldLooseEvidence(task: Record<string, unknown> & { origin?: TaskOrigin }): void {
+  if (!task.origin || (!task.contested_by && !task.contested_overflow)) return;
+  const loose: Partial<ContestEvidence> = {
+    contested_by: task.contested_by as string[] | undefined,
+    contested_overflow: task.contested_overflow as number | undefined,
+    contested_overflow_since: task.contested_overflow_since as string | undefined,
+  };
+  task.origin = { ...task.origin };
+  applyEvidence(task, loose);
+  delete task.contested_by;
+  delete task.contested_overflow;
+  delete task.contested_overflow_since;
 }
 
 export async function handleTaskUpdate(
@@ -73,6 +180,10 @@ export async function handleTaskUpdate(
    *  failure is attributed to the provider — the same answer an unbacked claim
    *  gets, and the only safe default when the check cannot run. */
   declaredNeeds?: DeclaredNeedsFn,
+  /** The task-origin ledger (origin.ts): the requests the server observed
+   *  routing, and which one each Task id is bound to. Left unwired, records
+   *  get no `origin` and a cancel's `requester_request` is always null. */
+  origins?: OriginLedger,
 ): Promise<void> {
   let env: Envelope;
   try {
@@ -299,6 +410,17 @@ export async function handleTaskUpdate(
           `a revision is a task update carrying only the budget block (§7.7)`,
       );
     }
+
+    // An origin bound after this record was created (the tap and this handler
+    // run independently) is attached here, on the record's next update, if a
+    // compare-and-set from the tap did not already do it or was overwritten.
+    // Never replaces one: an origin, once on the record, is the record's.
+    if (!task.origin && origins) {
+      const found = await lookupOrigin(origins, task.requester, task.responder, taskId);
+      if (found && partiesMatch(task, found) && !createdLongBefore(task.created_at, found.observed_at)) {
+        task.origin = found;
+      }
+    }
   } else {
     // Task doesn't exist yet — create it.
     //
@@ -318,9 +440,10 @@ export async function handleTaskUpdate(
     // nominate a counterparty for a task id nobody else is using (ids are uuids;
     // an existing record takes the authorized branch above), and it cannot touch
     // an existing task — but a consumer must not read `requester` on a freshly
-    // created task as proof that agent asked for anything. Closing it needs the
-    // request itself to be visible to this service, which is a protocol change,
-    // not a handler change.
+    // created task as proof that agent asked for anything. What a consumer CAN
+    // read as proof is `origin` (origin.ts): the request the server itself
+    // observed, attached only when its parties are this record's parties. A
+    // record with no `origin` is one whose request the server did not see.
     //
     // A creating update with no `to` is refused. There would be no second party:
     // `requester` used to be set to "", which matches no sender, so the real
@@ -358,6 +481,15 @@ export async function handleTaskUpdate(
       // §7.7: trial work says so on the creating update, beside `offering`.
       ...((env.payload as Record<string, unknown> | undefined)?.trial === true ? { trial: true } : {}),
     };
+
+    // The creating request, as the server observed it (origin.ts). Looked up
+    // by the record's two parties and this Task id, so it attaches only when
+    // the request the server saw was from this requester to this responder.
+    // Nothing in this update is read for it.
+    if (origins) {
+      const found = await lookupOrigin(origins, requester, env.from, taskId);
+      if (found) task.origin = found;
+    }
 
     // §7.7 "Scope": when the responder goes deferred, the Task INHERITS the
     // request's budget. The task manager never sees the request itself (see the
@@ -399,6 +531,7 @@ export async function handleTaskUpdate(
   // inside the sender's envelope in `history`, whose signature covers its
   // bytes as sent.
   if (newState === "canceled" && cancel) {
+    task.canceled_by = await canceledBy(task, env, taskId, origins);
     task.cancel_reason = cancel.reason;
     if (cancel.unmet_need !== undefined) task.unmet_need = cancel.unmet_need;
     if (cancel.dependency !== undefined) task.dependency = cancel.dependency;
@@ -443,8 +576,44 @@ export async function handleTaskUpdate(
     }
   }
 
+  // The record carries everything the ledger holds about this Task, on every
+  // write, append-only: every asker's evidence, and for an asker the record
+  // does not name, its observed requests and the mismatch. A contest the
+  // record side missed repairs itself here.
+  if (origins && task.responder) {
+    foldLooseEvidence(task as unknown as Record<string, unknown> & { origin?: TaskOrigin });
+    await origins.projectAll(task as unknown as Record<string, unknown>, taskId).catch((err) => {
+      console.warn(`[task-manager] could not read the contest evidence of task ${taskId}:`, err);
+    });
+  }
+
   // Persist to KV
-  await persist(kv, taskId, task);
+  await persist(kv, taskId, task, entry);
+
+  // A record this update created: evidence the tap wrote between the read
+  // above and this write found no record to go on (a Task created already
+  // terminal is never written again), so it is read again now and mirrored.
+  if (!entry && origins && task.responder) {
+    const askers = new Set(await origins.askersOf(task.responder, taskId).catch(() => [] as string[]));
+    if (task.requester) askers.add(task.requester);
+    for (const a of askers) {
+      await origins.mirror(taskId, a, task.responder).catch(() => undefined);
+    }
+  }
+
+  // The tap may bind this Task id between the lookup above and the write just
+  // made: its compare-and-set then found no record to attach to, or attached
+  // to the revision this unconditional write has just replaced. One more look
+  // closes that window, on every write that left the record without one.
+  if (!task.origin && origins) {
+    const found = await lookupOrigin(origins, task.requester, task.responder, taskId);
+    if (found && (await attachOrigin(kv, taskId, found).catch(() => false))) task.origin = found;
+    // Ending with no origin: the request never crossed this server, or an
+    // observation was lost. Counted, so a mesh losing them says so.
+    if (!task.origin && TERMINAL_STATES.has(newState)) {
+      noteOriginMiss("terminal_without_origin", { task_id: taskId, state: newState });
+    }
+  }
 
   // Publish state change event.
   //
@@ -478,6 +647,11 @@ export async function handleTaskUpdate(
         requester: task.requester,
         responder: task.responder,
         offering: task.offering,
+        // The creating request as this service observed it, when it did.
+        // Without its contest lists and its multiple_requests: request ids are
+        // the record's business (and the platform's privileged read), not a
+        // broadcast's.
+        ...(task.origin ? { origin: broadcastOrigin(task.origin) } : {}),
         // §7.7: the late-completion record, on the platform-signed event the
         // requester can hold. Present only when a deadline was actually missed.
         ...(task.completed_late
@@ -486,6 +660,7 @@ export async function handleTaskUpdate(
         // §10.8: the cancel reason, additively, on the canceled lifecycle
         // event — the same enum the record and the §19.2 receipt carry.
         ...(newState === "canceled" && cancel ? { cancel_reason: cancel.reason } : {}),
+        ...(newState === "canceled" && task.canceled_by ? { canceled_by: task.canceled_by } : {}),
         // §10.8/§10.8a: the failure's reason and the attribution this service
         // COMPUTED for it. Everything downstream that scores an outcome — the
         // reputation bureau above all — reads attribution from here, off an
@@ -631,6 +806,7 @@ export async function handleTaskUpdate(
       ...(task.budget ? { budget: task.budget } : {}),
       status: "canceled",
       cancel_reason: cancel.reason,
+      ...(task.canceled_by ? { canceled_by: task.canceled_by } : {}),
     };
     const meteringEnv = createEnvelope({
       type: "emit",
@@ -682,6 +858,79 @@ export async function handleTaskUpdate(
   console.log(`[task-manager] task ${taskId}: ${newState}`);
 }
 
+/** An origin as the broadcast lifecycle event carries it: no request ids
+ *  beyond the origin's own. */
+function broadcastOrigin(origin: TaskOrigin): TaskOrigin {
+  const {
+    contested_by: _c,
+    contested_overflow: _o,
+    contested_overflow_since: _s,
+    multiple_requests: _m,
+    ...rest
+  } = origin as TaskOrigin & { multiple_requests?: string[] };
+  return rest;
+}
+
+/** The ledger's binding for these parties, or null (also on a read failure:
+ *  an origin nobody could read is an origin not observed, never a guess). */
+async function lookupOrigin(
+  origins: OriginLedger,
+  requester: string | undefined,
+  responder: string | undefined,
+  taskId: string,
+): Promise<TaskOrigin | null> {
+  if (!requester || !responder) return null;
+  try {
+    return await origins.originFor(requester, responder, taskId);
+  } catch (err) {
+    console.warn(`[task-manager] could not read the origin of task ${taskId}:`, err);
+    return null;
+  }
+}
+
+/** A request first seen well after the Task existed did not create it. */
+function createdLongBefore(createdAt: string | undefined, observedAt: string): boolean {
+  const created = Date.parse(createdAt ?? "");
+  const seen = Date.parse(observedAt);
+  return Number.isFinite(created) && Number.isFinite(seen) && seen - created > ORIGIN_SKEW_MS;
+}
+
+/**
+ * Who asked for this cancellation, as this service observed it.
+ *
+ * `party` is the signer of the canceled update against the record: the
+ * responder whenever the responder signed it, whatever `reason` it gives (a
+ * responder that also named itself requester is still the responder).
+ *
+ * `requester_request` is the cancel the server observed from the ORIGINAL
+ * requester, the origin's, before this transition: this update itself when the
+ * original requester signed it, else the first `task.cancel` request it sent
+ * the responder about this Task. Without an origin there is no original
+ * requester the server can vouch for, and it is null.
+ */
+async function canceledBy(
+  task: TaskRecord,
+  env: Envelope,
+  taskId: string,
+  origins: OriginLedger | undefined,
+): Promise<TaskCanceledBy> {
+  const now = new Date().toISOString();
+  const party: TaskCanceledBy["party"] = env.from === task.responder ? "responder" : "requester";
+  let requesterRequest: TaskCanceledBy["requester_request"] = null;
+  const origin = task.origin;
+  if (origin && env.from === origin.requester && env.from !== origin.responder) {
+    requesterRequest = { request_id: env.id, observed_at: now, via: "update" };
+  } else if (origin && origins) {
+    try {
+      const seen = await origins.cancelRequest(taskId, origin.requester, origin.responder);
+      if (seen) requesterRequest = { request_id: seen.request_id, observed_at: seen.observed_at, via: "cancel_request" };
+    } catch (err) {
+      console.warn(`[task-manager] could not read the cancel requests of task ${taskId}:`, err);
+    }
+  }
+  return { party, requester_request: requesterRequest, at: now };
+}
+
 /**
  * §10.8 "stranded delegates": having just recorded `canceled` on a task that
  * belongs to a context, find every record that (a) is non-terminal, (b) shares
@@ -719,11 +968,19 @@ async function flagStrandedDelegates(
     if (child.context_id !== canceled.context_id) continue; // a different conversation
     if (child.requester !== canceled.responder) continue; // not the delegation chain
 
+    // Written against the record as stored now (task-write.ts), not the
+    // snapshot copy, so an update or an attached origin since the snapshot is
+    // kept, and a child that finished meanwhile is left alone.
     const now = new Date().toISOString();
-    child.stranded = true;
-    child.stranded_at = now;
-    child.updated_at = now;
-    await persist(kv, key, child);
+    const written = await rewriteTask<TaskRecord>(kv, key, (current) => {
+      if (TERMINAL_STATES.has(current.state)) return false;
+      current.stranded = true;
+      current.stranded_at = now;
+      current.updated_at = now;
+      return true;
+    });
+    if (!written) continue;
+    child = written;
 
     const ev = createEnvelope({
       type: "emit",
@@ -867,7 +1124,7 @@ async function handleBudgetRevision(
   task.budget = revision;
   task.updated_at = new Date().toISOString();
   appendHistory(task, env);
-  await persist(kv, taskId, task);
+  await persist(kv, taskId, task, entry);
 
   // Rebroadcast to the counterparty as a normal task update: same subject its
   // existing subscription already watches, this service's signature, the whole

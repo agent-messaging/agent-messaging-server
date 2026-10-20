@@ -7,6 +7,7 @@ import type { Manifest } from "../../src/sdk.js";
 import type { StoredManifest } from "../../src/registry/endpoints.js";
 import { isWellFormedSubject, withEndpoints } from "../../src/registry/endpoints.js";
 import { PresenceStore } from "../../src/registry/presence-store.js";
+import { metrics } from "../../src/shared/ops-events.js";
 import { NodeProfileStore } from "../../src/registry/node-profile-store.js";
 
 // The registry-side half of resolve-never-construct (§14.4): the manifest's
@@ -92,6 +93,27 @@ describe("endpoints stamping at register (§8.2)", () => {
     expect((cache.get(id) as StoredManifest).endpoints).toEqual({
       inbox: `mesh.agent.${id}.inbox`,
     });
+  });
+
+  it("says so when an inbox endpoint is outside mesh.agent.*.inbox, where task origins are observed", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const metric = vi.spyOn(metrics, "event");
+    const { id, manifest } = makeVouchedManifest();
+    manifest.endpoints = { inbox: "acme.orders.inbox" };
+    const resp = await register(id, manifest);
+    expect(resp.error).toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("will carry no origin"));
+    expect(metric).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "task_origin", status: "endpoint_outside_inbox", actor: id, meta: { inbox: "acme.orders.inbox" } }),
+    );
+    warn.mockClear();
+    metric.mockClear();
+    const plain = makeVouchedManifest();
+    await register(plain.id, plain.manifest);
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("will carry no origin"));
+    expect(metric).not.toHaveBeenCalledWith(expect.objectContaining({ status: "endpoint_outside_inbox" }));
+    warn.mockRestore();
+    metric.mockRestore();
   });
 
   it("stores a supplied, valid block verbatim and fills a missing inbox", async () => {

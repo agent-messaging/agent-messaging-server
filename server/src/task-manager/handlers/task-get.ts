@@ -3,12 +3,16 @@ import type { KeyedStore } from "../../storage/index.js";
 import type { Envelope, Task } from "../../sdk.js";
 import { createEnvelope, childSpan, ErrorCode } from "../../sdk.js";
 import { isPartyToTask, reportRefusal } from "../task-parties.js";
+import { redactForRequester, type OriginLedger } from "../origin.js";
 
 export async function handleTaskGet(
   env: Envelope,
   msg: BusMessage,
   kv: KeyedStore,
   serviceId: string,
+  /** The origin ledger: projected onto the record at read time (origin.ts
+   *  `view`), so evidence whose mirror was lost still shows. */
+  origins?: OriginLedger,
 ): Promise<Envelope> {
   // Extract task_id from subject: mesh.task.get.{task_id}
   const parts = msg.subject.split(".");
@@ -80,12 +84,19 @@ export async function handleTaskGet(
     });
   }
 
+  // The ledger's evidence, projected at read time (never written here). Then
+  // what this party may see: the responder sees everything; the requester
+  // sees its own origin, contests and cancel attribution, never what the
+  // server recorded about other askers (origin.ts `redactForRequester`).
+  let seen = (origins ? await origins.view(task as unknown as Record<string, unknown>, taskId) : task) as unknown as Task;
+  if (env.from !== task.responder) seen = redactForRequester(seen as unknown as Record<string, unknown>) as unknown as Task;
+
   return createEnvelope({
     type: "respond",
     from: serviceId,
     to: env.from,
     in_reply_to: env.id,
     trace: childSpan(env.trace),
-    payload: task,
+    payload: seen,
   });
 }

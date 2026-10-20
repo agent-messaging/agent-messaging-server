@@ -51,6 +51,16 @@ where its work did.
   work with a second hold; so is a request naming a Task this agent already
   ran for the same requester whose record does not answer. "No record"
   answers are remembered for 30 seconds.
+- **One task id runs one piece of work, and contention decides nothing.**
+  Requests naming the same task id are resolved one at a time, in arrival
+  order, each by the ordinary checks (a remembered owner, or the record). So
+  two stream requests sent back to back naming the same new id cannot both
+  run under it: the same requester's second one, while its stream still runs,
+  is refused with `TASK_INVALID_TRANSITION` (not retryable). A stranger naming
+  a paused Task is refused as before (`UNAUTHORIZED`) and only delays the
+  requester's resume by one record read; it can never block it. At most 8
+  requests wait per id, and 256 in all; past that, a retryable
+  `AGENT_UNAVAILABLE`.
 - **A stream reads only the chunks that answer its own request.** Besides
   the responder and the task id, every chunk (the signed final and its
   `chunk_count` included) must be `in_reply_to` the request this agent sent
@@ -75,6 +85,42 @@ where its work did.
   land just before the task manager stored the terminal. The answer came up
   to a second late.
 - Inbox replies are unchanged. Usage receipts stay on the inbox reply only.
+
+Types and readers for two Task record fields the server now writes (server
+0.4.2). Nothing the SDK sends changes.
+
+- **`Task.origin` (`TaskOrigin`).** The request that created the Task, as the
+  server observed it routing that request: `request_id` (the id answer-derived
+  meter events carry as `request_id`), `requester`, `responder`, `offering`,
+  `observed_at` and `bound_by` (`"request"` or `"answer"`). Never taken from a
+  task update, never replaced, and kept outside `history`, so the history cap
+  cannot drop it. Absent when the server did not observe the request.
+  Optional `contested_by` (request ids, at most 256, append-only, terminal
+  Tasks included), `contested_overflow` and `contested_overflow_since` list
+  every other request the server saw answered with the Task's id (a genuine
+  resume aside): the first binding stands, and a consumer refunding the origin
+  refunds those too. On a Task with no origin, the same three fields sit on
+  the Task itself (the record's own requester's requests only). Another
+  asker's requests, when the record names a different requester, are kept
+  per asker in `contested_by_asker`, beside `origin_mismatch: { requester }`.
+  A request is tied to a Task only by the provider's answer carrying it.
+  A request whose own envelope named the Task id is the requester's choice
+  and never evidence. At most 64 other askers are listed; `askers_overflow`
+  and `askers_overflow_since` count the rest. `mesh.task.get` shows a
+  requester only its own entries; the responder sees everything.
+  `multiple_requests` (on the origin, or the record while it has none) lists
+  every request that named a stream-created Task and ran under it, when there
+  was more than one.
+  `taskContestsOf(task)` reads the record-level fields strictly; a malformed
+  contest field is dropped on its own, never the origin around it.
+- **`Task.canceled_by` (`TaskCanceledBy`).** On a canceled Task: `party`
+  (`"requester"` or `"responder"`, whoever signed the canceled update, whatever
+  reason it gave), `requester_request` (the cancel the server observed from the
+  original requester, its own update or a `task.cancel` request, with when it
+  saw it, or `null`), and `at`.
+- **`taskOriginOf(record)` and `taskCanceledByOf(record)`** read the two fields
+  strictly and return null for anything short of the shape. Pinned by
+  `conformance/task-origin.json`.
 
 ## 0.62.2 (2026-10-20)
 

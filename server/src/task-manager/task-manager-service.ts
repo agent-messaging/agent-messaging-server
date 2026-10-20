@@ -8,6 +8,8 @@ import { handleTaskUpdate } from "./handlers/task-update.js";
 import { handleTaskGet } from "./handlers/task-get.js";
 import { OverdueSweep } from "./overdue-sweep.js";
 import { declaredNeedRefs, type DeclaredNeedsFn } from "./cancel.js";
+import { OriginLedger } from "./origin.js";
+import { OriginTap } from "./origin-tap.js";
 
 export class TaskManagerService {
   /** Signing identity (§4.5). Stable if TASK_MANAGER_SEED is set; a set-but-
@@ -22,13 +24,19 @@ export class TaskManagerService {
   private kv: KeyedStore;
   /** The registry's bucket, once it has opened (see `declaredNeeds`). */
   private registryKv: KeyedStore | null = null;
+  /** Task origins (origin.ts): the requests this server observed routing and
+   *  which Task id each is bound to. Null when its store is not wired, which
+   *  leaves records without `origin`. */
+  private origins: OriginLedger | null;
 
   constructor(
     private nc: Messaging,
     private js: StorageLike,
     kv: KeyedLike,
+    origins?: KeyedLike,
   ) {
     this.kv = keyedOf(kv, js);
+    this.origins = origins ? new OriginLedger(keyedOf(origins, js), this.kv) : null;
   }
 
   /**
@@ -60,10 +68,12 @@ export class TaskManagerService {
   ): Promise<TaskManagerService> {
     // Ten revisions a task, kept seven days (storage/catalog.ts).
     const kv = await storageOf(js).keyed("mesh_tasks");
+    // Seven days, the Task horizon (storage/catalog.ts).
+    const origins = await storageOf(js).keyed("mesh_task_origins");
     // EXT-8 §3's reported-spend rollup is not this service's: whoever
     // operates the mesh folds it from the §19.2 receipts this service
     // publishes (on AgentMesh, platform-shared/spend-rollup.ts).
-    return new TaskManagerService(messagingOf(nc), js, kv);
+    return new TaskManagerService(messagingOf(nc), js, kv, origins);
   }
 
   async start(): Promise<void> {
@@ -95,6 +105,8 @@ export class TaskManagerService {
             // §10.8a: the responder's declared needs, for attributing a
             // failure the responder says was the caller's doing.
             this.declaredNeeds,
+            // The task origins the tap below records.
+            this.origins ?? undefined,
           );
         } catch (err) {
           console.error("[task-manager] update handler error:", err);
@@ -102,13 +114,36 @@ export class TaskManagerService {
       }
     })();
 
+    // The origin tap (origin.ts, origin-tap.ts): the requests this server
+    // routes, and the first answers that tell it which Task id each one became,
+    // so a Task record carries the request that created it as the server saw
+    // it. The inbox only, where requests are delivered and answers reach their
+    // requesters; broadcast like the activity service's tap (queue-groups.ts):
+    // every write the ledger makes is create-only, so every instance observing
+    // the same envelope writes the same thing once.
+    if (this.origins) {
+      const subject = "mesh.agent.*.inbox";
+      const sub = this.nc.subscribe(subject, { queue: serviceQueue(subject) });
+      this.subs.push(sub);
+      const tap = new OriginTap(this.origins);
+      (async () => {
+        for await (const msg of sub) {
+          try {
+            await tap.push(msg.subject, msg.data);
+          } catch (err) {
+            console.error("[task-manager] origin tap:", err);
+          }
+        }
+      })();
+    }
+
     // Request-reply for task lookup: mesh.task.get.*
     this.subs.push(
       subscribeWithHandler(
         this.nc,
         "mesh.task.get.*",
         this.kp,
-        (env, msg) => handleTaskGet(env, msg, this.kv, this.SERVICE_ID),
+        (env, msg) => handleTaskGet(env, msg, this.kv, this.SERVICE_ID, this.origins ?? undefined),
         undefined,
         undefined,
         serviceQueue("mesh.task.get.*"),
