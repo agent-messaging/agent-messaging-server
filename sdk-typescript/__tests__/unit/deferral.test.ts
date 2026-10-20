@@ -115,6 +115,15 @@ function deliver(conn: Conn, agentId: string, senderKp: KeyPair, payload: unknow
 const decoded = (replies: Uint8Array[]) => replies.map((d) => decode(d));
 const statusOf = (e: Envelope) => (e.payload as RespondPayload | undefined)?.status;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** The statuses on a task's update subject, in order. */
+const updateStatuses = (conn: Conn, taskId: string) =>
+  conn.published.filter((p) => p.subject === Subjects.taskUpdate(taskId)).map((p) => statusOf(decode(p.data)));
+/** The first update on a task's update subject that is not `working`. */
+const terminalUpdate = (conn: Conn, taskId: string) =>
+  conn.published
+    .filter((p) => p.subject === Subjects.taskUpdate(taskId))
+    .map((p) => decode(p.data))
+    .find((e) => statusOf(e) !== "working");
 
 describe("§7.0 deferral", () => {
   it("a slow handler defers: `working` on the live wait, the completion on the task update channel", async () => {
@@ -141,15 +150,13 @@ describe("§7.0 deferral", () => {
     expect(decoded(replies).every((e) => statusOf(e) !== "completed")).toBe(true);
 
     // The terminal statement arrives on `mesh.task.{id}.update`, signed, with
-    // the output — and a copy on the outbox tap like every other respond.
+    // the output — and a copy on the outbox tap like every other respond. The
+    // record saw `working` first (§7.3), recorded when the dispatch deferred.
     await vi.waitFor(() => {
-      expect(
-        conn.published.some((p) => p.subject === Subjects.taskUpdate(taskId!)),
-      ).toBe(true);
+      expect(terminalUpdate(conn, taskId!)).toBeDefined();
     });
-    const update = decode(
-      conn.published.find((p) => p.subject === Subjects.taskUpdate(taskId!))!.data,
-    );
+    expect(updateStatuses(conn, taskId!)).toEqual(["working", "completed"]);
+    const update = terminalUpdate(conn, taskId!)!;
     expect(statusOf(update)).toBe("completed");
     expect((update.payload as RespondPayload).output).toEqual({ slow: "answer" });
     expect(update.task_id).toBe(taskId);
@@ -206,9 +213,10 @@ describe("§7.0 deferral", () => {
     const taskId = decoded(replies).find((e) => statusOf(e) === "working")!.task_id!;
 
     await vi.waitFor(() => {
-      expect(conn.published.some((p) => p.subject === Subjects.taskUpdate(taskId))).toBe(true);
+      expect(terminalUpdate(conn, taskId)).toBeDefined();
     });
-    const update = decode(conn.published.find((p) => p.subject === Subjects.taskUpdate(taskId))!.data);
+    expect(updateStatuses(conn, taskId)).toEqual(["working", "failed"]);
+    const update = terminalUpdate(conn, taskId)!;
     expect(statusOf(update)).toBe("failed");
     expect(update.error?.message).toContain("the model fell over");
   });

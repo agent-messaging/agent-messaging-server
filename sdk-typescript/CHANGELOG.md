@@ -1,5 +1,81 @@
 # Changelog
 
+## Unreleased
+
+Task records now follow §7.3 on every dispatch path, so a Task's record ends
+where its work did.
+
+- **A resume records `working` first.** A request naming an existing Task
+  (the follow-up request that §7.3 says takes `input_required` to `working`)
+  now publishes `working` on the task's update channel before its handler
+  runs. Its outcome (completed, failed, paused again) is recorded there too,
+  whether the handler answered at once or deferred. Before this, a resume
+  published `failed` or `completed` straight after `input_required`, which the
+  task manager refuses, so the record stayed `input_required`. A resume that
+  is declined is recorded `failed`, with the decline in the note, because §7.3
+  has no `working → rejected`.
+- **A deferral records `working` when it defers.** The `working` answer used
+  to reach only the caller's inbox. A deferred Task's record now starts
+  `working`, with the right two parties, before its terminal update or pause.
+- **A synchronous budget pause creates the record** (`input_required`, the
+  same as an input-problems pause), so a budget revision has a Task to revise.
+  Both synchronous pauses now publish that creating record BEFORE the inbox
+  reply, so a requester that acts on the reply at once finds the Task.
+- **Only a Task's own requester resumes it.** Naming a task id is not owning
+  it: ids are broadcast on `mesh.event.task.*`. A responder now remembers, for
+  every Task it pauses, who asked for it (for as long as the task manager
+  keeps the record), and a request naming a Task is a resume only when it
+  comes from that requester. A remembered pause is a hint: it is forgotten
+  when the Task is canceled or ended here, and one older than 30 seconds is
+  confirmed on the Task's record before it resumes. When the responder does
+  not remember the Task (after a restart), it reads the record and checks
+  that `env.from` is its requester, this agent its responder, and the Task
+  still paused. A request naming somebody else's Task is refused with
+  `UNAUTHORIZED` and nothing is recorded on that Task. This also closes the
+  same hole on the deferred and streaming paths, which recorded on any task
+  id a request named.
+- **A Task still working is not resumable.** A requester naming its own
+  deferred Task gets new work under a new id, not a second handler on the
+  same Task. A resume claims its pause when it arrives, before admission, so
+  of two resumes a moment apart only the first resumes the Task.
+- **A request naming a Task nobody has recorded** (a `requestStream` id) runs
+  as ordinary work, so a stream that falls through to a plain handler and
+  answers at once still creates no Task, no receipt and no meter events. When
+  the record cannot be read (the task manager is slow or down, or takes over
+  a second, the cap on this read), the request is not refused: a streaming
+  request runs under the requester's own id, so its chunks and its end reach
+  the requester, but nothing is recorded on that id until a later read shows
+  it has no record or is this requester's. A request that is not a stream
+  and names a task id is a resume, so when the record cannot be read it is
+  refused with a retryable `AGENT_UNAVAILABLE` rather than started as new
+  work with a second hold; so is a request naming a Task this agent already
+  ran for the same requester whose record does not answer. "No record"
+  answers are remembered for 30 seconds.
+- **A stream reads only the chunks that answer its own request.** Besides
+  the responder and the task id, every chunk (the signed final and its
+  `chunk_count` included) must be `in_reply_to` the request this agent sent
+  and addressed `to` this agent. Otherwise a stranger naming a buyer's stream
+  id, while the responder could not read the task record, got the honest
+  responder to sign chunks onto the buyer's stream subject, which joined the
+  buyer's stream or made it read as tampered.
+- **A stream that resumes a paused Task records `working` first**, so its
+  ending is a legal step on the record.
+- **Only a Task's requester cancels it.** An inbound `task.cancel` is taken
+  only from the agent that asked for the Task (what this agent remembers of
+  its dispatches, or else the Task's record). Anybody else's is refused with
+  `UNAUTHORIZED` and does nothing: no hold released, no subcontracted Task
+  canceled.
+- **A queued ack does not complete a resumed Task.** An interactive agent
+  that queues a resume for its session leaves the record `working` until the
+  real answer.
+- **`awaitTask` re-reads the record sooner** (250 ms, then doubling, was
+  1 s). A deferred Task that finished just as it deferred could have its
+  terminal update go out before the requester's subscription was live, and,
+  now that a deferral records `working` first, the first record read could
+  land just before the task manager stored the terminal. The answer came up
+  to a second late.
+- Inbox replies are unchanged. Usage receipts stay on the inbox reply only.
+
 ## 0.62.2 (2026-10-20)
 
 A fix to the funds-hold admission gate. Nothing else changes.
