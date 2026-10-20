@@ -30,19 +30,41 @@ afterEach(async () => {
   for (const a of openAgents.splice(0)) await a.close();
 });
 
-function makeConn() {
+/** The task manager's records, for `mesh.task.get.<id>`: a record the reader
+ *  is a party to is answered, one it is not is UNAUTHORIZED, a missing one is
+ *  TASK_NOT_FOUND (server/src/task-manager/handlers/task-get.ts). */
+type Records = Map<string, { requester: string; responder: string; state: TaskState }>;
+
+function makeConn(records?: Records) {
   const subs = new Map<string, (msg: unknown) => void>();
   const registryKp = nkeys.createUser();
   const published: { subject: string; data: Uint8Array }[] = [];
+  const taskGets: string[] = [];
   return {
     subs,
     published,
+    taskGets,
     publish: vi.fn((subject: string, data: Uint8Array) => {
       published.push({ subject, data });
       subs.get(subject)?.({ subject, data, reply: undefined, respond: () => true });
     }),
-    request: vi.fn(async (_subject: string, data: Uint8Array) => {
+    request: vi.fn(async (subject: string, data: Uint8Array) => {
       const req = decodeUnverified(data);
+      if (records && subject.startsWith("mesh.task.get.")) {
+        const id = subject.slice("mesh.task.get.".length);
+        taskGets.push(id);
+        const record = records.get(id);
+        const answer = !record
+          ? { error: { code: "TASK_NOT_FOUND", message: `Task ${id} not found`, retryable: false } }
+          : record.requester !== req.from && record.responder !== req.from
+            ? { error: { code: "UNAUTHORIZED", message: "not a party", retryable: false } }
+            : { payload: { id, ...record } };
+        return {
+          data: encode(
+            signEnvelope(createEnvelope({ type: "respond", from: registryKp.getPublicKey(), to: req.from, in_reply_to: req.id, ...answer }), registryKp),
+          ),
+        };
+      }
       return {
         data: encode(
           signEnvelope(
@@ -70,8 +92,12 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const problem = { input: "file", problem: "missing" as const, description: "attach the file" };
 
 /** A responder whose handler does whatever `behave` says for each call. */
-async function responder(behave: (input: { step?: string }) => unknown, deferAfterMs?: number) {
-  const conn = makeConn();
+async function responder(
+  behave: (input: { step?: string }) => unknown,
+  deferAfterMs?: number,
+  opts: { records?: Records; interaction?: "service" | "interactive" } = {},
+) {
+  const conn = makeConn(opts.records);
   const agent = AgentMesh.withConnection(conn as unknown as ConnectionManager, nkeys.createUser(), nkeys.createUser(), {});
   openAgents.push(agent);
   agent.onRequest("work", (input) => behave(input as { step?: string }), deferAfterMs !== undefined ? { deferAfterMs } : undefined);
@@ -81,7 +107,7 @@ async function responder(behave: (input: { step?: string }) => unknown, deferAft
     writer.write("a");
     writer.end("done");
   });
-  await agent.register({ name: "transitions" });
+  await agent.register({ name: "transitions", ...(opts.interaction ? { interaction: opts.interaction } : {}) });
   return { conn, agent };
 }
 
@@ -143,7 +169,7 @@ describe("fresh dispatches reach the record legally", () => {
     it(`${c.name}: ends ${c.end} on the record`, async () => {
       const { conn, agent, kp, buyer } = await run(c.behave, c.defer);
       deliver(conn, agent.agentId, kp, { offering: "work", input: {} });
-      await sleep(150);
+      await sleep(400);
       const T = taskIdOf(conn, buyer)!;
       expect(T).toBeTruthy();
       const r = replay(statuses(updates(conn, T)));
@@ -155,14 +181,14 @@ describe("fresh dispatches reach the record legally", () => {
   it("a deferral records working before anything else", async () => {
     const { conn, agent, kp, buyer } = await run(async () => { await sleep(60); return 1; }, 20);
     deliver(conn, agent.agentId, kp, { offering: "work", input: {} });
-    await sleep(150);
+    await sleep(400);
     expect(statuses(updates(conn, taskIdOf(conn, buyer)!))).toEqual(["working", "completed"]);
   });
 
   it("a synchronous bare answer creates no record", async () => {
     const { conn, agent, kp } = await run(() => ({ ok: true }));
     deliver(conn, agent.agentId, kp, { offering: "work", input: {} });
-    await sleep(50);
+    await sleep(200);
     expect(conn.published.some((p) => p.subject.startsWith("mesh.task.") && p.subject.endsWith(".update"))).toBe(false);
   });
 
@@ -171,7 +197,7 @@ describe("fresh dispatches reach the record legally", () => {
       const { conn, agent, kp } = await run(() => 1);
       const T = "stream-task-" + step;
       deliver(conn, agent.agentId, kp, { offering: "stream", input: { step }, config: { stream: true } }, T);
-      await sleep(80);
+      await sleep(200);
       const r = replay(statuses(updates(conn, T)));
       expect(r.refused).toEqual([]);
       expect(r.state).toBe(step === "end" ? "completed" : "failed");
@@ -199,11 +225,11 @@ describe("a resume after a synchronous pause reaches the record legally", () => 
         return c.then();
       }, c.defer);
       deliver(conn, agent.agentId, kp, { offering: "work", input: {} });
-      await sleep(30);
+      await vi.waitFor(() => expect(taskIdOf(conn, buyer)).toBeTruthy());
       const T = taskIdOf(conn, buyer)!;
       expect(replay(statuses(updates(conn, T))).state).toBe("input_required");
       deliver(conn, agent.agentId, kp, { offering: "work", input: { step: "resume" } }, T);
-      await sleep(150);
+      await sleep(400);
       const all = statuses(updates(conn, T));
       const r = replay(all);
       expect(r.refused).toEqual([]);
@@ -211,4 +237,161 @@ describe("a resume after a synchronous pause reaches the record legally", () => 
       expect(all.slice(1, 2)).toEqual(["working"]);
     });
   }
+});
+
+/** What this responder sent to `who`'s inbox, decoded, in order. */
+const repliesTo = (conn: Conn, who: string): Envelope[] =>
+  conn.published.filter((p) => p.subject === Subjects.agentInbox(who)).map((p) => decode(p.data));
+/** Anything published about any Task, or any metering event. */
+const taskTraffic = (conn: Conn) =>
+  conn.published.filter((p) => p.subject.startsWith("mesh.task.") || p.subject.startsWith("mesh.event.metering"));
+
+/** A responder that pauses the first call for a file, then does `then`. */
+async function pausing(then: () => unknown, deferAfterMs?: number, opts: Parameters<typeof responder>[2] = {}) {
+  const calls: { step?: string }[] = [];
+  const { conn, agent } = await responder((input) => {
+    calls.push(input);
+    if (calls.length === 1) throw new InputProblemsError(problem);
+    return then();
+  }, deferAfterMs, opts);
+  const buyerKp = nkeys.createUser();
+  return { conn, agent, calls, buyerKp, buyer: buyerKp.getPublicKey() };
+}
+
+describe("only the Task's own requester resumes it", () => {
+  // Task ids are public (mesh.event.task.*). A third party that names a
+  // buyer's paused Task must not drive it: the task manager would take it,
+  // because the responder is a party to that Task.
+  const cases: { name: string; offering: string; defer?: number; then: () => unknown; config?: unknown }[] = [
+    { name: "answers at once", offering: "work", then: () => ({ theirs: true }) },
+    { name: "fails at once", offering: "work", then: () => { throw new Error("x"); } },
+    { name: "defers, then completes (the deferred path)", offering: "work", defer: 20, then: async () => { await sleep(60); return 1; } },
+    { name: "defers, then fails (the deferred path)", offering: "work", defer: 20, then: async () => { await sleep(60); throw new Error("x"); } },
+    { name: "is a stream", offering: "stream", then: () => 1, config: { stream: true } },
+  ];
+  for (const c of cases) {
+    it(`a third party naming a paused Task, whose request ${c.name}, is refused and the Task is untouched`, async () => {
+      const { conn, agent, calls, buyerKp, buyer } = await pausing(c.then, c.defer);
+      deliver(conn, agent.agentId, buyerKp, { offering: "work", input: {} });
+      await vi.waitFor(() => expect(taskIdOf(conn, buyer)).toBeTruthy());
+      const T = taskIdOf(conn, buyer)!;
+      expect(statuses(updates(conn, T))).toEqual(["input_required"]);
+
+      const strangerKp = nkeys.createUser();
+      const stranger = strangerKp.getPublicKey();
+      deliver(conn, agent.agentId, strangerKp, { offering: c.offering, input: { step: "end" }, ...(c.config ? { config: c.config } : {}) }, T);
+      await sleep(400);
+      expect(statuses(updates(conn, T))).toEqual(["input_required"]);
+      expect(conn.published.some((p) => p.subject === Subjects.taskStream(T))).toBe(false);
+      expect(calls.length).toBe(1);
+      const refusal = repliesTo(conn, stranger).find((e) => e.error);
+      expect(refusal?.error?.code).toBe("UNAUTHORIZED");
+      expect(refusal?.error?.message).toContain(T);
+
+      // The buyer still resumes its own Task.
+      deliver(conn, agent.agentId, buyerKp, { offering: "work", input: { step: "resume" } }, T);
+      await sleep(400);
+      expect(statuses(updates(conn, T)).slice(0, 2)).toEqual(["input_required", "working"]);
+      expect(replay(statuses(updates(conn, T))).refused).toEqual([]);
+    });
+  }
+
+  it("after a restart (nothing remembered), the record decides: its requester resumes, a stranger is refused", async () => {
+    const records: Records = new Map();
+    const { conn, agent } = await responder(() => ({ ok: true }), undefined, { records });
+    const buyerKp = nkeys.createUser();
+    const buyer = buyerKp.getPublicKey();
+    const T = "paused-before-restart";
+    records.set(T, { requester: buyer, responder: agent.agentId, state: "input_required" });
+
+    const strangerKp = nkeys.createUser();
+    deliver(conn, agent.agentId, strangerKp, { offering: "work", input: {} }, T);
+    await sleep(200);
+    expect(updates(conn, T)).toEqual([]);
+    expect(repliesTo(conn, strangerKp.getPublicKey()).find((e) => e.error)?.error?.code).toBe("UNAUTHORIZED");
+    expect(conn.taskGets).toContain(T);
+
+    deliver(conn, agent.agentId, buyerKp, { offering: "work", input: {} }, T);
+    await sleep(200);
+    expect(statuses(updates(conn, T))).toEqual(["working", "completed"]);
+    expect(replay(statuses(updates(conn, T)), "input_required").refused).toEqual([]);
+  });
+
+  it("a record naming another responder is not this agent's to resume, even for its requester", async () => {
+    const records: Records = new Map();
+    const { conn, agent } = await responder(() => ({ ok: true }), 20, { records });
+    const buyerKp = nkeys.createUser();
+    const T = "someone-elses-task";
+    // The buyer is the requester; the responder is another agent. Reading it
+    // answers (the reader is a party); resuming it here would be wrong.
+    records.set(T, { requester: buyerKp.getPublicKey(), responder: nkeys.createUser().getPublicKey(), state: "input_required" });
+    deliver(conn, agent.agentId, buyerKp, { offering: "work", input: {} }, T);
+    await sleep(200);
+    expect(updates(conn, T)).toEqual([]);
+    expect(repliesTo(conn, buyerKp.getPublicKey()).find((e) => e.error)?.error?.code).toBe("UNAUTHORIZED");
+  });
+});
+
+describe("a requestStream that falls through to a plain handler", () => {
+  // requestStream sends a requester-made task_id. With no stream handler for
+  // the offering, the plain handler answers, and a synchronous answer is a
+  // bare reply (§6.4): no Task, so no record, no §19.2 receipt, no meter events.
+  for (const withRecords of [false, true]) {
+    it(`answered synchronously creates no record, no receipt and no meter events${withRecords ? " (the record read finds none)" : ""}`, async () => {
+      const { conn, agent } = await responder(() => ({ ok: true }), undefined, withRecords ? { records: new Map() } : {});
+      const kp = nkeys.createUser();
+      const T = "requester-made-stream-id";
+      deliver(conn, agent.agentId, kp, { offering: "work", input: {}, config: { stream: true } }, T);
+      await sleep(200);
+      expect(taskTraffic(conn)).toEqual([]);
+      const answer = repliesTo(conn, kp.getPublicKey()).find((e) => (e.payload as RespondPayload | undefined)?.status === "completed");
+      expect(answer).toBeDefined();
+      expect(answer!.task_id).toBeUndefined();
+    });
+  }
+
+  it("deferred, it records on the requester's own id, which is nobody else's Task", async () => {
+    const { conn, agent } = await responder(async () => { await sleep(60); return 1; }, 20, { records: new Map() });
+    const kp = nkeys.createUser();
+    const T = "requester-made-deferred";
+    deliver(conn, agent.agentId, kp, { offering: "work", input: {}, config: { stream: true } }, T);
+    await vi.waitFor(() => expect(statuses(updates(conn, T))).toEqual(["working", "completed"]), { timeout: 2000 });
+  });
+});
+
+describe("a pause creates its record before the inbox reply", () => {
+  const cases: { name: string; behave: () => unknown }[] = [
+    { name: "an input-problems pause", behave: () => { throw new InputProblemsError(problem); } },
+    { name: "a budget pause", behave: () => { throw new BudgetExhaustedError({ message: "ceiling" }); } },
+  ];
+  for (const c of cases) {
+    it(`${c.name}: the input_required record, then the reply`, async () => {
+      const { conn, agent, kp, buyer } = await run(c.behave);
+      deliver(conn, agent.agentId, kp, { offering: "work", input: {} });
+      await sleep(200);
+      const T = taskIdOf(conn, buyer)!;
+      const at = (pred: (p: { subject: string; data: Uint8Array }) => boolean) => conn.published.findIndex(pred);
+      const record = at((p) => p.subject === Subjects.taskUpdate(T));
+      const reply = at((p) => p.subject === Subjects.agentInbox(buyer) && (decode(p.data).payload as RespondPayload | undefined)?.status === "input_required");
+      expect(record).toBeGreaterThanOrEqual(0);
+      expect(reply).toBeGreaterThanOrEqual(0);
+      expect(record).toBeLessThan(reply);
+    });
+  }
+});
+
+describe("an interactive agent that answers a resume with a queued ack", () => {
+  it("records working and no completion until the real answer", async () => {
+    const { conn, agent, buyerKp, buyer } = await pausing(
+      () => ({ queued: true, inbox_id: "0198c001-0000-7000-8000-0000000000ff" }),
+      undefined,
+      { interaction: "interactive" },
+    );
+    deliver(conn, agent.agentId, buyerKp, { offering: "work", input: {} });
+    await vi.waitFor(() => expect(taskIdOf(conn, buyer)).toBeTruthy());
+    const T = taskIdOf(conn, buyer)!;
+    deliver(conn, agent.agentId, buyerKp, { offering: "work", input: { step: "resume" } }, T);
+    await sleep(200);
+    expect(statuses(updates(conn, T))).toEqual(["input_required", "working"]);
+  });
 });

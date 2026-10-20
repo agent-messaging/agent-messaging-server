@@ -231,6 +231,7 @@ import { derivedSealing } from "./internal/sealing-posture.js";
 import { AdmissionGate, readKnockInput, textOfInput, type AdmissionControl, type AdmissionOptions, type DescribeDocument, type SenderFacts } from "./admission.js";
 import { describeDocumentOf } from "./interview.js";
 import { registrarNameLookup } from "./naming-gate.js";
+import { ResumableTasks } from "./internal/resumable-tasks.js";
 import {
   StorefrontAdopter,
   type StorefrontAdoption,
@@ -612,6 +613,9 @@ export class AgentMesh {
   /** dispatch task id → the trial it was admitted as. Its spend is metered
    *  as trial spend, and its task updates say `trial: true`. Bounded. */
   private trialTasks = new Map<string, TrialContext>();
+  /** The Tasks this agent paused or deferred, and who asked for each: the
+   *  only requests that resume one (resolveDispatchTask). */
+  private readonly resumableTasks = new ResumableTasks();
   /** The §13.5 usage-receipt ledger: declared meter reports accumulated per
    *  task until the terminal respond attaches them as `payload.usage`. */
   private meterUsage = new MeterUsageLedger();
@@ -6220,8 +6224,91 @@ export class AgentMesh {
       error: body.error ?? undefined,
     });
     const encoded = encode(updateEnv);
+    this.noteResumable(taskId, requestEnv, body.payload.status);
     this.conn.publish(Subjects.taskUpdate(taskId), encoded);
     if (opts.outbox !== false) this.conn.publish(Subjects.agentOutbox(this.agentId), encoded);
+  }
+
+  /** Keep `resumableTasks` in step with what this agent records on a Task: a
+   *  pause or a deferral (`input_required`, `working`) leaves it resumable by
+   *  the requester that asked for it, and a terminal statement ends that. */
+  private noteResumable(taskId: string, requestEnv: Envelope, status: string | undefined): void {
+    if (status === "input_required" || status === "working") {
+      const offering = (requestEnv.payload as RequestPayload | undefined)?.offering;
+      this.resumableTasks.remember(taskId, requestEnv.from, typeof offering === "string" ? offering : "");
+    } else if (status && TERMINAL_STATES.has(status as TaskState)) {
+      this.resumableTasks.forget(taskId);
+    }
+  }
+
+  /**
+   * Which Task an inbound request runs under, and whether it is a RESUME
+   * (§7.3: the follow-up request that takes a paused Task back to working).
+   *
+   * `env.task_id` is not proof of anything: task ids are broadcast on
+   * `mesh.event.task.*`, so a third party can name somebody else's paused
+   * Task. And the task manager would take what this agent recorded on it,
+   * because this agent is a party to that Task. So a request is a resume only
+   * when this agent paused or deferred that Task for `env.from`
+   * (`resumableTasks`), or, when it does not remember it (a restart, an
+   * evicted entry), when the Task's own record names `env.from` as the
+   * requester and this agent as the responder and is still paused.
+   *
+   * - `fresh`: ordinary work under `taskId` (the request's own id when it names
+   *   a Task nobody has recorded, such as a requestStream's requester-made id;
+   *   a new one when it names a Task this request may not touch). Nothing is
+   *   recorded on a Task the request named unless the work itself creates it.
+   * - `resume`: the paused Task, resumed by its own requester.
+   * - `refuse`: the request names a Task that belongs to someone else, or one
+   *   whose parties could not be read. Answered with the error, never worked.
+   */
+  private async resolveDispatchTask(
+    env: Envelope,
+  ): Promise<{ kind: "fresh" | "resume"; taskId: string } | { kind: "refuse"; error: ErrorObject }> {
+    const named = env.task_id;
+    if (named === undefined) return { kind: "fresh", taskId: uuid7() };
+    const notYours: ErrorObject = {
+      code: ErrorCode.UNAUTHORIZED,
+      message:
+        `Task ${named} was not opened by you with this agent, so this request cannot resume it (§7.3). ` +
+        `Send the request without a task_id to start new work.`,
+      retryable: false,
+    };
+    const known = this.resumableTasks.get(named);
+    if (known) return known.requester === env.from ? { kind: "resume", taskId: named } : { kind: "refuse", error: notYours };
+
+    // Not remembered: read the Task's record (§7.4), which carries both parties.
+    let record: { requester?: unknown; responder?: unknown; state?: unknown; offering?: unknown } | undefined;
+    try {
+      record = (await this.serviceRequest(Subjects.taskGet(named), { task_id: named }, TASK_RECORD_TIMEOUT_MS)) as typeof record;
+    } catch (err) {
+      const code = err instanceof MeshError ? err.code : undefined;
+      // No record: nobody's Task. Ordinary work, under the id the requester chose.
+      if (code === ErrorCode.TASK_NOT_FOUND || code === ErrorCode.NOT_FOUND) return { kind: "fresh", taskId: named };
+      // A record this agent is not a party to: somebody else's Task.
+      if (code === ErrorCode.UNAUTHORIZED) return { kind: "refuse", error: notYours };
+      return {
+        kind: "refuse",
+        error: {
+          code: ErrorCode.AGENT_UNAVAILABLE,
+          message:
+            `This request names Task ${named}, and its record could not be read to check who it belongs to ` +
+            `(${err instanceof Error ? err.message : "no answer"}). Send it again shortly, or without a task_id to start new work.`,
+          retryable: true,
+        },
+      };
+    }
+    if (!record || typeof record.requester !== "string" || typeof record.responder !== "string") {
+      return { kind: "fresh", taskId: named };
+    }
+    if (record.requester !== env.from || record.responder !== this.agentId) return { kind: "refuse", error: notYours };
+    if (record.state === "input_required") {
+      this.resumableTasks.remember(named, env.from, typeof record.offering === "string" ? record.offering : "");
+      return { kind: "resume", taskId: named };
+    }
+    // The requester's own Task, but not paused (still working, or ended): new
+    // work under a new id, so nothing lands on a record that cannot take it.
+    return { kind: "fresh", taskId: uuid7() };
   }
 
   /**
@@ -6677,7 +6764,26 @@ export class AgentMesh {
 
     // The task id this dispatch runs under, computed once so the §7.7
     // admission phase, the regular handler and the stream branch all agree.
-    const dispatchTaskId = env.task_id ?? uuid7();
+    // A request naming a Task resumes it only when that Task is this agent's
+    // paused work for this same requester (resolveDispatchTask): a task id is
+    // public, and naming one is not owning it. Before admission, so a refused
+    // request places no hold and gets no accept.
+    const resolved = await this.resolveDispatchTask(env);
+    if (resolved.kind === "refuse") {
+      const refuseEnv = this.newEnvelope({
+        type: "respond",
+        from: this.agentId,
+        to: env.from,
+        in_reply_to: env.id,
+        trace: childSpan(env.trace),
+        error: resolved.error,
+        payload: { status: "failed" },
+      });
+      this.sendRespond(msg, env, encode(refuseEnv), { transportReply: viaReply, tap: true });
+      return;
+    }
+    const dispatchTaskId = resolved.taskId;
+    const resuming = resolved.kind === "resume";
 
     // ── §7.7 admission, then the §6.4a accept ──────────────────────────
     // Everything §22 refuses has been refused above. What remains before the
@@ -6900,8 +7006,8 @@ export class AgentMesh {
     // runs, and a deferral records it when it defers. After that, every
     // outcome is legal from `working`, and a resume's outcome is recorded on
     // the channel too (`recordOnTask`), whatever its inbox reply looks like.
-    // The inbox replies themselves are unchanged.
-    const resuming = env.task_id !== undefined;
+    // The inbox replies themselves are unchanged. `resuming` is decided above
+    // (resolveDispatchTask): a request that merely names a Task is not one.
     let workingRecorded = false;
     const recordOnTask = (payload: RespondPayload & { problems?: unknown }, error?: ErrorObject | null) =>
       this.publishDeferredTerminal(dispatchTaskId, env, { payload, error }, { outbox: false });
@@ -7084,8 +7190,11 @@ export class AgentMesh {
       this.holdDelivered(dispatchTaskId);
 
       // A resumed Task ends on its record too. The usage receipt stays on the
-      // inbox reply alone: one receipt per request (§13.5).
-      if (resuming) {
+      // inbox reply alone: one receipt per request (§13.5). Not on a queued
+      // ack: an interactive agent that queued the resume for its session has
+      // not answered it yet, so the record stays `working` (recorded when the
+      // resume arrived) until the real answer, and no completion is claimed.
+      if (resuming && !queuedAck) {
         const { usage: _receipt, ...recorded } = respPayload;
         recordOnTask(recorded);
       }
@@ -7189,13 +7298,14 @@ export class AgentMesh {
           trace: childSpan(env.trace),
           payload: { status: "input_required", message: err.message, problems: err.problems, ...this.trialMark(ctx.taskId) },
         });
-        this.sendRespond(msg, env, encode(pauseEnv), { transportReply: viaReply, tap: true });
         // The same pause on the task's own subject: this is the CREATING
         // update (the task manager fixes the parties from it — `to` names
         // the requester), so the parked task exists as a record and the
         // wait is visible to the requester's surfaces, not only to the
         // requester's socket. Without this, a park was a reply that
-        // vanished with the connection.
+        // vanished with the connection. Published BEFORE the inbox reply, so
+        // a requester that acts on the reply at once (a revision, a resume)
+        // finds the record there.
         const recordEnv = this.newEnvelope({
           type: "respond",
           from: this.agentId,
@@ -7204,7 +7314,9 @@ export class AgentMesh {
           trace: childSpan(env.trace),
           payload: { status: "input_required", message: err.message, problems: err.problems, ...this.trialMark(ctx.taskId) },
         });
+        this.noteResumable(ctx.taskId, env, "input_required");
         this.conn.publish(Subjects.taskUpdate(ctx.taskId), encode(recordEnv));
+        this.sendRespond(msg, env, encode(pauseEnv), { transportReply: viaReply, tap: true });
         return;
       }
 
@@ -7226,11 +7338,12 @@ export class AgentMesh {
           error: err.toErrorObject(),
           payload: { status: "input_required", message: err.message },
         });
-        this.sendRespond(msg, env, encode(pauseEnv), { transportReply: viaReply, tap: true });
         // The same pause on the task's own subject, as for input problems: the
         // budget conversation continues on the Task, so the Task must exist
-        // as a record (a revision for a Task with no record is refused).
+        // as a record (a revision for a Task with no record is refused). The
+        // creating update goes first, before the inbox reply, as above.
         recordOnTask({ status: "input_required", message: err.message }, err.toErrorObject());
+        this.sendRespond(msg, env, encode(pauseEnv), { transportReply: viaReply, tap: true });
         return;
       }
 

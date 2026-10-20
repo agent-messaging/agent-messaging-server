@@ -19,6 +19,24 @@ where its work did.
   `working`, with the right two parties, before its terminal update or pause.
 - **A synchronous budget pause creates the record** (`input_required`, the
   same as an input-problems pause), so a budget revision has a Task to revise.
+  Both synchronous pauses now publish that creating record BEFORE the inbox
+  reply, so a requester that acts on the reply at once finds the Task.
+- **Only a Task's own requester resumes it.** Naming a task id is not owning
+  it: ids are broadcast on `mesh.event.task.*`. A responder now remembers, for
+  every Task it pauses or defers, who asked for it (for as long as the task
+  manager keeps the record), and a request naming a Task is a resume only when
+  it comes from that requester. When the responder does not remember the Task
+  (after a restart), it reads the Task's record and checks that `env.from` is
+  its requester, this agent its responder, and the Task still paused. A
+  request naming somebody else's Task is refused with `UNAUTHORIZED` and
+  nothing is recorded on that Task. This also closes the same hole on the
+  deferred and streaming paths, which recorded on any task id a request
+  named. A request naming a Task nobody has recorded (a `requestStream` id)
+  runs as ordinary work, so a stream that falls through to a plain handler
+  and answers at once still creates no Task, no receipt and no meter events.
+- **A queued ack does not complete a resumed Task.** An interactive agent
+  that queues a resume for its session leaves the record `working` until the
+  real answer.
 - Inbox replies are unchanged. Usage receipts stay on the inbox reply only.
 
 ## 0.62.2 (2026-10-20)
