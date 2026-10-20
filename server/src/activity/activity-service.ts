@@ -724,6 +724,12 @@ export class ActivityService {
     // Same normal/degraded split as recordRequest; the fold reconstructs the
     // once-per-exchange rule from which events the batch carries.
     const metered = this.meteringOn && entry.to !== "" && entry.from !== "";
+    // §13.5 request_id: every event derived from this answer names the request
+    // it answers, so a reader joins the request's batch (keyed by its own
+    // envelope_id) to this one without the correlation held here. The entry's
+    // own id first: a task-mode respond correlated by task_id carries no
+    // in_reply_to. Pre-fix KV entries have no requestId; in_reply_to covers them.
+    const requestId = entry.requestId ?? env.in_reply_to ?? undefined;
 
     // §13.5 usage receipt, lifted into DECLARED meter events. Two shapes
     // carry one, and `usageReceiptParties` decides which and who is which:
@@ -743,7 +749,7 @@ export class ActivityService {
       const parties = usageReceiptParties(env, entry);
       if (parties) {
         const { batch, dropped } = declaredUsage(
-          parties.provider, parties.consumer, env.id, parties.raw, entry.offering, env.task_id,
+          parties.provider, parties.consumer, env.id, parties.raw, entry.offering, env.task_id, requestId,
         );
         if (dropped > 0) {
           console.warn(`[activity] dropped ${dropped} malformed usage entr(y/ies) from ${parties.provider.slice(0, 12)}…`);
@@ -756,7 +762,7 @@ export class ActivityService {
     }
     if (entry.to && entry.respondedAt) {
       if (metered) {
-        publishMeterEvents(this.nc, this.kp, observedResponseBytes(entry.to, entry.from, env.id, bytes));
+        publishMeterEvents(this.nc, this.kp, observedResponseBytes(entry.to, entry.from, env.id, bytes, requestId));
       } else {
         this.usage.recordOutBytes(entry.to, bytes);
       }
@@ -781,7 +787,7 @@ export class ActivityService {
         publishMeterEvents(
           this.nc,
           this.kp,
-          observedResponse(entry.to, entry.from, env.id, bytes, entry.status === "failed", entry.offering, env.task_id),
+          observedResponse(entry.to, entry.from, env.id, bytes, entry.status === "failed", entry.offering, env.task_id, requestId),
         );
         // §13.5 refusal events: an admission refusal is declined demand, and
         // both parties reasonably want it recorded. Derives from the REFUSING
@@ -791,7 +797,7 @@ export class ActivityService {
           publishMeterEvents(
             this.nc,
             this.kp,
-            observedRefusal(entry.to, entry.from, env.id, code, entry.offering),
+            observedRefusal(entry.to, entry.from, env.id, code, entry.offering, requestId),
           );
         }
       } else {
