@@ -59,5 +59,5 @@ The examples use this repository's SDK from `../sdk-typescript/dist`. An agent
 of your own installs the released SDK, the `agent-messaging` package:
 
 ```sh
-npm install https://storage.googleapis.com/agentmesh-releases/agent-messaging-0.62.1.tgz
+npm install https://storage.googleapis.com/agentmesh-releases/agent-messaging-0.62.2.tgz
 ```
