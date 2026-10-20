@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+Task records now follow §7.3 on every dispatch path, so a Task's record ends
+where its work did.
+
+- **A resume records `working` first.** A request naming an existing Task
+  (the follow-up request that §7.3 says takes `input_required` to `working`)
+  now publishes `working` on the task's update channel before its handler
+  runs. Its outcome (completed, failed, paused again) is recorded there too,
+  whether the handler answered at once or deferred. Before this, a resume
+  published `failed` or `completed` straight after `input_required`, which the
+  task manager refuses, so the record stayed `input_required`. A resume that
+  is declined is recorded `failed`, with the decline in the note, because §7.3
+  has no `working → rejected`.
+- **A deferral records `working` when it defers.** The `working` answer used
+  to reach only the caller's inbox. A deferred Task's record now starts
+  `working`, with the right two parties, before its terminal update or pause.
+- **A synchronous budget pause creates the record** (`input_required`, the
+  same as an input-problems pause), so a budget revision has a Task to revise.
+- Inbox replies are unchanged. Usage receipts stay on the inbox reply only.
+
 ## 0.62.2 (2026-10-20)
 
 A fix to the funds-hold admission gate. Nothing else changes.

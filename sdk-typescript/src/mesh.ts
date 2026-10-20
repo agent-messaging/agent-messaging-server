@@ -6205,6 +6205,7 @@ export class AgentMesh {
     taskId: string,
     requestEnv: Envelope,
     body: { payload: RespondPayload & { problems?: unknown }; error?: ErrorObject | null },
+    opts: { outbox?: boolean } = {},
   ): void {
     const updateEnv = this.newEnvelope({
       type: "respond",
@@ -6220,7 +6221,7 @@ export class AgentMesh {
     });
     const encoded = encode(updateEnv);
     this.conn.publish(Subjects.taskUpdate(taskId), encoded);
-    this.conn.publish(Subjects.agentOutbox(this.agentId), encoded);
+    if (opts.outbox !== false) this.conn.publish(Subjects.agentOutbox(this.agentId), encoded);
   }
 
   /**
@@ -6882,6 +6883,34 @@ export class AgentMesh {
     // §7.0: set when this dispatch answered the live wait with `working` and
     // owes its terminal statement to the task update channel instead.
     let deferred = false;
+
+    // §7.3: the Task record must see a LEGAL sequence of states. Two dispatch
+    // shapes used to skip `working` on the task update channel and then state
+    // an outcome that only `working` may lead to:
+    //
+    //  - A RESUME: a request naming an existing Task (`env.task_id`), the
+    //    follow-up `request` §7.3 names as the trigger of input_required →
+    //    working. The record was parked in input_required, and the outcome
+    //    (failed, completed) is refused from there, so the Task never ended.
+    //  - A DEFERRAL: the `working` answer went to the caller's inbox only, so
+    //    a Task paused or ended by a later update had never been working on
+    //    the record either.
+    //
+    // So a resume records `working` on the update channel before its handler
+    // runs, and a deferral records it when it defers. After that, every
+    // outcome is legal from `working`, and a resume's outcome is recorded on
+    // the channel too (`recordOnTask`), whatever its inbox reply looks like.
+    // The inbox replies themselves are unchanged.
+    const resuming = env.task_id !== undefined;
+    let workingRecorded = false;
+    const recordOnTask = (payload: RespondPayload & { problems?: unknown }, error?: ErrorObject | null) =>
+      this.publishDeferredTerminal(dispatchTaskId, env, { payload, error }, { outbox: false });
+    const recordWorking = () => {
+      if (workingRecorded) return;
+      workingRecorded = true;
+      recordOnTask({ status: "working" });
+    };
+    if (resuming) recordWorking();
     try {
       // §13.1: the inbound trace is ambient while the handler runs, so any
       // request/emit the handler makes joins the same trace automatically.
@@ -6911,6 +6940,8 @@ export class AgentMesh {
         ]);
         if (raced === DEFER) {
           deferred = true;
+          // §7.3: the record goes working before anything this Task says next.
+          recordWorking();
           const workingEnv = this.newEnvelope({
             type: "respond",
             from: this.agentId,
@@ -6999,6 +7030,7 @@ export class AgentMesh {
             });
             return;
           }
+          if (resuming) recordOnTask({ status: "failed", note: "SEALING_REQUIRED: the reply_key could not be resolved" }, refuseEnv.error);
           this.sendRespond(msg, env, encode(refuseEnv), { transportReply: viaReply, tap: true });
           return;
         }
@@ -7050,6 +7082,13 @@ export class AgentMesh {
       // Delivered: the hold stands, and the platform draws against it when the
       // rating fold writes this job's charge.
       this.holdDelivered(dispatchTaskId);
+
+      // A resumed Task ends on its record too. The usage receipt stays on the
+      // inbox reply alone: one receipt per request (§13.5).
+      if (resuming) {
+        const { usage: _receipt, ...recorded } = respPayload;
+        recordOnTask(recorded);
+      }
 
       // Tap: publish response for activity observation
       this.sendRespond(msg, env, encode(respEnv), { transportReply: viaReply || queuedAck, tap: true });
@@ -7118,6 +7157,9 @@ export class AgentMesh {
       // A handler that throws RejectedError is DECLINING the task (§7.2
       // `rejected`), not failing it. Terminal, bare reply, no error object.
       if (err instanceof RejectedError) {
+        // §7.3 has no working → rejected edge: a resumed Task that is then
+        // declined is recorded failed, the decline in the note (as deferred).
+        if (resuming) recordOnTask({ status: "failed", note: `rejected after the work began: ${err.message}` });
         const rejEnv = this.newEnvelope({
           type: "respond",
           from: this.agentId,
@@ -7185,6 +7227,10 @@ export class AgentMesh {
           payload: { status: "input_required", message: err.message },
         });
         this.sendRespond(msg, env, encode(pauseEnv), { transportReply: viaReply, tap: true });
+        // The same pause on the task's own subject, as for input problems: the
+        // budget conversation continues on the Task, so the Task must exist
+        // as a record (a revision for a Task with no record is refused).
+        recordOnTask({ status: "input_required", message: err.message }, err.toErrorObject());
         return;
       }
 
@@ -7210,6 +7256,9 @@ export class AgentMesh {
         error: meshErr.toErrorObject(),
         payload: { status: "failed", ...(failUsage ? { usage: failUsage } : {}) },
       });
+
+      // A resumed Task ends failed on its record too (the receipt stays on the reply).
+      if (resuming) recordOnTask({ status: "failed" }, errEnv.error);
 
       // Tap: publish error response for activity observation
       this.sendRespond(msg, env, encode(errEnv), { transportReply: viaReply, tap: true });
