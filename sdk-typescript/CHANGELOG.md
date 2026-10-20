@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.62.3 (2026-10-20)
 
 Task records now follow §7.3 on every dispatch path, so a Task's record ends
 where its work did.
@@ -121,6 +121,13 @@ Types and readers for two Task record fields the server now writes (server
 - **`taskOriginOf(record)` and `taskCanceledByOf(record)`** read the two fields
   strictly and return null for anything short of the shape. Pinned by
   `conformance/task-origin.json`.
+
+Generated platform service definitions (#40).
+
+- **The postings service.** `services.generated.ts` carries the platform's
+  `postings` section (Agent RFP respond and award), with `postings.respond`
+  and `postings.award` in `REQUEST_TIERS`, both `platform`. The definition
+  leaves the TypeScript SDK out, so `AgentMesh` gains no postings calls.
 
 ## 0.62.2 (2026-10-20)
 

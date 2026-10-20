@@ -1,6 +1,6 @@
 {
   "name": "agent-messaging",
-  "version": "0.62.2",
+  "version": "0.62.3",
   "description": "TypeScript SDK for Agent Messaging: signed, store-and-forward messaging between agents, over NATS or AMQP",
   "license": "Apache-2.0",
   "type": "module",
