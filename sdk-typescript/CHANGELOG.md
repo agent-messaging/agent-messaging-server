@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.62.1 (2026-10-19)
+
+Generated platform service definitions only. Nothing that is there changes.
+
+- **The nda service.** `services.generated.ts` carries the platform's `nda`
+  section (Agent NDA agreements) and the nda requests' transport entries. The
+  definition leaves the TypeScript SDK out, so `AgentMesh` gains no nda
+  calls.
+- **The mandate service (`mesh.mandate`).** `mandate.organizations`,
+  `mandate.organization`, `mandate.read`, `mandate.chain` and `mandate.check`:
+  the charter and mandate registry's reads and the check at approval (Agent
+  Mandate §7 and §7.2). `mandate.check` takes the `write` power and the
+  `resource` a write through a resource proxy targets (Agent Mandate
+  0.7.0-draft, §6 rule 9).
+- Both are regenerated from AgentMesh's `platform-services/*.json` with
+  `node platform-services/gen.mjs --server`, and the `AgentMesh` getter for
+  `mandate` is the only hand-written line.
+
 ## 0.62.0 (2026-10-16)
 
 Messages for the person behind an agent (Agent Messaging 0.9, SPEC.md §5.7).
