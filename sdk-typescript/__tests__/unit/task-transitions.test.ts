@@ -829,8 +829,77 @@ describe("two requests naming the same new task id at once", () => {
         .map((x) => JSON.parse(new TextDecoder().decode(x.data)) as Envelope); // chunks may be unsigned (§11.6)
       expect(onT.length).toBeGreaterThan(0);
       expect(onT.every((e) => e.in_reply_to === undefined || e.in_reply_to === first.id)).toBe(true);
-      // The claim is released: a later request naming T is decided as before.
-      expect((agent as unknown as { claimingTasks: Set<string> }).claimingTasks.size).toBe(0);
+      // Nothing is left queued or in flight once both are done.
+      await sleep(100);
+      const internals = agent as unknown as { taskIdQueues: Map<string, unknown>; streamsInFlight: Map<string, string> };
+      expect(internals.taskIdQueues.size).toBe(0);
+      expect(internals.streamsInFlight.size).toBe(0);
     });
   }
+});
+
+describe("requests naming one task id queue; contention never decides who resumes", () => {
+  /** A responder that just restarted (it remembers nothing), whose paused
+   *  Task `T` the record says belongs to `buyer`. The record read is slow. */
+  async function restarted(T: string, buyer: string, readMs: number) {
+    const records: Records = new Map();
+    const ran: string[] = [];
+    const conn = makeConn(records);
+    const slowRequest = conn.request;
+    conn.request = vi.fn(async (subject: string, data: Uint8Array) => {
+      if (subject.startsWith("mesh.task.get.")) await sleep(readMs);
+      return slowRequest(subject, data);
+    }) as typeof conn.request;
+    const agent = AgentMesh.withConnection(conn as unknown as ConnectionManager, nkeys.createUser(), nkeys.createUser(), {});
+    openAgents.push(agent);
+    agent.onRequest("work", (input) => {
+      ran.push((input as { who: string }).who);
+      return { ok: true };
+    });
+    await agent.register({ name: "restarted" });
+    records.set(T, { requester: buyer, responder: agent.agentId, state: "input_required" });
+    return { conn, agent, ran };
+  }
+
+  it("a stranger naming a paused task 5 ms before its requester's resume: the stranger is refused, the resume runs", async () => {
+    const buyerKp = nkeys.createUser();
+    const strangerKp = nkeys.createUser();
+    const T = "paused-after-restart";
+    const { conn, agent, ran } = await restarted(T, buyerKp.getPublicKey(), 200);
+    const stranger = deliver(conn, agent.agentId, strangerKp, { offering: "work", input: { who: "stranger" } }, T);
+    await sleep(5);
+    const resume = deliver(conn, agent.agentId, buyerKp, { offering: "work", input: { who: "buyer" } }, T);
+    await vi.waitFor(() => expect(statuses(updates(conn, T))).toEqual(["working", "completed"]), { timeout: 5000 });
+    expect(ran).toEqual(["buyer"]);
+    const toStranger = repliesTo(conn, strangerKp.getPublicKey()).find((e) => e.in_reply_to === stranger.id && e.error);
+    expect(toStranger?.error?.code).toBe("UNAUTHORIZED");
+    const toBuyer = repliesTo(conn, buyerKp.getPublicKey()).filter((e) => e.in_reply_to === resume.id);
+    expect(toBuyer.some((e) => e.error)).toBe(false);
+    expect(statuses(updates(conn, T))).toEqual(["working", "completed"]);
+  });
+
+  it("repeated strangers only delay the resume, never block it", async () => {
+    const buyerKp = nkeys.createUser();
+    const T = "paused-many-strangers";
+    const { conn, agent, ran } = await restarted(T, buyerKp.getPublicKey(), 20);
+    for (let i = 0; i < 5; i++) deliver(conn, agent.agentId, nkeys.createUser(), { offering: "work", input: { who: "stranger" } }, T);
+    deliver(conn, agent.agentId, buyerKp, { offering: "work", input: { who: "buyer" } }, T);
+    await vi.waitFor(() => expect(ran).toEqual(["buyer"]), { timeout: 5000 });
+  });
+
+  it("past the per-id bound, a request is told to retry (AGENT_UNAVAILABLE), never refused for good", async () => {
+    const buyerKp = nkeys.createUser();
+    const T = "paused-bounded";
+    const { conn, agent } = await restarted(T, buyerKp.getPublicKey(), 100);
+    const sent = Array.from({ length: 10 }, () => {
+      const kp = nkeys.createUser();
+      return { kp, env: deliver(conn, agent.agentId, kp, { offering: "work", input: { who: "x" } }, T) };
+    });
+    await sleep(1500);
+    const codes = sent.map(({ kp, env }) => repliesTo(conn, kp.getPublicKey()).find((e) => e.in_reply_to === env.id && e.error)?.error);
+    const busy = codes.filter((e) => e?.code === "AGENT_UNAVAILABLE");
+    expect(busy.length).toBeGreaterThan(0);
+    expect(busy.every((e) => e!.retryable === true)).toBe(true);
+    expect(codes.some((e) => e?.code === "TASK_INVALID_TRANSITION")).toBe(false);
+  });
 });
