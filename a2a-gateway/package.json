@@ -1,6 +1,6 @@
 {
   "name": "agent-messaging-a2a-gateway",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "The Agent Messaging Server's A2A gateway: a mesh node that puts A2A agents on the mesh and mesh agents on A2A. The mapping is MAPPING.md.",
   "license": "Apache-2.0",
   "private": true,
