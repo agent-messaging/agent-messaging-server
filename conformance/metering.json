@@ -270,6 +270,132 @@
       }
     }
   },
+  "request_id": {
+    "comment": "13.5: request_id is the id of the request envelope that an event's deriving envelope answers. A metering deployment SHOULD set it on every event it derives from an answer: the responses and bytes_out events of a respond, the declared events lifted from a usage receipt (on a respond, or on a request carrying in_reply_to), and the refusal event. The events of a delivered request carry none, because their envelope_id is the request's id. request_id takes no part in the (meter, envelope_id) idempotency key, and a reader that does not know the member ignores it, so every event under 'valid' is valid to a reader written before it too. 'join' shows what the member gives a reader, and asks nothing of a reader that does not join.",
+    "valid": [
+      {
+        "meter": "responses",
+        "class": "observed",
+        "quantity": 1,
+        "provider": "UAKQRYZBYFOC65OQZVJ3QPCIERDTRNNZPMOJUYXC3DGPRCDWSKD4HV5A",
+        "consumer": "UBMBH4BK6EIHQFVMHLSABFSQXB3JXUFZOXVZQTIERO33AD4HHAI3D7QP",
+        "offering": "caselaw-summary",
+        "envelope_id": "0198c001-0000-7000-8000-00000000c4f2",
+        "request_id": "0198c001-0000-7000-8000-00000000a1b0",
+        "ts": "2026-08-02T15:04:10Z"
+      },
+      {
+        "meter": "bytes_out",
+        "class": "observed",
+        "quantity": 812,
+        "provider": "UAKQRYZBYFOC65OQZVJ3QPCIERDTRNNZPMOJUYXC3DGPRCDWSKD4HV5A",
+        "consumer": "UBMBH4BK6EIHQFVMHLSABFSQXB3JXUFZOXVZQTIERO33AD4HHAI3D7QP",
+        "offering": "caselaw-summary",
+        "envelope_id": "0198c001-0000-7000-8000-00000000c4f2",
+        "request_id": "0198c001-0000-7000-8000-00000000a1b0",
+        "ts": "2026-08-02T15:04:10Z"
+      },
+      {
+        "meter": "tokens_out",
+        "class": "declared",
+        "quantity": 4210,
+        "provider": "UAKQRYZBYFOC65OQZVJ3QPCIERDTRNNZPMOJUYXC3DGPRCDWSKD4HV5A",
+        "consumer": "UBMBH4BK6EIHQFVMHLSABFSQXB3JXUFZOXVZQTIERO33AD4HHAI3D7QP",
+        "offering": "caselaw-summary",
+        "envelope_id": "0198c001-0000-7000-8000-00000000c4f2",
+        "request_id": "0198c001-0000-7000-8000-00000000a1b0",
+        "ts": "2026-08-02T15:04:10Z"
+      },
+      {
+        "meter": "requests",
+        "class": "observed",
+        "quantity": 0,
+        "refused": true,
+        "refusal_code": "AGREEMENT_REQUIRED",
+        "provider": "UAKQRYZBYFOC65OQZVJ3QPCIERDTRNNZPMOJUYXC3DGPRCDWSKD4HV5A",
+        "consumer": "UBMBH4BK6EIHQFVMHLSABFSQXB3JXUFZOXVZQTIERO33AD4HHAI3D7QP",
+        "offering": "caselaw-summary",
+        "envelope_id": "0198c001-0000-7000-8000-00000000d5e1",
+        "request_id": "0198c001-0000-7000-8000-00000000d5e0",
+        "ts": "2026-08-02T15:10:00Z"
+      }
+    ],
+    "join": {
+      "comment": "The meter events of one exchange as the stream carries them: the request's two, under its own envelope_id, and the answer's three, under the respond's envelope_id with request_id naming the request. The respond is the one receipt.signed_envelope pins, whose in_reply_to is the request's id. A reader groups the request's events by envelope_id and the answer's by request_id, and the two groups meet on the request's id. expect lists, for each request id, the meters on each side and the answer envelopes that carried them.",
+      "events": [
+        {
+          "meter": "requests",
+          "class": "observed",
+          "quantity": 1,
+          "provider": "UAKQRYZBYFOC65OQZVJ3QPCIERDTRNNZPMOJUYXC3DGPRCDWSKD4HV5A",
+          "consumer": "UBMBH4BK6EIHQFVMHLSABFSQXB3JXUFZOXVZQTIERO33AD4HHAI3D7QP",
+          "offering": "caselaw-summary",
+          "envelope_id": "0198c001-0000-7000-8000-00000000a1b0",
+          "ts": "2026-08-02T15:04:02Z"
+        },
+        {
+          "meter": "bytes_in",
+          "class": "observed",
+          "quantity": 640,
+          "provider": "UAKQRYZBYFOC65OQZVJ3QPCIERDTRNNZPMOJUYXC3DGPRCDWSKD4HV5A",
+          "consumer": "UBMBH4BK6EIHQFVMHLSABFSQXB3JXUFZOXVZQTIERO33AD4HHAI3D7QP",
+          "offering": "caselaw-summary",
+          "envelope_id": "0198c001-0000-7000-8000-00000000a1b0",
+          "ts": "2026-08-02T15:04:02Z"
+        },
+        {
+          "meter": "responses",
+          "class": "observed",
+          "quantity": 1,
+          "provider": "UAKQRYZBYFOC65OQZVJ3QPCIERDTRNNZPMOJUYXC3DGPRCDWSKD4HV5A",
+          "consumer": "UBMBH4BK6EIHQFVMHLSABFSQXB3JXUFZOXVZQTIERO33AD4HHAI3D7QP",
+          "offering": "caselaw-summary",
+          "envelope_id": "0198c001-0000-7000-8000-00000000c4f2",
+          "request_id": "0198c001-0000-7000-8000-00000000a1b0",
+          "ts": "2026-08-02T15:04:10Z"
+        },
+        {
+          "meter": "bytes_out",
+          "class": "observed",
+          "quantity": 812,
+          "provider": "UAKQRYZBYFOC65OQZVJ3QPCIERDTRNNZPMOJUYXC3DGPRCDWSKD4HV5A",
+          "consumer": "UBMBH4BK6EIHQFVMHLSABFSQXB3JXUFZOXVZQTIERO33AD4HHAI3D7QP",
+          "offering": "caselaw-summary",
+          "envelope_id": "0198c001-0000-7000-8000-00000000c4f2",
+          "request_id": "0198c001-0000-7000-8000-00000000a1b0",
+          "ts": "2026-08-02T15:04:10Z"
+        },
+        {
+          "meter": "tokens_out",
+          "class": "declared",
+          "quantity": 4210,
+          "provider": "UAKQRYZBYFOC65OQZVJ3QPCIERDTRNNZPMOJUYXC3DGPRCDWSKD4HV5A",
+          "consumer": "UBMBH4BK6EIHQFVMHLSABFSQXB3JXUFZOXVZQTIERO33AD4HHAI3D7QP",
+          "offering": "caselaw-summary",
+          "envelope_id": "0198c001-0000-7000-8000-00000000c4f2",
+          "request_id": "0198c001-0000-7000-8000-00000000a1b0",
+          "ts": "2026-08-02T15:04:10Z"
+        }
+      ],
+      "expect": [
+        {
+          "request_id": "0198c001-0000-7000-8000-00000000a1b0",
+          "request_meters": [
+            "bytes_in",
+            "requests"
+          ],
+          "answer_meters": [
+            "bytes_out",
+            "responses",
+            "tokens_out"
+          ],
+          "answer_envelope_ids": [
+            "0198c001-0000-7000-8000-00000000c4f2"
+          ]
+        }
+      ]
+    }
+  },
   "not_covered": {
     "comment": "Boundaries, written down so nobody mistakes them for gaps.",
     "items": [

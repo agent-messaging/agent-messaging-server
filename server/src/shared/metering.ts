@@ -78,6 +78,13 @@ export interface MeterEvent {
   /** The id of the envelope this event derives from. (meter, envelope_id) is
    *  the idempotency key a fold MUST deduplicate on. */
   envelope_id: string;
+  /** Events derived from an ANSWER (a respond's `responses` / `bytes_out`,
+   *  declared receipt events, refusal events): the id of the request envelope
+   *  answered (§13.5, Agent Messaging 0.9.5-draft). Lets a reader join a
+   *  request's events (keyed by their own envelope_id) to its answer's without
+   *  correlation state. Request-side events never carry it: their envelope_id
+   *  IS the request id. Not part of the idempotency key. */
+  request_id?: string;
   ts: string;
   /** Refusal events only: quantity 0, and the code that refused. */
   refused?: boolean;
@@ -174,7 +181,7 @@ export function observedRequest(
 
 /** The FIRST `respond` of an exchange left `provider`: one `responses` event
  *  plus its `bytes_out`; `failed` marks an error response. Derives from the
- *  respond envelope. */
+ *  respond envelope; `requestId` names the request it answers. */
 export function observedResponse(
   provider: string,
   consumer: string,
@@ -183,8 +190,13 @@ export function observedResponse(
   failed: boolean,
   offering?: string,
   taskId?: string,
+  requestId?: string,
 ): MeterEventBatch {
-  const extra = { ...(offering ? { offering } : {}), ...(taskId ? { task_id: taskId } : {}) };
+  const extra = {
+    ...(offering ? { offering } : {}),
+    ...(taskId ? { task_id: taskId } : {}),
+    ...(requestId ? { request_id: requestId } : {}),
+  };
   return {
     events: [
       base("responses", 1, provider, consumer, envelopeId, extra),
@@ -195,14 +207,21 @@ export function observedResponse(
 }
 
 /** A follow-up `respond` on an already-counted exchange (task-mode
- *  multi-respond): bytes only, exactly as the counters have always worked. */
+ *  multi-respond): bytes only, exactly as the counters have always worked.
+ *  `requestId` names the request the exchange answers. */
 export function observedResponseBytes(
   provider: string,
   consumer: string,
   envelopeId: string,
   bytes: number,
+  requestId?: string,
 ): MeterEventBatch {
-  return { events: [base("bytes_out", Math.max(0, bytes), provider, consumer, envelopeId)] };
+  return {
+    events: [
+      base("bytes_out", Math.max(0, bytes), provider, consumer, envelopeId,
+        requestId ? { request_id: requestId } : undefined),
+    ],
+  };
 }
 
 /**
@@ -214,7 +233,8 @@ export function observedResponseBytes(
  * deliberately, because the delivered request already produced a `requests`
  * event under the request's id, and (meter, envelope_id) is the idempotency
  * key: the same key twice would make the refusal record disappear into the
- * dedupe. The fixture's refusal vector pins the distinct-id shape.
+ * dedupe. The fixture's refusal vector pins the distinct-id shape. The
+ * refused request is named by `request_id` instead (§13.5).
  */
 export function observedRefusal(
   provider: string,
@@ -222,6 +242,7 @@ export function observedRefusal(
   refusingEnvelopeId: string,
   refusalCode: string,
   offering?: string,
+  requestId?: string,
 ): MeterEventBatch {
   return {
     events: [
@@ -229,6 +250,7 @@ export function observedRefusal(
         refused: true,
         refusal_code: refusalCode,
         ...(offering ? { offering } : {}),
+        ...(requestId ? { request_id: requestId } : {}),
       }),
     ],
   };
@@ -249,6 +271,7 @@ export function declaredUsage(
   entries: unknown,
   offering?: string,
   taskId?: string,
+  requestId?: string,
 ): { batch: MeterEventBatch; dropped: number } {
   const raw = Array.isArray(entries) ? entries : [];
   const ts = new Date().toISOString();
@@ -266,6 +289,7 @@ export function declaredUsage(
       ts,
       ...(offering ? { offering } : {}),
       ...(taskId ? { task_id: taskId } : {}),
+      ...(requestId ? { request_id: requestId } : {}),
     };
     if (validMeterEvent(candidate)) events.push(candidate);
     else dropped++;
@@ -340,6 +364,16 @@ export function readBatch(env: Envelope): { batch: MeterEventBatch; dropped: num
     const ev = e as { offering?: unknown; skill?: unknown } | null;
     if (ev && typeof ev === "object" && ev.offering === undefined && typeof ev.skill === "string") {
       ev.offering = ev.skill;
+    }
+  }
+  // §13.5 request_id is optional and a reader ignores what it cannot use: a
+  // malformed one is dropped from the event, never the event itself, so the
+  // counters stay whole and `MeterEvent.request_id` is always a real id.
+  for (const e of raw) {
+    const ev = e as { request_id?: unknown } | null;
+    if (ev && typeof ev === "object" && "request_id" in ev &&
+        (typeof ev.request_id !== "string" || ev.request_id === "")) {
+      delete ev.request_id;
     }
   }
   const events = raw.filter(validMeterEvent);
