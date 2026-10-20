@@ -5197,8 +5197,10 @@ export class AgentMesh {
    * A throw REFUSES the work: a balance this agent could not check is not a
    * balance it may spend against. Throw a `MeshError` with code
    * `INSUFFICIENT_FUNDS` — carrying the shortfall and a top-up URL in
-   * `details` — to have the buyer told exactly that; any other throw refuses as
-   * "the funds service could not be reached", which is retryable.
+   * `details` — to have the buyer told exactly that, or `BUDGET_INSUFFICIENT`
+   * — carrying the estimate and the spend ceiling in `details` — when the job
+   * would pass an engagement's ceiling; any other throw refuses as "the funds
+   * service could not be reached", which is retryable.
    */
   onFundsHold(fn: (req: FundsHoldRequest) => Promise<unknown>): void {
     this.fundsHold = fn;
@@ -7609,7 +7611,7 @@ export class AgentMesh {
       // define, any more than the platform can.
       held = loadFundsHoldResult(answer);
     } catch (err) {
-      // Three different facts, told apart on purpose.
+      // Four different facts, told apart on purpose.
       const fromPlatform = err instanceof MeshError ? err : null;
       const code = fromPlatform?.code ?? null;
       let refusal: MeshError;
@@ -7624,6 +7626,19 @@ export class AgentMesh {
           { sku: sku.sku, ...fromPlatform.details },
           fromPlatform.message,
         );
+      } else if (fromPlatform !== null && code === ErrorCode.BUDGET_INSUFFICIENT) {
+        // The platform SAID no on the engagement's spend ceiling, not on the
+        // balance: a fixed-fee engagement whose period ceiling this job would
+        // pass (Agent SoW §5.5.1). Same rule as INSUFFICIENT_FUNDS: pass its own
+        // words and figures through — the estimate is the price quote, and the
+        // ceiling and what remains of it are the platform's to know, not ours.
+        // Not retryable: the same message gets the same answer until the
+        // ceiling moves or the period turns. `details.sku` is guaranteed, as
+        // on every refusal out of this slot.
+        refusal = new MeshError(ErrorCode.BUDGET_INSUFFICIENT, fromPlatform.message, {
+          retryable: false,
+          details: { sku: sku.sku, ...fromPlatform.details },
+        });
       } else if (code === ErrorCode.AGREEMENT_REQUIRED) {
         // The hold door re-checks coverage against the LIVE terms and can
         // disagree with the coverage gate a few lines above: the seller

@@ -355,6 +355,89 @@ describe("the hold at admission", () => {
     expect(replies.some((e) => (e.payload as RespondPayload)?.output !== undefined)).toBe(false);
   });
 
+  it("a spend-ceiling refusal reaches the buyer as BUDGET_INSUFFICIENT, with the quote", async () => {
+    // A fixed-fee engagement whose monthly ceiling this job would pass (Agent
+    // SoW §5.5.1): the platform answers BUDGET_INSUFFICIENT with the estimate,
+    // the ceiling and what remains of it. That is the buyer's quote, so it must
+    // arrive as itself, not as a retryable outage that hides the numbers.
+    const platformDetails = {
+      sku: "default",
+      estimate: { amount_micro: 1500, currency: "USD" },
+      ceiling: { amount: 10000, period: "month", charged: 9000, remaining: 1000 },
+      remaining: 1000,
+      engagement: "eng_123",
+    };
+    const state: State = {
+      agreements: [],
+      holdError: {
+        code: "BUDGET_INSUFFICIENT",
+        message: "This job's estimate passes the engagement's monthly ceiling",
+        details: platformDetails,
+        retryable: false,
+      },
+    };
+    const agent = await coveredSeller(state);
+    const replies = send(agent);
+    await settle();
+
+    expect(replies).toHaveLength(1); // the refusal is the first and only reply
+    const terminal = replies[0];
+    expect(terminal.error?.code).toBe(ErrorCode.BUDGET_INSUFFICIENT);
+    expect(terminal.error?.retryable).toBe(false);
+    expect(terminal.error?.message).toBe(
+      "This job's estimate passes the engagement's monthly ceiling",
+    );
+    expect((terminal.payload as RespondPayload).status).toBe("failed");
+    // The platform's figures arrive unchanged: estimate, ceiling, remaining,
+    // engagement and sku.
+    expect(terminal.error?.details).toEqual(platformDetails);
+    expect(replies.some((e) => (e.payload as RespondPayload)?.output !== undefined)).toBe(false);
+    expect(conn.releases).toHaveLength(0);
+  });
+
+  it("a spend-ceiling refusal that does not name the SKU still gets one", async () => {
+    const state: State = {
+      agreements: [],
+      holdError: {
+        code: "BUDGET_INSUFFICIENT",
+        message: "Over the ceiling",
+        details: { estimate: { amount_micro: 1500 }, remaining: 0 },
+        retryable: false,
+      },
+    };
+    const agent = await coveredSeller(state);
+    const replies = send(agent);
+    await settle();
+    const terminal = terminalOf(replies);
+    expect(terminal?.error?.code).toBe(ErrorCode.BUDGET_INSUFFICIENT);
+    expect(terminal?.error?.details).toEqual({
+      sku: "default",
+      estimate: { amount_micro: 1500 },
+      remaining: 0,
+    });
+  });
+
+  it("any other platform refusal is still the retryable outage", async () => {
+    // Only the three refusals the hold contract defines pass through; anything
+    // else from the hold door keeps meaning "could not authorise, try again".
+    const state: State = {
+      agreements: [],
+      holdError: {
+        code: "INTERNAL_ERROR",
+        message: "ledger unavailable",
+        details: { reason: "db" },
+        retryable: false,
+      },
+    };
+    const agent = await coveredSeller(state);
+    const replies = send(agent);
+    await settle();
+    const terminal = terminalOf(replies);
+    expect(terminal?.error?.code).toBe(ErrorCode.AGENT_UNAVAILABLE);
+    expect(terminal?.error?.retryable).toBe(true);
+    expect(terminal?.error?.details).toEqual({ sku: "default" });
+  });
+
   it("a malformed answer is not an admission", async () => {
     // Fail-closed on the one input a half-deployed platform most easily gets
     // wrong: an unreadable answer is not "the hold succeeded".
@@ -500,6 +583,26 @@ describe("the injectable seams", () => {
     const terminal = terminalOf(replies);
     expect(terminal?.error?.code).toBe(ErrorCode.INSUFFICIENT_FUNDS);
     expect((terminal?.error?.details as Record<string, unknown>).shortfall_micro).toBe(42);
+  });
+  it("a host hook throwing BUDGET_INSUFFICIENT refuses with its quote", async () => {
+    const state: State = { agreements: [] };
+    const agent = await coveredSeller(state);
+    agent.onFundsHold(async () => {
+      throw new MeshError(ErrorCode.BUDGET_INSUFFICIENT, "over the ceiling", {
+        retryable: false,
+        details: { estimate: { amount_micro: 1500, currency: "USD" }, remaining: 200 },
+      });
+    });
+    const replies = send(agent);
+    await settle();
+    const terminal = terminalOf(replies);
+    expect(terminal?.error?.code).toBe(ErrorCode.BUDGET_INSUFFICIENT);
+    expect(terminal?.error?.retryable).toBe(false);
+    expect(terminal?.error?.details).toEqual({
+      sku: "default",
+      estimate: { amount_micro: 1500, currency: "USD" },
+      remaining: 200,
+    });
   });
 });
 
