@@ -17,6 +17,10 @@ export { PROTOCOL_VERSION } from "../../sdk-typescript/src/types/envelope.js";
 export { DIGEST_RE, MAX_RESTS_ON, checkFreshness, validateRestsOn } from "../../sdk-typescript/src/rests-on.js";
 export type { Freshness, FreshnessResult, RestsOnEntry } from "../../sdk-typescript/src/rests-on.js";
 
+// How a receiver reads `meta.audience` (SPEC.md §5.7). The activity tap applies
+// rule 1 (a message marked for a person answers no wait) the way the SDK does.
+export { audienceOf } from "../../sdk-typescript/src/audience.js";
+
 export type {
   Manifest,
   Offering,

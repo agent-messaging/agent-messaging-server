@@ -26,6 +26,7 @@ import {
   uuid7,
   Subjects,
   ErrorCode,
+  audienceOf,
 } from "../sdk.js";
 import { keyedOf, storageOf, type KeyedLike, type KeyedStore } from "../storage/index.js";
 import { metrics } from "../shared/ops-events.js";
@@ -577,7 +578,7 @@ export class ActivityService {
           const env = decode(msg.data);
           const bytes = msg.data.length;
           if (env.type === "request") {
-            this.recordRequest(env, bytes);
+            this.recordRequestOrAnswer(env, bytes);
           } else if (env.type === "respond") {
             this.recordResponse(env, bytes);
           }
@@ -604,6 +605,12 @@ export class ActivityService {
       clearInterval(this.unansweredTimer);
       this.unansweredTimer = null;
     }
+    // Exchange-index writes queued on the tap's hot path (a request's record,
+    // a first answer's respondedAt) land before shutdown, or a restart would
+    // meter a follow-up as a first answer or miss an evicted exchange.
+    try {
+      await this.index?.drain();
+    } catch { /* each write already logged its own failure */ }
     await this.usage.close(); // flushes pending counters
     this.audit.close();
     console.log("[activity] service stopped");
@@ -702,7 +709,81 @@ export class ActivityService {
     return true;
   }
 
-  private recordResponse(env: Envelope, bytes = 0): void {
+  /**
+   * A `request` envelope: a new request, or an inbox-mode answer to an
+   * earlier one (§13.5 "a new `request` carrying `in_reply_to`").
+   *
+   * An agent that answers later — a human-paced or mailbox-driven one, whose
+   * node acknowledged the asking envelope with a queued ack (§6.4a) — sends
+   * its answer as a fresh request whose `in_reply_to` names the original
+   * request. That answer is the exchange's response and is metered as one:
+   * `responses`/`bytes_out` (the first answer only, as for a respond), its
+   * `payload.usage` receipt as declared usage, `request_id` the original
+   * request, and the ORIGINAL requester as the consumer. Metering it as the
+   * request it looks like would bill it the other way round — the requester
+   * as the provider of a request the answering agent consumed.
+   *
+   * It is an answer only when the exchange it names is known (the ring, else
+   * the durable exchange index) and the envelope is the asked agent speaking
+   * to the original requester: `from` is the request's `to`, `to` is its
+   * `from`, and it is meant for the agent, not a person (§5.7 rule 1, which
+   * the SDK's own correlation applies). Anything else that happens to carry
+   * `in_reply_to` — a third party's request, the asked agent writing to
+   * somebody else, an unknown id — is an ordinary request.
+   */
+  private recordRequestOrAnswer(env: Envelope, bytes = 0): void {
+    const replyTo = typeof env.in_reply_to === "string" && env.in_reply_to !== "" ? env.in_reply_to : undefined;
+    if (replyTo === undefined || !forTheAgent(env)) {
+      this.recordRequest(env, bytes);
+      return;
+    }
+    const entry = this.entries.find((e) => e.requestId === replyTo);
+    if (entry) {
+      if (answersAsRequest(env, entry)) this.recordResponse(env, bytes, entry);
+      else this.recordRequest(env, bytes);
+      return;
+    }
+    if (!this.index) {
+      this.recordRequest(env, bytes);
+      return;
+    }
+    this.recordAnswerFromIndex(env, bytes, replyTo);
+  }
+
+  /**
+   * The index half of recordRequestOrAnswer: the request named by
+   * `in_reply_to` has left the ring. An answer when the stored exchange is
+   * the asked agent's own; otherwise — unknown id, expired record, or a
+   * sender or addressee who is not the exchange's other party — the envelope
+   * is recorded as the ordinary request it is.
+   */
+  private recordAnswerFromIndex(env: Envelope, bytes: number, replyTo: string): void {
+    const index = this.index!;
+    let ordinary = false;
+    index
+      .update(replyTo, (rec) => {
+        if (!rec || !answersAsRequest(env, rec)) {
+          ordinary = true;
+          return null;
+        }
+        return this.meterFromRecord(env, bytes, rec);
+      })
+      .then(
+        () => { if (ordinary) this.recordRequest(env, bytes); },
+        (err) => {
+          // The index could not say. Recording it as a request keeps the
+          // traffic counted, as the tap did before inbox answers were known.
+          console.error("[activity] looking up an inbox answer's exchange failed:", err instanceof Error ? err.message : err);
+          this.recordRequest(env, bytes);
+        },
+      );
+  }
+
+  /**
+   * An answer: a `respond`, or an inbox-mode answer `request` whose exchange
+   * `found` the caller already matched (recordRequestOrAnswer).
+   */
+  private recordResponse(env: Envelope, bytes = 0, found?: ActivityEntry): void {
     // §6.4a: an accept is a signal that the handler is ABOUT to run, never the
     // exchange's response - and post-cutover it precedes nearly every answer
     // on the same tapped subjects. Counting it would stamp the duration at
@@ -710,13 +791,13 @@ export class ActivityService {
     // append the audit row before the work ran, and leave a real failure
     // arriving later recorded as completed. The SDK requester filters accepts
     // out of its own wait for the same reason; so does this tap.
-    if (!env.error && (env.payload as { status?: string } | undefined)?.status === "accepted") {
+    if (!found && !env.error && (env.payload as { status?: string } | undefined)?.status === "accepted") {
       return;
     }
 
     // Correlate by the request envelope id first (in_reply_to) — bare
     // responses (§6.4) carry no task_id by design — then by task id.
-    const entry = this.entries.find(
+    const entry = found ?? this.entries.find(
       (e) =>
         (env.in_reply_to !== undefined && e.requestId === env.in_reply_to) ||
         (env.task_id !== undefined && e.taskId === env.task_id),
@@ -862,20 +943,28 @@ export class ActivityService {
     const metered = this.meteringOn && x.to !== "" && x.from !== "";
 
     // §13.5 usage receipt, lifted into DECLARED meter events. Two shapes
-    // carry one, and `usageReceiptParties` decides which and who is which:
-    // a terminal respond (the responder did the work) and an inbox-mode
-    // answer, which is a fresh request carrying `in_reply_to` (the SENDER did
-    // the work). The second was harvested by nothing until 2026-08-02, so
-    // every inbox agent on the fleet metered zero — including the one live
-    // priced agent, which enforced its price at admission and then charged
-    // for nothing.
+    // carry one: a terminal respond (the responder did the work) and an
+    // inbox-mode answer, a fresh request carrying `in_reply_to` (its SENDER,
+    // the asked agent, did the work). Either way the receipt is read against
+    // the exchange `x`: the asked agent provided, the original requester
+    // consumed. The inbox answer was metered as nothing but a reversed
+    // request until the tap learned to match it to its exchange
+    // (recordRequestOrAnswer), so every inbox agent's receipts were lost.
     //
     // The receipt rode the reporter's own envelope signature; these events
     // carry the claim into the stream, where rating (§19.6) decides what it is
     // worth. Validated whether or not metering is on, because the audit chains
     // record the claim either way.
     let receiptEntries: Array<{ meter: string; quantity: number }> | undefined;
-    const parties = usageReceiptParties(env, x);
+    // A respond is passed WITHOUT its in_reply_to: on a respond that field
+    // names the request, not an inbox answer, and `usageReceiptParties` would
+    // read a non-terminal one (a task-mode "working" update) in the
+    // reply-request direction, the requester as provider. Only its terminal
+    // shape carries a receipt.
+    const parties =
+      env.type === "request"
+        ? replyReceiptParties(env, x)
+        : usageReceiptParties({ payload: env.payload }, x);
     if (parties) {
       const { batch, dropped } = declaredUsage(
         parties.provider, parties.consumer, env.id, parties.raw, x.offering, env.task_id, x.requestId,
@@ -941,35 +1030,54 @@ export class ActivityService {
   private recordFromIndex(env: Envelope, bytes: number): void {
     const index = this.index;
     if (!index) return;
-    const viaRequest = (requestId: string) =>
-      index.update(requestId, (rec) => {
+    // Whether the record a lookup reached exists at all, so an in_reply_to
+    // naming nothing the index knows can fall back to the task id.
+    const viaRequest = async (requestId: string, strict: boolean): Promise<boolean> => {
+      let known = false;
+      await index.update(requestId, (rec) => {
         if (!rec) return null;
-        if (rec.to !== "" && env.from !== rec.to) return null;
-        if (!this.rememberRespond(env.id)) return null;
-        const first = !rec.respondedAt;
-        this.meterAnswer(env, bytes, {
-          from: rec.from,
-          to: rec.to,
-          offering: rec.offering,
-          requestId: rec.requestId,
-          first,
-          failed: !!env.error,
-        });
-        return first ? { ...rec, respondedAt: new Date().toISOString() } : null;
+        known = true;
+        // Only the responder of record answers its own exchange. A match made
+        // by the task-id fallback must name that responder outright: a
+        // record with no `to` cannot be claimed through an alias.
+        if (strict ? rec.to === "" || env.from !== rec.to : rec.to !== "" && env.from !== rec.to) return null;
+        return this.meterFromRecord(env, bytes, rec);
       });
+      return known;
+    };
     (async () => {
-      // in_reply_to names the request outright (bare mode, and task-mode
-      // answers that carry it). A task-mode answer with only a task id goes
-      // through the requester-scoped task alias; the requester is the
-      // respond's `to`.
-      let requestId: string | undefined = env.in_reply_to ?? undefined;
-      if (requestId === undefined && env.task_id !== undefined && env.to) {
-        requestId = await index.requestForTask(env.to, env.task_id);
+      // Correlate as the ring does (recordResponse): by the request envelope
+      // id first (in_reply_to — bare mode, and task-mode answers that carry
+      // it), then by task id, through the requester-scoped task alias; the
+      // requester is the respond's `to`.
+      const replyTo = typeof env.in_reply_to === "string" && env.in_reply_to !== "" ? env.in_reply_to : undefined;
+      if (replyTo !== undefined && (await viaRequest(replyTo, false))) return;
+      if (env.task_id !== undefined && env.to) {
+        const requestId = await index.requestForTask(env.to, env.task_id);
+        if (requestId !== undefined && requestId !== replyTo) await viaRequest(requestId, true);
       }
-      if (requestId !== undefined) await viaRequest(requestId);
     })().catch((err) =>
       console.error("[activity] metering an evicted exchange failed:", err instanceof Error ? err.message : err),
     );
+  }
+
+  /**
+   * Meter an answer against a stored exchange the caller has already matched
+   * to the answering agent. Returns the record to write back (the first
+   * answer stamps `respondedAt`), or null for no write.
+   */
+  private meterFromRecord(env: Envelope, bytes: number, rec: ExchangeRecord): ExchangeRecord | null {
+    if (!this.rememberRespond(env.id)) return null;
+    const first = !rec.respondedAt;
+    this.meterAnswer(env, bytes, {
+      from: rec.from,
+      to: rec.to,
+      offering: rec.offering,
+      requestId: rec.requestId,
+      first,
+      failed: !!env.error,
+    });
+    return first ? { ...rec, respondedAt: new Date().toISOString() } : null;
   }
 
   /**
@@ -1544,6 +1652,38 @@ export class ActivityService {
       payload: { agents, day: new Date().toISOString().slice(0, 10) },
     });
   }
+}
+
+/** §5.7 rule 1: only a message for the agent (no mark, or "agent") can be an
+ *  answer; one marked for a person, or malformed, never is. */
+function forTheAgent(env: Envelope): boolean {
+  return audienceOf(env) === "agent";
+}
+
+/**
+ * Is this `request` the asked agent answering its own exchange — sent by the
+ * exchange's responder of record, to the exchange's requester? Both parties
+ * must be known: an exchange with an empty side cannot be answered this way,
+ * so nobody can thread an id into a stranger's exchange and bill it.
+ */
+function answersAsRequest(env: Envelope, x: { from: string; to: string }): boolean {
+  return x.from !== "" && x.to !== "" && env.from === x.to && env.to === x.from;
+}
+
+/**
+ * The §13.5 receipt on an inbox-mode answer, read off the exchange it answers:
+ * the asked agent (`x.to`) provided, the original requester (`x.from`)
+ * consumed — the same parties as a terminal respond's receipt. The answer
+ * envelope's own from/to point the other way and are not used.
+ */
+function replyReceiptParties(
+  env: Envelope,
+  x: { from: string; to: string },
+): { provider: string; consumer: string; raw: unknown[] } | null {
+  const raw = (env.payload as { usage?: unknown } | undefined)?.usage;
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  if (!x.to || !x.from) return null;
+  return { provider: x.to, consumer: x.from, raw };
 }
 
 /** A ring row's content-free twin in the exchange index; null for a row that
