@@ -102,8 +102,16 @@ for (const [then, end] of [["defer-fail", "failed"], ["complete", "completed"], 
 }
 
 {
-  const r = await buyer.request(sellerAgent.id, "over-budget", {}, { timeout_ms: 10_000 });
-  const rec = r.task_id ? await until(r.task_id, (x) => x.state === "input_required") : null;
+  // A budget pause answers with BUDGET_EXHAUSTED, which request() throws,
+  // carrying the live Task's id in the error's details.
+  let taskId = null;
+  try {
+    const r = await buyer.request(sellerAgent.id, "over-budget", {}, { timeout_ms: 10_000 });
+    taskId = r.task_id;
+  } catch (e) {
+    taskId = e?.details?.task_id ?? null;
+  }
+  const rec = taskId ? await until(taskId, (x) => x.state === "input_required") : null;
   results.push([rec?.state === "input_required", `a synchronous budget pause has a record (${rec?.state ?? "none"})`]);
 }
 
