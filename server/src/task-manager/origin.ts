@@ -120,10 +120,11 @@
  */
 
 import { createHash } from "node:crypto";
-import type { Envelope, TaskOrigin } from "../sdk.js";
+import type { Envelope, TaskCanceledBy, TaskOrigin } from "../sdk.js";
 import { audienceOf, TERMINAL_STATES } from "../sdk.js";
 import type { KeyedStore } from "../storage/index.js";
 import { noteOriginMiss } from "./origin-tap.js";
+import { rewriteTask } from "./task-write.js";
 
 export type { TaskOrigin };
 
@@ -305,6 +306,77 @@ function seenTooLate(task: TaskParties, observedAt: string): boolean {
   const created = Date.parse(task.created_at ?? "");
   const seen = Date.parse(observedAt);
   return Number.isFinite(created) && Number.isFinite(seen) && seen - created > ORIGIN_SKEW_MS;
+}
+
+/**
+ * How long the update handler waits for the cancel-request read that decides
+ * `canceled_by.requester_request`. Past it the attribution is written
+ * unverified (never as "the requester did not ask") and settled later.
+ */
+export const CANCEL_READ_TIMEOUT_MS = 5_000;
+
+/** When an unverified `canceled_by` is retried after the transition. */
+export const CANCEL_SETTLE_DELAYS_MS: readonly number[] = [1_000, 5_000, 30_000, 120_000];
+
+/** Why a `canceled_by` is unverified. */
+export type CancelReadFailure = "read_failed" | "read_timed_out" | "ledger_unavailable";
+
+/** The cancel-request read: what it found, or why it could not tell. */
+export type CancelRead = { ok: true; seen: ObservedCancel | null } | { ok: false; reason: CancelReadFailure };
+
+/**
+ * Read the first `task.cancel` request `from` sent `to` about this Task,
+ * bounded by `timeoutMs`. A failure or a timeout is reported as such, never
+ * as "none seen".
+ */
+export async function readCancelRequest(
+  origins: OriginLedger | undefined,
+  taskId: string,
+  from: string,
+  to: string,
+  timeoutMs = CANCEL_READ_TIMEOUT_MS,
+): Promise<CancelRead> {
+  if (!origins) return { ok: false, reason: "ledger_unavailable" };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<CancelRead>((resolve) => {
+    timer = setTimeout(() => resolve({ ok: false, reason: "read_timed_out" }), timeoutMs);
+    (timer as { unref?: () => void }).unref?.();
+  });
+  const read = origins.cancelRequest(taskId, from, to).then(
+    (seen): CancelRead => ({ ok: true, seen }),
+    (err): CancelRead => {
+      console.warn(`[task-manager] could not read the cancel requests of task ${taskId}:`, err);
+      return { ok: false, reason: "read_failed" };
+    },
+  );
+  try {
+    const out = await Promise.race([read, timedOut]);
+    if (!out.ok && out.reason === "read_timed_out") {
+      console.warn(`[task-manager] reading the cancel requests of task ${taskId} timed out after ${timeoutMs}ms`);
+    }
+    return out;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * An unverified `canceled_by` settled from a successful read: the original
+ * requester's cancel request counts only when observed at or before the
+ * transition (`at`), the same as at transition time.
+ */
+export function settledCanceledBy(
+  c: TaskCanceledBy,
+  seen: ObservedCancel | null,
+  now = new Date().toISOString(),
+): TaskCanceledBy {
+  const counts = !!seen && Date.parse(seen.observed_at) <= Date.parse(c.at);
+  return {
+    party: c.party,
+    requester_request: counts ? { request_id: seen!.request_id, observed_at: seen!.observed_at, via: "cancel_request" } : null,
+    at: c.at,
+    resolved_at: now,
+  };
 }
 
 export class OriginLedger {
@@ -689,6 +761,13 @@ export class OriginLedger {
       console.warn(`[task-manager] could not read the ledger for task ${taskId}; showing the record as stored:`, err);
       return record;
     }
+    // An unverified cancel attribution is settled on the copy when the read
+    // now succeeds; when it fails again the reader sees it unverified.
+    const t = task as unknown as { origin?: TaskOrigin; canceled_by?: TaskCanceledBy };
+    if (t.canceled_by?.unverified && t.origin) {
+      const got = await readCancelRequest(this, taskId, t.origin.requester, t.origin.responder);
+      if (got.ok) t.canceled_by = settledCanceledBy(t.canceled_by, got.seen);
+    }
     return task;
   }
 
@@ -707,6 +786,57 @@ export class OriginLedger {
   /** The first `task.cancel` request `from` sent `to` about this Task, if seen. */
   async cancelRequest(taskId: string, from: string, to: string): Promise<ObservedCancel | null> {
     return read<ObservedCancel>(this.store, cancelKey(taskId, from, to));
+  }
+
+  /**
+   * Settle an unverified `canceled_by` on the stored record: read the original
+   * requester's cancel requests again and, when the read succeeds, replace the
+   * attribution with the verified one (with `resolved_at`). Returns "settled",
+   * "unverified" (the read failed again), or "nothing" (no record, no origin,
+   * or already verified).
+   */
+  async settleCanceledBy(taskId: string, timeoutMs = CANCEL_READ_TIMEOUT_MS): Promise<"settled" | "unverified" | "nothing"> {
+    const e = await this.tasks.get(taskId);
+    if (!e || e.operation === "DEL" || e.operation === "PURGE" || e.length === 0) return "nothing";
+    let stored: { origin?: TaskOrigin; canceled_by?: TaskCanceledBy };
+    try {
+      stored = e.json<typeof stored>();
+    } catch {
+      return "nothing";
+    }
+    if (!stored.canceled_by?.unverified || !stored.origin) return "nothing";
+    const got = await readCancelRequest(this, taskId, stored.origin.requester, stored.origin.responder, timeoutMs);
+    if (!got.ok) return "unverified";
+    const written = await rewriteTask<{ canceled_by?: TaskCanceledBy }>(this.tasks, taskId, (t) => {
+      if (!t.canceled_by?.unverified) return false;
+      t.canceled_by = settledCanceledBy(t.canceled_by, got.seen);
+      return true;
+    });
+    return written ? "settled" : "nothing";
+  }
+
+  /**
+   * Retry {@link settleCanceledBy} in the background at `delays`, stopping at
+   * the first answer. Timers do not hold the process open; a restart loses
+   * them, and a read of the record (task.get, the privileged read) settles it
+   * on the copy it answers with.
+   */
+  settleCanceledByLater(taskId: string, delays: readonly number[] = CANCEL_SETTLE_DELAYS_MS): void {
+    const attempt = (i: number) => {
+      if (i >= delays.length) {
+        console.error(`[task-manager] canceled_by of task ${taskId} is still unverified after ${delays.length} retries`);
+        return;
+      }
+      const t = setTimeout(() => {
+        void this.settleCanceledBy(taskId)
+          .catch(() => "unverified" as const)
+          .then((r) => {
+            if (r === "unverified") attempt(i + 1);
+          });
+      }, delays[i]);
+      (t as { unref?: () => void }).unref?.();
+    };
+    attempt(0);
   }
 }
 

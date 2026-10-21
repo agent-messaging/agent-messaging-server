@@ -56,8 +56,22 @@
       "read_time": "both reads project the server's ledger onto the record when they answer, so evidence whose mirror onto the record was lost still shows"
     },
     "canceled_by": {
-      "comment": "Written once, on the canceled transition, beside `cancel_reason`, which stays the canceling party's own signed claim.",
+      "comment": "Written once, on the canceled transition, beside `cancel_reason`, which stays the canceling party's own signed claim. Verified (the server read what it needed: `required`, `requester_request` its finding) or unverified (it could not: see `unverified`). A reader tests `unverified` first.",
       "required": ["party", "requester_request", "at"],
+      "optional": ["resolved_at"],
+      "resolved_at": "ISO-8601: present when the attribution was first written unverified and the server settled it later; only cancel requests observed at or before `at` count",
+      "unverified": {
+        "comment": "The server could not read the cancel requests it needed to decide whether the original requester asked (a store read failure, a timeout, or no ledger). Whether the requester asked is UNKNOWN, so there is no `requester_request` at all: it is never written null as if confirmed. A consumer refunds nothing automatically on it and alerts an operator. The server retries in the background and replaces it with a verified attribution carrying `resolved_at` when the read succeeds; a read of the record (task.get, the privileged read) settles it on the copy it answers with. The lifecycle event and the receipt carry it as written at the transition.",
+        "required": ["party", "at", "unverified", "unverified_reason"],
+        "absent": ["requester_request", "resolved_at"],
+        "unverified": "true",
+        "unverified_reason": {
+          "read_failed": "the store refused the read",
+          "read_timed_out": "the read did not answer in time",
+          "ledger_unavailable": "the server had no ledger to read"
+        },
+        "reader": "any `unverified` other than absent or false reads as unverified, whatever else the object holds; an unknown reason is kept as given"
+      },
       "party": {
         "requester": "the requester signed the canceled update",
         "responder": "the responder signed the canceled update, whatever reason it gave"
@@ -109,6 +123,22 @@
       "party": "responder",
       "requester_request": null,
       "at": "2026-10-20T09:02:00.000Z"
+    },
+    "canceled_by_unverified": {
+      "party": "responder",
+      "at": "2026-10-20T09:03:00.000Z",
+      "unverified": true,
+      "unverified_reason": "read_failed"
+    },
+    "canceled_by_settled": {
+      "party": "responder",
+      "requester_request": {
+        "request_id": "0198c003-0000-7000-8000-00000000a006",
+        "observed_at": "2026-10-20T09:02:50.000Z",
+        "via": "cancel_request"
+      },
+      "at": "2026-10-20T09:03:00.000Z",
+      "resolved_at": "2026-10-20T09:03:01.000Z"
     },
     "canceled_by_responder_after_cancel_request": {
       "party": "responder",
@@ -167,7 +197,11 @@
       { "case": "responder_cancels_superseded", "signer": "responder", "reason": "superseded", "party": "responder", "requester_request": null },
       { "case": "responder_cancels_budget_exhausted", "signer": "responder", "reason": "budget_exhausted", "party": "responder", "requester_request": null },
       { "case": "stranger_cancel_request", "signer": "responder", "reason": "user_requested", "party": "responder", "requester_request": null, "why": "only the original requester's cancel request counts" },
-      { "case": "no_origin", "signer": "requester", "reason": "user_requested", "party": "requester", "requester_request": null, "why": "without an origin there is no original requester the server can vouch for" }
+      { "case": "no_origin", "signer": "requester", "reason": "user_requested", "party": "requester", "requester_request": null, "why": "without an origin there is no original requester the server can vouch for" },
+      { "case": "cancel_requests_unreadable", "signer": "responder", "reason": "user_requested", "party": "responder", "unverified": true, "unverified_reason": "read_failed", "requester_request": "absent", "why": "the buyer may have asked; unknown is never written as 'did not ask'" },
+      { "case": "cancel_read_timed_out", "signer": "responder", "reason": "superseded", "party": "responder", "unverified": true, "unverified_reason": "read_timed_out", "requester_request": "absent" },
+      { "case": "unverified_then_settled", "path": "written unverified; the read succeeds later", "party": "responder", "requester_request": "the buyer's task.cancel request observed before `at`, else null", "resolved_at": "present" },
+      { "case": "buyer_cancels_while_ledger_down", "signer": "requester", "reason": "user_requested", "party": "requester", "via": "update", "why": "the buyer's own update needs no read" }
     ]
   }
 }

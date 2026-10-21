@@ -190,23 +190,62 @@ export interface TaskOrigin {
  * Who asked for a cancellation, as the PLATFORM saw it. Written once, on the
  * `canceled` transition, beside `cancel_reason` (which stays the canceling
  * party's own signed claim).
+ *
+ * Either verified ({@link TaskCanceledByVerified}: the server read what it
+ * needed and `requester_request` is its finding) or unverified
+ * ({@link TaskCanceledByUnverified}: it could not read the cancel requests,
+ * so it does not know whether the original requester asked). Test
+ * `unverified` first; an unverified attribution carries no
+ * `requester_request` at all, so it can never be read as "the requester did
+ * not ask".
  */
-export interface TaskCanceledBy {
+export type TaskCanceledBy = TaskCanceledByVerified | TaskCanceledByUnverified;
+
+/** The cancel request the server observed from the ORIGINAL requester. */
+export interface TaskCancelRequestSeen {
+  request_id: string;
+  observed_at: string;
+  via: "update" | "cancel_request";
+}
+
+export interface TaskCanceledByVerified {
   /** The party that signed the `canceled` update: `"responder"` whenever the
    *  responder did, whatever reason it gave. */
   party: "requester" | "responder";
   /** The cancel the server observed from the ORIGINAL requester
    *  (`origin.requester`) before the transition: the requester's own
    *  `canceled` update (`via: "update"`) or a `task.cancel` request it sent
-   *  the responder (`via: "cancel_request"`). `null` when the server observed
-   *  none, which includes every Task without an `origin`. */
-  requester_request: {
-    request_id: string;
-    observed_at: string;
-    via: "update" | "cancel_request";
-  } | null;
+   *  the responder (`via: "cancel_request"`). `null` when the server READ its
+   *  cancel requests and found none, which includes every Task without an
+   *  `origin`. */
+  requester_request: TaskCancelRequestSeen | null;
   /** When the server recorded the transition (the server's clock). */
   at: string;
+  /** Present when the attribution was first written unverified and the server
+   *  settled it later (the server's clock). Only cancel requests observed at
+   *  or before `at` count. */
+  resolved_at?: string;
+  unverified?: never;
+  unverified_reason?: never;
+}
+
+export interface TaskCanceledByUnverified {
+  /** As on a verified attribution: the signer of the `canceled` update. */
+  party: "requester" | "responder";
+  /** When the server recorded the transition (the server's clock). */
+  at: string;
+  /** The server could not read the cancel requests it needed (a store read
+   *  failure or a timeout), so whether the original requester asked for this
+   *  cancel is UNKNOWN. Not a responder's cancel: a consumer refunds nothing
+   *  automatically on it. The server retries and replaces it with a verified
+   *  attribution (with `resolved_at`) when the read succeeds. */
+  unverified: true;
+  /** Why: `"read_failed"` (the store refused the read), `"read_timed_out"`, or
+   *  `"ledger_unavailable"` (no ledger to read). A reader keeps an unknown
+   *  reason as given. */
+  unverified_reason: "read_failed" | "read_timed_out" | "ledger_unavailable" | (string & {});
+  requester_request?: never;
+  resolved_at?: never;
 }
 
 export interface Task {
@@ -343,15 +382,28 @@ export function taskContestsOf(record: unknown): TaskContests | null {
 /**
  * A canceled Task record's `canceled_by`, read strictly: the
  * {@link TaskCanceledBy} when well-formed, else null. Pinned by
- * conformance/task-origin.json.
+ * conformance/task-origin.json. Fails toward unknown: any `unverified` other
+ * than absent or `false` reads as unverified, whatever else the object holds,
+ * and a verified attribution must carry `requester_request` (an object or
+ * `null`) to be read at all.
  */
 export function taskCanceledByOf(record: unknown): TaskCanceledBy | null {
   const c = (record as { canceled_by?: unknown } | null)?.canceled_by as Record<string, unknown> | undefined;
   if (typeof c !== "object" || c === null) return null;
   if (c.party !== "requester" && c.party !== "responder") return null;
   if (!isIso(c.at)) return null;
+  if (c.unverified !== undefined && c.unverified !== false) {
+    return {
+      party: c.party,
+      at: c.at,
+      unverified: true,
+      unverified_reason: isStr(c.unverified_reason) ? c.unverified_reason : "read_failed",
+    };
+  }
+  const resolved = isIso(c.resolved_at) ? { resolved_at: c.resolved_at } : {};
+  if (!("requester_request" in c)) return null;
   const r = c.requester_request as Record<string, unknown> | null | undefined;
-  if (r === null) return { party: c.party, requester_request: null, at: c.at };
+  if (r === null) return { party: c.party, requester_request: null, at: c.at, ...resolved };
   if (typeof r !== "object" || r === undefined) return null;
   if (!isStr(r.request_id) || !isIso(r.observed_at)) return null;
   if (r.via !== "update" && r.via !== "cancel_request") return null;
@@ -359,5 +411,6 @@ export function taskCanceledByOf(record: unknown): TaskCanceledBy | null {
     party: c.party,
     requester_request: { request_id: r.request_id, observed_at: r.observed_at, via: r.via },
     at: c.at,
+    ...resolved,
   };
 }

@@ -38,6 +38,7 @@ import {
   mergeEvidence,
   partiesMatch,
   ORIGIN_SKEW_MS,
+  readCancelRequest,
   type ContestEvidence,
   type OriginLedger,
 } from "../origin.js";
@@ -182,7 +183,8 @@ export async function handleTaskUpdate(
   declaredNeeds?: DeclaredNeedsFn,
   /** The task-origin ledger (origin.ts): the requests the server observed
    *  routing, and which one each Task id is bound to. Left unwired, records
-   *  get no `origin` and a cancel's `requester_request` is always null. */
+   *  get no `origin` and a cancel's `requester_request` is always null.
+   *  With an origin but no ledger, a responder's cancel is written unverified. */
   origins?: OriginLedger,
 ): Promise<void> {
   let env: Envelope;
@@ -590,6 +592,12 @@ export async function handleTaskUpdate(
   // Persist to KV
   await persist(kv, taskId, task, entry);
 
+  // An attribution written unverified is retried in the background until the
+  // cancel requests can be read (origin.ts settleCanceledBy).
+  if (task.state === "canceled" && task.canceled_by?.unverified && origins) {
+    origins.settleCanceledByLater(taskId);
+  }
+
   // A record this update created: evidence the tap wrote between the read
   // above and this write found no record to go on (a Task created already
   // terminal is never written again), so it is read again now and mirrored.
@@ -907,6 +915,13 @@ function createdLongBefore(createdAt: string | undefined, observedAt: string): b
  * original requester signed it, else the first `task.cancel` request it sent
  * the responder about this Task. Without an origin there is no original
  * requester the server can vouch for, and it is null.
+ *
+ * When the cancel requests cannot be read (the ledger store fails, the read
+ * times out, or there is no ledger), whether the original requester asked is
+ * UNKNOWN: the attribution is written `unverified: true` with an
+ * `unverified_reason` and no `requester_request`, never as a confirmed
+ * `requester_request: null`, which a refund consumer would read as the
+ * responder's own cancel. The handler then retries it in the background.
  */
 async function canceledBy(
   task: TaskRecord,
@@ -916,19 +931,19 @@ async function canceledBy(
 ): Promise<TaskCanceledBy> {
   const now = new Date().toISOString();
   const party: TaskCanceledBy["party"] = env.from === task.responder ? "responder" : "requester";
-  let requesterRequest: TaskCanceledBy["requester_request"] = null;
   const origin = task.origin;
-  if (origin && env.from === origin.requester && env.from !== origin.responder) {
-    requesterRequest = { request_id: env.id, observed_at: now, via: "update" };
-  } else if (origin && origins) {
-    try {
-      const seen = await origins.cancelRequest(taskId, origin.requester, origin.responder);
-      if (seen) requesterRequest = { request_id: seen.request_id, observed_at: seen.observed_at, via: "cancel_request" };
-    } catch (err) {
-      console.warn(`[task-manager] could not read the cancel requests of task ${taskId}:`, err);
-    }
+  if (!origin) return { party, requester_request: null, at: now };
+  if (env.from === origin.requester && env.from !== origin.responder) {
+    return { party, requester_request: { request_id: env.id, observed_at: now, via: "update" }, at: now };
   }
-  return { party, requester_request: requesterRequest, at: now };
+  const got = await readCancelRequest(origins, taskId, origin.requester, origin.responder);
+  if (!got.ok) return { party, at: now, unverified: true, unverified_reason: got.reason };
+  const seen = got.seen;
+  return {
+    party,
+    requester_request: seen ? { request_id: seen.request_id, observed_at: seen.observed_at, via: "cancel_request" } : null,
+    at: now,
+  };
 }
 
 /**

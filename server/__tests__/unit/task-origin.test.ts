@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createEnvelope, encode, decode, signEnvelope, nkeys } from "../../src/sdk.js";
 import type { Envelope, TaskCanceledBy, TaskOrigin } from "../../src/sdk.js";
 import { handleTaskUpdate } from "../../src/task-manager/handlers/task-update.js";
-import { OriginLedger, ORIGIN_SKEW_MS, requestKey } from "../../src/task-manager/origin.js";
+import { OriginLedger, ORIGIN_SKEW_MS, CANCEL_READ_TIMEOUT_MS, CANCEL_SETTLE_DELAYS_MS, requestKey } from "../../src/task-manager/origin.js";
 import { OriginTap, flushOriginMisses, inboxAgentOf } from "../../src/task-manager/origin-tap.js";
 import { OverdueSweep } from "../../src/task-manager/overdue-sweep.js";
 import { handleTaskGet } from "../../src/task-manager/handlers/task-get.js";
@@ -27,6 +27,7 @@ const fixture = JSON.parse(
       required: string[];
       party: Record<string, string>;
       requester_request: { required: string[]; via: Record<string, string> };
+      unverified: { required: string[]; absent: string[]; unverified_reason: Record<string, string> };
     };
   };
   cases: { origin: { case: string }[]; canceled_by: { case: string }[] };
@@ -527,6 +528,131 @@ describe("cancel attribution", () => {
     await update(taskUpdate(T, { status: "working" }));
     await update(cancelUpdate(T, buyerKp, "user_requested"));
     expect(record(T).canceled_by).toMatchObject({ party: "requester", requester_request: null });
+  });
+
+  /** Make the ledger's reads of cancel requests (keys `c.`) fail or hang. */
+  function breakCancelReads(how: "fail" | "hang") {
+    const get = store.get.bind(store);
+    const spy = vi.spyOn(store, "get").mockImplementation(async (k: string) => {
+      if (!k.startsWith("c.")) return get(k);
+      if (how === "fail") throw new Error("store unavailable");
+      return new Promise<never>(() => {});
+    });
+    return () => spy.mockRestore();
+  }
+
+  const expectUnverified = (c: TaskCanceledBy | undefined, reason: string) => {
+    const u = fixture.fields.canceled_by.unverified;
+    expect(c).toBeDefined();
+    expect(Object.keys(c!).sort()).toEqual([...u.required].sort());
+    for (const k of u.absent) expect(c).not.toHaveProperty(k);
+    expect(c).toMatchObject({ party: "responder", unverified: true, unverified_reason: reason });
+    expect(Object.keys(u.unverified_reason)).toContain(reason);
+  };
+
+  it("a failed cancel-request read: unverified, never requester_request null", async () => {
+    const T = "cancel-read-fails";
+    await started(T);
+    await tap(cancelRequest(T)); // the buyer did ask
+    const restore = breakCancelReads("fail");
+    nc.publish.mockClear();
+    await update(cancelUpdate(T, sellerKp, "user_requested"));
+    restore();
+    expectUnverified(record(T).canceled_by, "read_failed");
+    expect(record(T).state).toBe("canceled");
+    expect(record(T).cancel_reason).toBe("user_requested");
+    // The signed event and the receipt carry the same unknown.
+    const bySubject = new Map(nc.publish.mock.calls.map((c) => [c[0] as string, decode(c[1] as Uint8Array)]));
+    for (const subject of ["mesh.event.task.canceled", "mesh.event.metering.task_canceled"]) {
+      const data = (bySubject.get(subject)!.payload as { data: { canceled_by?: TaskCanceledBy } }).data;
+      expectUnverified(data.canceled_by, "read_failed");
+    }
+  });
+
+  it("a cancel-request read that times out: unverified", async () => {
+    const T = "cancel-read-hangs";
+    await started(T);
+    const restore = breakCancelReads("hang");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const done = update(cancelUpdate(T, sellerKp, "superseded"));
+      await vi.advanceTimersByTimeAsync(CANCEL_READ_TIMEOUT_MS + 1);
+      await done;
+    } finally {
+      vi.useRealTimers();
+      restore();
+    }
+    expectUnverified(record(T).canceled_by, "read_timed_out");
+  });
+
+  it("a buyer's own cancel needs no read, so a broken ledger store leaves it verified", async () => {
+    const T = "cancel-buyer-ledger-down";
+    await started(T);
+    const restore = breakCancelReads("fail");
+    const env = cancelUpdate(T, buyerKp, "user_requested");
+    await update(env);
+    restore();
+    expect(record(T).canceled_by).toMatchObject({ party: "requester", requester_request: { request_id: env.id, via: "update" } });
+    expect(record(T).canceled_by).not.toHaveProperty("unverified");
+  });
+
+  it("unverified is settled in the background once the read succeeds, counting the buyer's earlier ask", async () => {
+    const T = "cancel-settles";
+    await started(T);
+    const ask = cancelRequest(T);
+    await tap(ask);
+    const restore = breakCancelReads("fail");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      await update(cancelUpdate(T, sellerKp, "user_requested"));
+      expectUnverified(record(T).canceled_by, "read_failed");
+      // Still failing at the first retry: stays unverified.
+      await vi.advanceTimersByTimeAsync(CANCEL_SETTLE_DELAYS_MS[0]! + 1);
+      expectUnverified(record(T).canceled_by, "read_failed");
+      restore();
+      await vi.advanceTimersByTimeAsync(CANCEL_SETTLE_DELAYS_MS[1]! + 1);
+    } finally {
+      vi.useRealTimers();
+      restore();
+    }
+    const c = record(T).canceled_by!;
+    expect(c).toMatchObject({ party: "responder", requester_request: { request_id: ask.id, via: "cancel_request" } });
+    expect(c).not.toHaveProperty("unverified");
+    expect(Object.keys(c).sort()).toEqual([...fixture.fields.canceled_by.required, "resolved_at"].sort());
+  });
+
+  it("settling ignores a cancel request observed after the transition", async () => {
+    const T = "cancel-settles-late-ask";
+    await started(T);
+    const restore = breakCancelReads("fail");
+    await update(cancelUpdate(T, sellerKp, "superseded"));
+    restore();
+    const at = Date.parse(record(T).canceled_by!.at);
+    vi.useFakeTimers({ toFake: ["Date"], now: at + 1_000 });
+    try {
+      await tap(cancelRequest(T));
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(await ledger.settleCanceledBy(T)).toBe("settled");
+    expect(record(T).canceled_by).toMatchObject({ party: "responder", requester_request: null });
+    expect(record(T).canceled_by).toHaveProperty("resolved_at");
+    expect(await ledger.settleCanceledBy(T)).toBe("nothing");
+  });
+
+  it("a read of the record settles an unverified attribution on its copy, and shows it unverified while the store still fails", async () => {
+    const T = "cancel-view-settles";
+    await started(T);
+    const ask = cancelRequest(T);
+    await tap(ask);
+    const restore = breakCancelReads("fail");
+    await update(cancelUpdate(T, sellerKp, "user_requested"));
+    const stored = record(T) as unknown as Record<string, unknown>;
+    expect(((await ledger.view(stored, T)) as { canceled_by?: TaskCanceledBy }).canceled_by).toMatchObject({ unverified: true });
+    restore();
+    const seen = (await ledger.view(stored, T)) as { canceled_by?: TaskCanceledBy };
+    expect(seen.canceled_by).toMatchObject({ requester_request: { request_id: ask.id, via: "cancel_request" } });
+    expect(record(T).canceled_by).toMatchObject({ unverified: true }); // the view writes nothing
   });
 
   it("the canceled event and the §19.2 receipt carry canceled_by", async () => {

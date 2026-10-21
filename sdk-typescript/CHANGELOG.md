@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+A cancel the server cannot attribute is recorded as unknown, never as the
+responder's.
+
+- **`canceled_by.unverified`.** When the task manager cannot read the cancel
+  requests it needs to decide whether the original requester asked for a
+  cancel (the ledger store fails, the read takes longer than 5 seconds, or
+  there is no ledger), it now writes
+  `{ party, at, unverified: true, unverified_reason }` with no
+  `requester_request` at all. `unverified_reason` is `"read_failed"`,
+  `"read_timed_out"` or `"ledger_unavailable"`. Before this it wrote
+  `requester_request: null`, the same as "the requester did not ask", so a
+  buyer's cancel could look like the responder's own. A consumer refunds
+  nothing automatically on an unverified attribution. The lifecycle event and
+  the receipt carry it as written. A buyer's own canceled update needs no
+  read and is never unverified.
+- **Settled later.** The task manager retries the read in the background
+  (after 1, 5, 30 and 120 seconds). When a read succeeds it replaces the
+  attribution with a verified one that adds `resolved_at`, counting only a
+  cancel request observed at or before `at`. `mesh.task.get` and the
+  privileged read settle it the same way on the copy they answer with.
+- **`TaskCanceledBy` is a union** of `TaskCanceledByVerified` and
+  `TaskCanceledByUnverified`; test `unverified` first. `taskCanceledByOf`
+  fails toward unknown: any `unverified` other than absent or `false` reads as
+  unverified, whatever else the object holds. An older reader, which requires
+  `requester_request`, returns null for an unverified attribution and so
+  never reads it as the responder's cancel. Pinned by
+  `conformance/task-origin.json` (new shapes `canceled_by_unverified` and
+  `canceled_by_settled`).
+
 ## 0.62.3 (2026-10-20)
 
 Task records now follow §7.3 on every dispatch path, so a Task's record ends
