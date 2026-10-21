@@ -31,7 +31,7 @@ name: agent-messaging-rabbitmq
 
 services:
   setup:
-    image: ${SERVER_IMAGE:-ghcr.io/agent-messaging/agent-messaging-server:0.4.2}
+    image: ${SERVER_IMAGE:-ghcr.io/agent-messaging/agent-messaging-server:0.4.3}
     command: ["first-run"]
     environment:
       MESH_BROKER: rabbitmq
@@ -92,7 +92,7 @@ services:
     restart: unless-stopped
 
   server:
-    image: ${SERVER_IMAGE:-ghcr.io/agent-messaging/agent-messaging-server:0.4.2}
+    image: ${SERVER_IMAGE:-ghcr.io/agent-messaging/agent-messaging-server:0.4.3}
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -129,7 +129,7 @@ services:
     restart: unless-stopped
 
   a2a-gateway:
-    image: ${GATEWAY_IMAGE:-ghcr.io/agent-messaging/agent-messaging-a2a-gateway:0.4.2}
+    image: ${GATEWAY_IMAGE:-ghcr.io/agent-messaging/agent-messaging-a2a-gateway:0.4.3}
     depends_on:
       server:
         condition: service_healthy
