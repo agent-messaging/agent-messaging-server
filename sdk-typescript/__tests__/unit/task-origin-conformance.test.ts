@@ -14,7 +14,13 @@ const here = dirname(fileURLToPath(import.meta.url));
 const fixture = JSON.parse(readFileSync(join(here, "../../../conformance/task-origin.json"), "utf8")) as {
   fields: {
     origin: { required: string[]; optional: string[]; bound_by: Record<string, string> };
-    canceled_by: { required: string[]; party: Record<string, string>; requester_request: { required: string[]; via: Record<string, string> } };
+    canceled_by: {
+      required: string[];
+      optional: string[];
+      party: Record<string, string>;
+      requester_request: { required: string[]; via: Record<string, string> };
+      unverified: { required: string[]; optional: string[]; absent: string[]; unverified_reason: Record<string, string> };
+    };
     record_contested_by: { optional: string[]; origin_mismatch: { required: string[] } };
   };
   shapes: Record<string, unknown>;
@@ -77,7 +83,9 @@ describe("canceled_by", () => {
     it(`reads ${name} back whole`, () => {
       const shape = fixture.shapes[name] as TaskCanceledBy;
       expect(taskCanceledByOf({ canceled_by: shape })).toEqual(shape);
-      expect(Object.keys(shape).sort()).toEqual([...fixture.fields.canceled_by.required].sort());
+      const f = fixture.fields.canceled_by;
+      for (const k of f.required) expect(shape).toHaveProperty(k);
+      for (const k of Object.keys(shape)) expect([...f.required, ...f.optional]).toContain(k);
       expect(Object.keys(fixture.fields.canceled_by.party)).toContain(shape.party);
       if (shape.requester_request) {
         expect(Object.keys(shape.requester_request).sort()).toEqual(
@@ -94,6 +102,43 @@ describe("canceled_by", () => {
     expect(taskCanceledByOf({ canceled_by: { ...shape, requester_request: { ...shape.requester_request, via: "said_so" } } })).toBeNull();
     const { requester_request: _omit, ...noRequest } = shape;
     expect(taskCanceledByOf({ canceled_by: noRequest })).toBeNull();
+  });
+
+  for (const name of ["canceled_by_unverified", "canceled_by_settling", "canceled_by_expired"]) {
+    it(`reads ${name} back whole, with no requester_request`, () => {
+      const shape = fixture.shapes[name] as TaskCanceledBy;
+      const u = fixture.fields.canceled_by.unverified;
+      expect(taskCanceledByOf({ canceled_by: shape })).toEqual(shape);
+      for (const k of u.required) expect(shape).toHaveProperty(k);
+      for (const k of Object.keys(shape)) expect([...u.required, ...u.optional]).toContain(k);
+      for (const k of u.absent) expect(shape).not.toHaveProperty(k);
+      expect(Object.keys(u.unverified_reason)).toContain(shape.unverified_reason);
+    });
+  }
+
+  it("a verified null always carries resolved_at: the server never writes it at the transition", () => {
+    const shape = fixture.shapes.canceled_by_responder_unasked as TaskCanceledBy;
+    expect(shape.requester_request).toBeNull();
+    expect(shape).toHaveProperty("resolved_at");
+  });
+
+  it("reads the settled shape back whole", () => {
+    const shape = fixture.shapes.canceled_by_settled as TaskCanceledBy;
+    expect(taskCanceledByOf({ canceled_by: shape })).toEqual(shape);
+    const f = fixture.fields.canceled_by;
+    expect(Object.keys(shape).sort()).toEqual([...f.required, ...f.optional].sort());
+  });
+
+  it("fails toward unknown: any unverified marker wins over a requester_request", () => {
+    const { resolved_at: _r, ...unasked } = fixture.shapes.canceled_by_responder_unasked as TaskCanceledBy & { resolved_at?: string };
+    const c = taskCanceledByOf({ canceled_by: { ...unasked, unverified: true, unverified_reason: "read_timed_out" } });
+    expect(c).toEqual({ party: "responder", at: unasked.at, unverified: true, unverified_reason: "read_timed_out" });
+    expect(c).not.toHaveProperty("requester_request");
+    expect(taskCanceledByOf({ canceled_by: { ...unasked, unverified: "yes" } })).toMatchObject({ unverified: true });
+    expect(taskCanceledByOf({ canceled_by: { ...unasked, unverified: true, unverified_reason: "disk_on_fire" } })).toMatchObject({
+      unverified: true, unverified_reason: "disk_on_fire",
+    });
+    expect(taskCanceledByOf({ canceled_by: { ...unasked, unverified: false } })).toEqual(unasked);
   });
 });
 

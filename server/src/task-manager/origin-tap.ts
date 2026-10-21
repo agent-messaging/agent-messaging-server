@@ -30,7 +30,7 @@
 
 import { decode, type Envelope } from "../sdk.js";
 import { metrics } from "../shared/ops-events.js";
-import type { Observation, OriginLedger } from "./origin.js";
+import { cancelIdentity, type Observation, type OriginLedger } from "./origin.js";
 
 /** The ways an origin can go missing, as counted and reported. */
 export type OriginMiss =
@@ -54,11 +54,18 @@ export type OriginMiss =
   /** A request named somebody else's Task id and was answered under it:
    *  the requester's choice, recorded nowhere but here. */
   | "foreign_task_named"
+  /** A cancel attribution was still unverified 24 hours after the cancel
+   *  and became unverified `expired`, for an operator. */
+  | "canceled_by_expired"
   /** The ledger threw. */
   | "error";
 
 export const MAX_IN_FLIGHT = 256;
 export const RETRY_DELAYS_MS = [100, 250, 500, 1000, 2000];
+/** A `task.cancel` request whose write failed is tried again on a longer
+ *  schedule: until it is written, a cancel attribution for its Task stays
+ *  unverified (`window_incomplete`). */
+export const CANCEL_RETRY_DELAYS_MS = [250, 1_000, 5_000, 30_000, 120_000];
 export const SLOW_MS = 5_000;
 const REPORT_EVERY_MS = 60_000;
 
@@ -116,7 +123,12 @@ export class OriginTap {
 
   constructor(
     private readonly ledger: OriginLedger,
-    private readonly opts: { maxInFlight?: number; retryDelaysMs?: number[]; sleep?: (ms: number) => Promise<void> } = {},
+    private readonly opts: {
+      maxInFlight?: number;
+      retryDelaysMs?: number[];
+      cancelRetryDelaysMs?: number[];
+      sleep?: (ms: number) => Promise<void>;
+    } = {},
   ) {}
 
   /** In-flight observations (for tests and the backlog check). */
@@ -137,6 +149,9 @@ export class OriginTap {
     } catch {
       return; // unsigned, unverifiable or not an envelope: not observed
     }
+    // A cancel request is in its window from the moment it arrives, so a
+    // cancel attribution read before it is written knows it is missing.
+    void this.ledger.cancelArrived(env);
     this.enqueue(env, agent, Date.now(), 0);
     const max = this.opts.maxInFlight ?? MAX_IN_FLIGHT;
     if (this.inFlight.size >= max) {
@@ -171,7 +186,8 @@ export class OriginTap {
     const delays = this.opts.retryDelaysMs ?? RETRY_DELAYS_MS;
     const sleep = this.opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
     try {
-      const outcome: Observation = await this.ledger.observe(env, agent, { final: attempt >= delays.length });
+      const outcome: Observation = await this.ledger.observe(env, agent, { final: attempt >= delays.length, receivedAt: arrived });
+      await this.ledger.cancelSettledInTap(env).catch(() => undefined);
       if (outcome === "unknown_request" && attempt < delays.length) {
         // Tried again later, OUTSIDE this key's chain, so a request queued
         // behind this answer on the same key is written first. The pending
@@ -195,6 +211,14 @@ export class OriginTap {
     } catch (err) {
       noteOriginMiss("error", { envelope_id: env.id });
       console.error("[task-manager] origin tap:", err);
+      // A cancel request whose write failed stays pending in its window (the
+      // ledger marked it) and is tried again, outside its key's chain.
+      const cancelDelays = this.opts.cancelRetryDelaysMs ?? CANCEL_RETRY_DELAYS_MS;
+      if (cancelIdentity(env) && attempt < cancelDelays.length) {
+        const retry = sleep(cancelDelays[attempt]).then(() => this.enqueue(env, agent, arrived, attempt + 1));
+        const held: Promise<void> = retry.finally(() => this.inFlight.delete(held));
+        this.inFlight.add(held);
+      }
     }
   }
 }

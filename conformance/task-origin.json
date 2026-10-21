@@ -56,14 +56,60 @@
       "read_time": "both reads project the server's ledger onto the record when they answer, so evidence whose mirror onto the record was lost still shows"
     },
     "canceled_by": {
-      "comment": "Written once, on the canceled transition, beside `cancel_reason`, which stays the canceling party's own signed claim.",
+      "comment": "Written on the canceled transition, beside `cancel_reason`, which stays the canceling party's own signed claim, and settled later by the server. Verified (`required`: `requester_request` is the server's finding) or unverified (the server does not know, or does not know yet: see `unverified`). A reader tests `unverified` first.",
       "required": ["party", "requester_request", "at"],
+      "optional": ["resolved_at"],
+      "resolved_at": "ISO-8601: when a settle wrote this attribution (the server's clock); absent on one written at the transition. With `task_id`, the dedupe key for the settled event.",
+      "grace_ms": 60000,
+      "horizon_ms": 86400000,
+      "rules": [
+        "a missing `requester_request` means UNKNOWN, never 'the requester did not ask'; only an explicit null says that",
+        "`requester_request: null` is NEVER written at the transition: a responder-signed cancel with no counting request seen is written unverified `settling`",
+        "a settle concludes `requester_request: null` only when ALL hold: it runs at least the grace period G (`grace_ms`, configurable, default 60 s) after `at` and before `at` + 24 h (`horizon_ms`); the reads worked; no cancel request for the Task is marked received-and-unwritten, in the store or in the settling process's memory",
+        "past `at` + 24 h a settle writes unverified `expired`: final, for an operator, never swept again",
+        "a cancel request seen from the original requester settles as soon as it is seen, before or after G, when it counts",
+        "a cancel the REQUESTER signed (party `requester`) is the requester asking: a settle writes `requester_request` `via: \"update\"` naming its own canceled update, and never null, whatever the cancel requests say (a Task with no origin at the cancel is settled this way once an origin is attached)",
+        "every cancel request is kept and weighed, up to 8 per (Task, sender, addressee), ordered by when it was received: a later-received one that counts is never hidden by an earlier one that does not; more than 8 make 'none counts' unknowable (`window_incomplete`)",
+        "a received-and-unwritten mark reaches the store at once (retried in the background when that write fails, and by the sweep), so a settle on any instance sees it",
+        "every task-manager instance must use the same G (TASK_CANCEL_SETTLE_GRACE_MS); each compares its G with the one last written to the ledger store at start and on every sweep, and logs a warning when they differ",
+        "it counts when the server received it at or before `at`, or received it within G after `at` and the requester's own signed `ts` is at or before `at` (a tap whose subscription buffer was behind stamps arrival late; the requester's `ts` can only cost the requester)",
+        "`requester_request.observed_at` is when the server received the cancel request (the tap's arrival time); the earliest-received one is kept",
+        "a settle is a compare-and-set on the record; the settled event is at least once, repeated by the sweep until the record is flagged `canceled_by_announced_at`, and a consumer dedupes on `task_id` plus `canceled_by.resolved_at`",
+        "every task-manager instance must run a release with these rules (an older one writes `requester_request: null` at the transition): instances are upgraded together"
+      ],
+      "settled_event": {
+        "subject": "mesh.event.task.canceled_by_settled",
+        "data": ["task_id", "state", "requester", "responder", "offering", "origin", "cancel_reason", "canceled_by"],
+        "delivery": "at least once; dedupe on task_id + canceled_by.resolved_at",
+        "comment": "Signed by the task manager when an unverified attribution is settled: to a verified one, or to unverified `expired`. `origin` without its contest lists, as on the lifecycle event. A change between unverified reasons is not announced."
+      },
+      "record_flags": {
+        "canceled_by_announced_at": "ISO-8601, on the Task record: when the settled event was published; absent means the sweep publishes it again"
+      },
+      "unverified": {
+        "comment": "Whether the original requester asked is UNKNOWN, or not known yet, so there is no `requester_request` at all: it is never written null as if confirmed. A consumer refunds nothing automatically on it and alerts an operator. The server retries in the background (1, 5 and 30 s, then G + 1, G + 30 and G + 120 s), a sweep every 5 minutes retries what is still unverified at least G after `at`, and every read of the record (task.get, the privileged read) tries too; each persists a settled result by compare-and-set and announces it on `mesh.event.task.canceled_by_settled`. The lifecycle event and the receipt carry it as written at the transition.",
+        "required": ["party", "at", "unverified", "unverified_reason"],
+        "optional": ["resolved_at"],
+        "absent": ["requester_request"],
+        "resolved_at": "only with `expired`: when it became final",
+        "unverified": "true",
+        "unverified_reason": {
+          "settling": "no counting cancel request seen yet, and a settle has not yet been able to conclude (the grace period has not passed); every responder-signed cancel without one starts here",
+          "read_failed": "the store refused the read",
+          "read_timed_out": "the read did not answer in time",
+          "ledger_unavailable": "the server had no ledger to read",
+          "window_incomplete": "the reads worked, but a cancel request received for this Task is not written (its write failed, or it is still in flight), so 'none seen' is not the whole story",
+          "expired": "still unverified 24 hours after `at`: final, for an operator",
+          "no_origin": "the Task has no origin, so there is no original requester to vouch for; settled only if an origin is attached later"
+        },
+        "reader": "any `unverified` other than absent or false reads as unverified, whatever else the object holds; an unknown reason is kept as given"
+      },
       "party": {
         "requester": "the requester signed the canceled update",
         "responder": "the responder signed the canceled update, whatever reason it gave"
       },
       "requester_request": {
-        "comment": "The cancel the server observed from the ORIGINAL requester (origin.requester) before the transition, or null when it observed none. Always null on a Task without an origin.",
+        "comment": "The cancel the server observed from the ORIGINAL requester (origin.requester): its own canceled update, or a counting task.cancel request. null only from a settle (see `rules`), so always with `resolved_at`.",
         "required": ["request_id", "observed_at", "via"],
         "via": {
           "update": "the original requester's own canceled update",
@@ -108,7 +154,37 @@
     "canceled_by_responder_unasked": {
       "party": "responder",
       "requester_request": null,
-      "at": "2026-10-20T09:02:00.000Z"
+      "at": "2026-10-20T09:02:00.000Z",
+      "resolved_at": "2026-10-20T09:03:01.000Z"
+    },
+    "canceled_by_settling": {
+      "party": "responder",
+      "at": "2026-10-20T09:02:00.000Z",
+      "unverified": true,
+      "unverified_reason": "settling"
+    },
+    "canceled_by_expired": {
+      "party": "responder",
+      "at": "2026-10-20T09:02:00.000Z",
+      "unverified": true,
+      "unverified_reason": "expired",
+      "resolved_at": "2026-10-21T09:05:00.000Z"
+    },
+    "canceled_by_unverified": {
+      "party": "responder",
+      "at": "2026-10-20T09:03:00.000Z",
+      "unverified": true,
+      "unverified_reason": "read_failed"
+    },
+    "canceled_by_settled": {
+      "party": "responder",
+      "requester_request": {
+        "request_id": "0198c003-0000-7000-8000-00000000a006",
+        "observed_at": "2026-10-20T09:02:50.000Z",
+        "via": "cancel_request"
+      },
+      "at": "2026-10-20T09:03:00.000Z",
+      "resolved_at": "2026-10-20T09:03:01.000Z"
     },
     "canceled_by_responder_after_cancel_request": {
       "party": "responder",
@@ -162,12 +238,35 @@
     "canceled_by": [
       { "case": "buyer_cancels", "signer": "requester", "reason": "user_requested", "party": "requester", "via": "update" },
       { "case": "buyer_cancels_then_contest", "signer": "requester", "reason": "user_requested", "party": "requester", "via": "update", "why": "a contest changes neither the origin nor canceled_by" },
-      { "case": "responder_cancels_user_requested_unasked", "signer": "responder", "reason": "user_requested", "party": "responder", "requester_request": null },
-      { "case": "responder_cancels_after_buyer_cancel_request", "signer": "responder", "reason": "user_requested", "party": "responder", "via": "cancel_request" },
-      { "case": "responder_cancels_superseded", "signer": "responder", "reason": "superseded", "party": "responder", "requester_request": null },
-      { "case": "responder_cancels_budget_exhausted", "signer": "responder", "reason": "budget_exhausted", "party": "responder", "requester_request": null },
-      { "case": "stranger_cancel_request", "signer": "responder", "reason": "user_requested", "party": "responder", "requester_request": null, "why": "only the original requester's cancel request counts" },
-      { "case": "no_origin", "signer": "requester", "reason": "user_requested", "party": "requester", "requester_request": null, "why": "without an origin there is no original requester the server can vouch for" }
+      { "case": "responder_cancels_user_requested_unasked", "signer": "responder", "reason": "user_requested", "party": "responder", "at_transition": "unverified settling", "settled_after_grace": { "requester_request": null, "resolved_at": "present" } },
+      { "case": "responder_cancels_after_buyer_cancel_request", "signer": "responder", "reason": "user_requested", "party": "responder", "via": "cancel_request", "at_transition": "verified" },
+      { "case": "responder_cancels_superseded", "signer": "responder", "reason": "superseded", "party": "responder", "at_transition": "unverified settling", "settled_after_grace": { "requester_request": null } },
+      { "case": "responder_cancels_budget_exhausted", "signer": "responder", "reason": "budget_exhausted", "party": "responder", "at_transition": "unverified settling", "settled_after_grace": { "requester_request": null } },
+      { "case": "stranger_cancel_request", "signer": "responder", "reason": "user_requested", "party": "responder", "settled_after_grace": { "requester_request": null }, "why": "only the original requester's cancel request counts" },
+      { "case": "no_origin", "signer": "requester", "reason": "user_requested", "party": "requester", "unverified": true, "unverified_reason": "no_origin", "requester_request": "absent", "why": "without an origin there is no original requester the server can vouch for" },
+      { "case": "settle_before_grace", "path": "a responder's cancel with nothing seen, settled before G", "unverified_reason": "settling", "why": "an instance's in-flight write or a tap backlog may still land" },
+      { "case": "two_instances_in_flight", "path": "instance B handles the cancel while instance A has received the buyer's task.cancel and its write has not landed", "at_transition": "unverified settling", "settled_after_grace": { "via": "cancel_request" }, "why": "B sees no request, no marker and no mark; it must not conclude null" },
+      { "case": "buffered_backlog_under_grace", "path": "the tap's subscription buffer was behind; the buyer's task.cancel, signed before `at`, is stamped received after `at` but within G", "settled_after_grace": { "via": "cancel_request" } },
+      { "case": "received_past_grace", "path": "a cancel request received more than G after `at`, whatever its own ts", "settled_after_grace": { "requester_request": null } },
+      { "case": "cancel_received_after_transition", "path": "a cancel request sent and received after `at`", "party": "responder", "settled_after_grace": { "requester_request": null } },
+      { "case": "cancel_requests_unreadable", "signer": "responder", "reason": "user_requested", "party": "responder", "unverified": true, "unverified_reason": "read_failed", "requester_request": "absent", "why": "the buyer may have asked; unknown is never written as 'did not ask'" },
+      { "case": "cancel_read_timed_out", "signer": "responder", "reason": "superseded", "party": "responder", "unverified": true, "unverified_reason": "read_timed_out", "requester_request": "absent" },
+      { "case": "unverified_then_settled", "path": "written unverified; the read succeeds later", "party": "responder", "requester_request": "the buyer's counting task.cancel request at once, else null only after G", "resolved_at": "present" },
+      { "case": "cancel_write_failed", "path": "the buyer's task.cancel arrives while its ledger write fails; the responder cancels", "party": "responder", "unverified": true, "unverified_reason": "window_incomplete", "requester_request": "absent", "why": "no settle concludes null while a received cancel request is unwritten, past G or not" },
+      { "case": "cancel_write_retried", "path": "as above; the tap's retry writes the cancel request, stamped when it was received", "party": "responder", "via": "cancel_request", "resolved_at": "present", "event": "mesh.event.task.canceled_by_settled" },
+      { "case": "cancel_request_in_flight", "path": "the tap has received the buyer's task.cancel and not yet written it when the responder cancels", "unverified": true, "unverified_reason": "window_incomplete" },
+      { "case": "marker_expired_past_horizon", "path": "unverified window_incomplete; the marker's TTL runs out and the process restarts; a sweep past `at` + 24 h", "unverified": true, "unverified_reason": "expired", "resolved_at": "present", "event": "mesh.event.task.canceled_by_settled", "then": "final: never swept or changed again" },
+      { "case": "backlogged_tap", "path": "the tap reaches the buyer's task.cancel late, after the transition, but received it before", "via": "cancel_request", "observed_at": "when it was received" },
+      { "case": "settled_by_sweep", "path": "unverified at least G after `at` (or across a restart); the store reads again", "resolved_at": "present", "event": "mesh.event.task.canceled_by_settled" },
+      { "case": "settled_by_read", "path": "task.get or the privileged read of an unverified record once a settle can conclude", "record": "persisted, announced" },
+      { "case": "announce_repeated", "path": "the settled event could not be published", "sweep": "publishes it again until the record carries canceled_by_announced_at", "consumer": "dedupes on task_id + canceled_by.resolved_at" },
+      { "case": "buyer_cancels_no_origin_then_origin_attached", "signer": "requester", "path": "the buyer signs the canceled update on a Task with no origin; the origin is attached afterwards; a settle runs", "at_transition": "unverified no_origin", "settled": { "party": "requester", "via": "update", "request_id": "the buyer's canceled update" }, "never": "requester_request: null" },
+      { "case": "later_request_counts", "path": "a cancel request signed after `at` is received first; one signed before `at` is received later, within G", "settled_after_grace": { "via": "cancel_request", "request_id": "the one signed before `at`" } },
+      { "case": "cancel_requests_past_the_cap", "path": "nine cancel requests, none counting", "kept": 8, "overflow": 1, "unverified_reason": "window_incomplete" },
+      { "case": "mark_reaches_the_store_at_once", "path": "instance A's tap receives the buyer's task.cancel; instance B handles the cancel before A writes the request", "at_transition": "unverified window_incomplete (A's marker)", "then": "settled to the buyer's ask once A's write lands" },
+      { "case": "mark_store_write_retried", "path": "the marker write fails, then the store recovers", "marker": "in the store after the first background retry, without a sweep" },
+      { "case": "grace_mismatch", "path": "two instances with different TASK_CANCEL_SETTLE_GRACE_MS", "log": "a warning naming both values" },
+      { "case": "buyer_cancels_while_ledger_down", "signer": "requester", "reason": "user_requested", "party": "requester", "via": "update", "why": "the buyer's own update needs no read" }
     ]
   }
 }
