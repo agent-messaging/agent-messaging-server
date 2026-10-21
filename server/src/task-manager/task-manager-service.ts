@@ -11,6 +11,18 @@ import { declaredNeedRefs, type DeclaredNeedsFn } from "./cancel.js";
 import { OriginLedger, CANCEL_SWEEP_INTERVAL_MS } from "./origin.js";
 import { OriginTap } from "./origin-tap.js";
 
+/** TASK_CANCEL_SETTLE_GRACE_MS: the grace period G before a cancel may be
+ *  settled as "the requester did not ask" (origin.ts); a positive integer of
+ *  milliseconds, else the default. */
+function settleGraceFromEnv(): number | undefined {
+  const raw = process.env.TASK_CANCEL_SETTLE_GRACE_MS;
+  if (!raw) return undefined;
+  const n = Number(raw);
+  if (Number.isInteger(n) && n > 0) return n;
+  console.warn(`[task-manager] TASK_CANCEL_SETTLE_GRACE_MS=${raw} is not a positive integer; using the default`);
+  return undefined;
+}
+
 export class TaskManagerService {
   /** Signing identity (§4.5). Stable if TASK_MANAGER_SEED is set; a set-but-
    *  unusable seed refuses to boot rather than falling back (shared/seed.ts). */
@@ -42,6 +54,7 @@ export class TaskManagerService {
     this.origins = origins
       ? new OriginLedger(keyedOf(origins, js), this.kv, {
           onCanceledBySettled: (record) => publishCanceledBySettled(this.nc, this.kp, record),
+          graceMs: settleGraceFromEnv(),
         })
       : null;
   }

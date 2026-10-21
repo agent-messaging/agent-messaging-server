@@ -19,7 +19,7 @@ const fixture = JSON.parse(readFileSync(join(here, "../../../conformance/task-or
       optional: string[];
       party: Record<string, string>;
       requester_request: { required: string[]; via: Record<string, string> };
-      unverified: { required: string[]; absent: string[]; unverified_reason: Record<string, string> };
+      unverified: { required: string[]; optional: string[]; absent: string[]; unverified_reason: Record<string, string> };
     };
     record_contested_by: { optional: string[]; origin_mismatch: { required: string[] } };
   };
@@ -83,7 +83,9 @@ describe("canceled_by", () => {
     it(`reads ${name} back whole`, () => {
       const shape = fixture.shapes[name] as TaskCanceledBy;
       expect(taskCanceledByOf({ canceled_by: shape })).toEqual(shape);
-      expect(Object.keys(shape).sort()).toEqual([...fixture.fields.canceled_by.required].sort());
+      const f = fixture.fields.canceled_by;
+      for (const k of f.required) expect(shape).toHaveProperty(k);
+      for (const k of Object.keys(shape)) expect([...f.required, ...f.optional]).toContain(k);
       expect(Object.keys(fixture.fields.canceled_by.party)).toContain(shape.party);
       if (shape.requester_request) {
         expect(Object.keys(shape.requester_request).sort()).toEqual(
@@ -102,13 +104,22 @@ describe("canceled_by", () => {
     expect(taskCanceledByOf({ canceled_by: noRequest })).toBeNull();
   });
 
-  it("reads the unverified shape back whole, with no requester_request", () => {
-    const shape = fixture.shapes.canceled_by_unverified as TaskCanceledBy;
-    const u = fixture.fields.canceled_by.unverified;
-    expect(taskCanceledByOf({ canceled_by: shape })).toEqual(shape);
-    expect(Object.keys(shape).sort()).toEqual([...u.required].sort());
-    for (const k of u.absent) expect(shape).not.toHaveProperty(k);
-    expect(Object.keys(u.unverified_reason)).toContain(shape.unverified_reason);
+  for (const name of ["canceled_by_unverified", "canceled_by_settling", "canceled_by_expired"]) {
+    it(`reads ${name} back whole, with no requester_request`, () => {
+      const shape = fixture.shapes[name] as TaskCanceledBy;
+      const u = fixture.fields.canceled_by.unverified;
+      expect(taskCanceledByOf({ canceled_by: shape })).toEqual(shape);
+      for (const k of u.required) expect(shape).toHaveProperty(k);
+      for (const k of Object.keys(shape)) expect([...u.required, ...u.optional]).toContain(k);
+      for (const k of u.absent) expect(shape).not.toHaveProperty(k);
+      expect(Object.keys(u.unverified_reason)).toContain(shape.unverified_reason);
+    });
+  }
+
+  it("a verified null always carries resolved_at: the server never writes it at the transition", () => {
+    const shape = fixture.shapes.canceled_by_responder_unasked as TaskCanceledBy;
+    expect(shape.requester_request).toBeNull();
+    expect(shape).toHaveProperty("resolved_at");
   });
 
   it("reads the settled shape back whole", () => {
@@ -119,7 +130,7 @@ describe("canceled_by", () => {
   });
 
   it("fails toward unknown: any unverified marker wins over a requester_request", () => {
-    const unasked = fixture.shapes.canceled_by_responder_unasked as TaskCanceledBy;
+    const { resolved_at: _r, ...unasked } = fixture.shapes.canceled_by_responder_unasked as TaskCanceledBy & { resolved_at?: string };
     const c = taskCanceledByOf({ canceled_by: { ...unasked, unverified: true, unverified_reason: "read_timed_out" } });
     expect(c).toEqual({ party: "responder", at: unasked.at, unverified: true, unverified_reason: "read_timed_out" });
     expect(c).not.toHaveProperty("requester_request");

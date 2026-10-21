@@ -205,7 +205,10 @@ export interface Askers {
 export interface ObservedCancel {
   v: 1;
   request_id: string;
+  /** When this server received it (the tap's arrival time). */
   observed_at: string;
+  /** The envelope's own `ts`, signed by its sender (the requester). */
+  sent_at?: string;
 }
 
 /**
@@ -322,23 +325,54 @@ function seenTooLate(task: TaskParties, observedAt: string): boolean {
  */
 export const CANCEL_READ_TIMEOUT_MS = 5_000;
 
-/** When an unverified `canceled_by` is retried after the transition. */
-export const CANCEL_SETTLE_DELAYS_MS: readonly number[] = [1_000, 5_000, 30_000, 120_000];
+/**
+ * The grace period G: how long after a cancel (`at`) the server waits before
+ * it may conclude "the requester did not ask" (`requester_request: null`).
+ * Long enough for every task-manager instance's in-flight cancel-request write
+ * and a normal tap backlog to land. Configurable (TASK_CANCEL_SETTLE_GRACE_MS,
+ * task-manager-service.ts). Every instance must run a release with this rule:
+ * an older instance still writes `requester_request: null` at the transition,
+ * so instances are upgraded together.
+ */
+export const CANCEL_SETTLE_GRACE_MS = 60_000;
 
-/** How often the sweep looks for records still unverified past those retries. */
+/** Past `at` plus this, an attribution still unverified becomes unverified
+ *  `expired`: final, an operator's, and not swept again. Well inside the
+ *  ledger's seven-day horizon, so no marker it relies on has expired. */
+export const CANCEL_SETTLE_HORIZON_MS = 24 * 60 * 60_000;
+
+/** When an unverified `canceled_by` is retried after the transition: early
+ *  tries (a request seen settles at once), then just past G, then later. */
+export function cancelSettleDelays(graceMs: number): number[] {
+  return [...[1_000, 5_000, 30_000].filter((d) => d < graceMs), graceMs + 1_000, graceMs + 30_000, graceMs + 120_000];
+}
+
+/** How often the sweep looks for records still unverified. */
 export const CANCEL_SWEEP_INTERVAL_MS = 5 * 60_000;
 
-/** Why a `canceled_by` is unverified. `window_incomplete`: the reads worked,
- *  but a `task.cancel` request for this Task was received and not (or not yet)
- *  written, so "none seen" is not known to be the whole story. */
-export type CancelReadFailure = "read_failed" | "read_timed_out" | "ledger_unavailable" | "window_incomplete";
+/** Why a `canceled_by` is unverified.
+ *  - `settling`: no cancel request seen yet, and the grace period has not
+ *    passed; every responder-signed cancel without a seen request starts here.
+ *  - `window_incomplete`: the reads worked, but a `task.cancel` request for
+ *    this Task was received and not (or not yet) written.
+ *  - `expired`: still unverified 24 hours after `at`; final, an operator's.
+ *  - `no_origin`: the Task has no origin, so there is no original requester
+ *    to vouch for; settled only if an origin is attached later. */
+export type CancelReadFailure =
+  | "read_failed"
+  | "read_timed_out"
+  | "ledger_unavailable"
+  | "window_incomplete"
+  | "settling"
+  | "expired"
+  | "no_origin";
 
 /** The cancel-request read: what it found, or why it could not tell. `seen`
  *  is the earliest-received cancel request recorded; `incomplete` says a
  *  received one is not recorded. */
 export type CancelRead =
   | { ok: true; seen: ObservedCancel | null; incomplete: boolean }
-  | { ok: false; reason: Exclude<CancelReadFailure, "window_incomplete"> };
+  | { ok: false; reason: "read_failed" | "read_timed_out" | "ledger_unavailable" };
 
 /** The `task.cancel` requests received and not yet written, per window key. */
 interface CancelWindow {
@@ -384,23 +418,46 @@ export async function readCancelRequest(
 }
 
 /**
+ * Whether a recorded cancel request counts as the requester asking before the
+ * cancel at `atMs`: received at or before it, or received within the grace
+ * period after it and signed by the requester as sent at or before it (a tap
+ * whose subscription buffer was behind stamps its arrival late; the
+ * requester's own `ts` can only cost the requester, never the responder).
+ */
+export function cancelRequestCounts(seen: ObservedCancel, atMs: number, graceMs: number): boolean {
+  const received = Date.parse(seen.observed_at);
+  if (received <= atMs) return true;
+  const sent = Date.parse(seen.sent_at ?? "");
+  return received <= atMs + graceMs && Number.isFinite(sent) && sent <= atMs;
+}
+
+/**
  * The attribution a cancel-request read supports, for a cancel the original
  * requester did not sign itself. One rule at the transition and on every
- * retry: a cancel request counts only when it was received at or before the
- * transition (`at`). "The requester did not ask" (`requester_request: null`)
- * is written only from a read that worked over a complete window; anything
- * less is unverified. `resolvedAt` marks a retry that settled it.
+ * retry:
+ *  - a seen request that counts ({@link cancelRequestCounts}) is verified, at
+ *    any time;
+ *  - `requester_request: null` ("did not ask") is NEVER written at the
+ *    transition; a retry concludes it only from a read that worked, over a
+ *    complete window, at least `graceMs` after `at` and within 24 hours;
+ *  - past `at` + 24 h a retry writes unverified `expired`, final.
+ * Everything else is unverified, `settling` while nothing says otherwise. A
+ * retry's verified or expired result carries `resolved_at` (`nowMs`).
  */
 export function cancelAttribution(
   party: TaskCanceledBy["party"],
   at: string,
   got: CancelRead,
-  resolvedAt?: string,
+  o: { nowMs: number; graceMs: number; atTransition?: boolean },
 ): TaskCanceledBy {
+  const atMs = Date.parse(at);
+  const resolved = o.atTransition ? {} : { resolved_at: new Date(o.nowMs).toISOString() };
+  if (!o.atTransition && o.nowMs > atMs + CANCEL_SETTLE_HORIZON_MS) {
+    return { party, at, unverified: true, unverified_reason: "expired", resolved_at: new Date(o.nowMs).toISOString() };
+  }
   if (!got.ok) return { party, at, unverified: true, unverified_reason: got.reason };
   const seen = got.seen;
-  const resolved = resolvedAt ? { resolved_at: resolvedAt } : {};
-  if (seen && Date.parse(seen.observed_at) <= Date.parse(at)) {
+  if (seen && cancelRequestCounts(seen, atMs, o.graceMs)) {
     return {
       party,
       requester_request: { request_id: seen.request_id, observed_at: seen.observed_at, via: "cancel_request" },
@@ -409,6 +466,7 @@ export function cancelAttribution(
     };
   }
   if (got.incomplete) return { party, at, unverified: true, unverified_reason: "window_incomplete" };
+  if (o.atTransition || o.nowMs < atMs + o.graceMs) return { party, at, unverified: true, unverified_reason: "settling" };
   return { party, requester_request: null, at, ...resolved };
 }
 
@@ -439,12 +497,24 @@ export class OriginLedger {
      *  (compare-and-set) to attach an origin to a record that already exists. */
     private readonly tasks: KeyedStore,
     private readonly opts: {
-      /** Called once per record whose `canceled_by` a retry settled to a
-       *  verified attribution, with the record as written (the service
-       *  announces it on `mesh.event.task.canceled_by_settled`). */
+      /** Called for a record whose `canceled_by` a retry settled (verified,
+       *  or unverified `expired`), with the record as written: the service
+       *  announces it on `mesh.event.task.canceled_by_settled`. At least once:
+       *  the sweep calls it again for a settled record not yet flagged
+       *  `canceled_by_announced_at`. */
       onCanceledBySettled?: (record: Record<string, unknown>) => void;
+      /** The grace period G ({@link CANCEL_SETTLE_GRACE_MS}). */
+      graceMs?: number;
     } = {},
   ) {}
+
+  /** The grace period G this ledger settles with. */
+  get graceMs(): number {
+    return this.opts.graceMs ?? CANCEL_SETTLE_GRACE_MS;
+  }
+
+  /** Whether a sweep is running in this process (one at a time). */
+  private sweeping = false;
 
   /** `task.cancel` requests received and not yet written, by window key:
    *  this process's copy of the window markers, kept even when the store
@@ -509,7 +579,13 @@ export class OriginLedger {
       const taskId = str(input?.task_id) ?? str(env.task_id);
       if (!taskId) return "ignored";
       const at = receivedAt !== undefined ? new Date(receivedAt).toISOString() : now;
-      const rec: ObservedCancel = { v: 1, request_id: env.id, observed_at: at };
+      const sent = str(env.ts);
+      const rec: ObservedCancel = {
+        v: 1,
+        request_id: env.id,
+        observed_at: at,
+        ...(sent && Number.isFinite(Date.parse(sent)) ? { sent_at: sent } : {}),
+      };
       await this.recordCancel(taskId, requester, responder, rec);
       return "recorded";
     }
@@ -975,14 +1051,19 @@ export class OriginLedger {
   }
 
   /**
-   * Settle an unverified `canceled_by` on the stored record: read the original
-   * requester's cancel requests and window again and, when they now support a
-   * verified attribution, write it (compare-and-set, with `resolved_at`) and
-   * announce it once. A read that works but still cannot vouch for "did not
-   * ask" leaves it unverified, with the reason updated. Returns the outcome
-   * and the record's `canceled_by` as it now stands.
+   * Settle an unverified `canceled_by` on the stored record by the rule in
+   * {@link cancelAttribution}: read the original requester's cancel requests
+   * and window again and, when they now support a verified attribution (or
+   * the 24-hour horizon has passed: `expired`), write it by compare-and-set,
+   * with `resolved_at`, and announce it. A read that still cannot conclude
+   * leaves it unverified, with the reason updated. Returns the outcome and the
+   * record's `canceled_by` as it now stands.
    */
-  async settleCanceledBy(taskId: string, timeoutMs = CANCEL_READ_TIMEOUT_MS): Promise<CancelSettlement> {
+  async settleCanceledBy(
+    taskId: string,
+    timeoutMs = CANCEL_READ_TIMEOUT_MS,
+    nowMs = Date.now(),
+  ): Promise<CancelSettlement> {
     const e = await this.tasks.get(taskId);
     if (!e || e.operation === "DEL" || e.operation === "PURGE" || e.length === 0) return { outcome: "nothing" };
     let stored: { origin?: TaskOrigin; canceled_by?: TaskCanceledBy };
@@ -992,13 +1073,19 @@ export class OriginLedger {
       return { outcome: "nothing" };
     }
     const c = stored.canceled_by;
-    if (!c?.unverified || !stored.origin) return { outcome: "nothing", ...(c ? { canceled_by: c } : {}) };
-    const got = await readCancelRequest(this, taskId, stored.origin.requester, stored.origin.responder, timeoutMs);
-    const next = cancelAttribution(c.party, c.at, got, new Date().toISOString());
-    if (next.unverified) {
+    if (!c?.unverified || c.unverified_reason === "expired" || !stored.origin) {
+      return { outcome: "nothing", ...(c ? { canceled_by: c } : {}) };
+    }
+    const expired = nowMs > Date.parse(c.at) + CANCEL_SETTLE_HORIZON_MS;
+    const got: CancelRead = expired
+      ? { ok: false, reason: "read_failed" } // not read: the horizon decides
+      : await readCancelRequest(this, taskId, stored.origin.requester, stored.origin.responder, timeoutMs);
+    const next = cancelAttribution(c.party, c.at, got, { nowMs, graceMs: this.graceMs });
+    if (next.unverified && next.unverified_reason !== "expired") {
       if (next.unverified_reason !== c.unverified_reason && got.ok) {
         const w = await rewriteTask<{ canceled_by?: TaskCanceledBy }>(this.tasks, taskId, (t) => {
-          if (!t.canceled_by?.unverified || t.canceled_by.unverified_reason === next.unverified_reason) return false;
+          if (!t.canceled_by?.unverified || t.canceled_by.unverified_reason === "expired") return false;
+          if (t.canceled_by.unverified_reason === next.unverified_reason) return false;
           t.canceled_by = next;
           return true;
         }).catch(() => null);
@@ -1007,70 +1094,107 @@ export class OriginLedger {
       return { outcome: "unverified", canceled_by: c };
     }
     const written = await rewriteTask<Record<string, unknown> & { canceled_by?: TaskCanceledBy }>(this.tasks, taskId, (t) => {
-      if (!t.canceled_by?.unverified) return false;
+      if (!t.canceled_by?.unverified || t.canceled_by.unverified_reason === "expired") return false;
       t.canceled_by = next;
+      delete t.canceled_by_announced_at;
       return true;
     });
     if (!written) {
       const now = await read<{ canceled_by?: TaskCanceledBy }>(this.tasks, taskId).catch(() => null);
       return { outcome: "nothing", ...(now?.canceled_by ? { canceled_by: now.canceled_by } : {}) };
     }
-    try {
-      this.opts.onCanceledBySettled?.(written);
-    } catch (err) {
-      console.warn(`[task-manager] could not announce the settled canceled_by of task ${taskId}:`, err);
+    if (next.unverified) {
+      noteOriginMiss("canceled_by_expired", { task_id: taskId });
+      console.error(`[task-manager] canceled_by of task ${taskId} is still unverified 24 hours after the cancel: expired, for an operator`);
     }
+    await this.announceSettled(taskId, written);
     return { outcome: "settled", canceled_by: next };
   }
 
+  /** Announce a settled record, then flag it announced (compare-and-set). A
+   *  failed announce or flag leaves it for the sweep to announce again. */
+  private async announceSettled(taskId: string, record: Record<string, unknown> & { canceled_by?: TaskCanceledBy }): Promise<void> {
+    const resolvedAt = record.canceled_by?.resolved_at;
+    if (!resolvedAt || !this.opts.onCanceledBySettled) return;
+    try {
+      this.opts.onCanceledBySettled(record);
+    } catch (err) {
+      console.warn(`[task-manager] could not announce the settled canceled_by of task ${taskId}:`, err);
+      return;
+    }
+    const stamp = new Date().toISOString();
+    await rewriteTask<Record<string, unknown> & { canceled_by?: TaskCanceledBy }>(this.tasks, taskId, (t) => {
+      if (t.canceled_by?.resolved_at !== resolvedAt || t.canceled_by_announced_at) return false;
+      t.canceled_by_announced_at = stamp;
+      return true;
+    }).catch(() => null);
+  }
+
   /**
-   * Retry {@link settleCanceledBy} in the background at `delays`, stopping
-   * once it is settled. Timers do not hold the process open; a restart loses
-   * them, and the sweep ({@link sweepCanceledBy}) and every read of the
-   * record (task.get, the privileged read) settle it instead.
+   * Retry {@link settleCanceledBy} in the background, stopping once it is
+   * settled ({@link cancelSettleDelays}, from G). Timers do not hold the
+   * process open; a restart loses them, and the sweep
+   * ({@link sweepCanceledBy}) and every read of the record (task.get, the
+   * privileged read) settle it instead.
    */
-  settleCanceledByLater(taskId: string, delays: readonly number[] = CANCEL_SETTLE_DELAYS_MS): void {
-    const attempt = (i: number) => {
+  settleCanceledByLater(taskId: string, delays: readonly number[] = cancelSettleDelays(this.graceMs)): void {
+    let i = 0;
+    let waited = 0;
+    const next = () => {
       if (i >= delays.length) {
-        console.error(`[task-manager] canceled_by of task ${taskId} is still unverified after ${delays.length} retries; the sweep keeps trying`);
+        console.warn(`[task-manager] canceled_by of task ${taskId} is still unverified after ${delays.length} retries; the sweep keeps trying`);
         return;
       }
       const t = setTimeout(() => {
         void this.settleCanceledBy(taskId)
           .catch((): CancelSettlement => ({ outcome: "unverified" }))
           .then((r) => {
-            if (r.outcome === "unverified") attempt(i + 1);
+            if (r.outcome === "unverified") next();
           });
-      }, delays[i]);
+      }, Math.max(0, delays[i] - waited));
+      waited = delays[i++];
       (t as { unref?: () => void }).unref?.();
     };
-    attempt(0);
+    next();
   }
 
   /**
-   * One sweep: write this process's pending cancel marks to the store, then
-   * settle every canceled record still unverified past the background retries
-   * (`at` older than their sum). Returns the ids it settled.
+   * One sweep, one at a time in this process: write this process's pending
+   * cancel marks to the store; announce again every settled record not yet
+   * flagged announced; settle every record still unverified (not `expired`)
+   * at least G after its cancel. Returns the ids it settled.
    */
   async sweepCanceledBy(
     loadEntries: () => Promise<Iterable<[string, { json<T>(): T }]>>,
     nowMs = Date.now(),
   ): Promise<string[]> {
-    await this.flushPendingCancels();
-    const after = CANCEL_SETTLE_DELAYS_MS.reduce((a, b) => a + b, 0);
-    const settled: string[] = [];
-    for (const [key, entry] of await loadEntries()) {
-      let c: TaskCanceledBy | undefined;
-      try {
-        c = entry.json<{ canceled_by?: TaskCanceledBy }>().canceled_by;
-      } catch {
-        continue;
+    if (this.sweeping) return [];
+    this.sweeping = true;
+    try {
+      await this.flushPendingCancels();
+      const settled: string[] = [];
+      for (const [key, entry] of await loadEntries()) {
+        let rec: Record<string, unknown> & { canceled_by?: TaskCanceledBy };
+        try {
+          rec = entry.json<typeof rec>();
+        } catch {
+          continue;
+        }
+        const c = rec.canceled_by;
+        if (!c) continue;
+        if (c.resolved_at && !rec.canceled_by_announced_at) {
+          await this.announceSettled(key, rec);
+          continue;
+        }
+        if (!c.unverified || c.unverified_reason === "expired" || nowMs - Date.parse(c.at) < this.graceMs) continue;
+        if (!rec.origin) continue; // nothing to read until an origin is attached
+        const r = await this.settleCanceledBy(key, CANCEL_READ_TIMEOUT_MS, nowMs).catch(() => null);
+        if (r?.outcome === "settled") settled.push(key);
       }
-      if (!c?.unverified || nowMs - Date.parse(c.at) < after) continue;
-      const r = await this.settleCanceledBy(key).catch(() => null);
-      if (r?.outcome === "settled") settled.push(key);
+      return settled;
+    } finally {
+      this.sweeping = false;
     }
-    return settled;
   }
 }
 

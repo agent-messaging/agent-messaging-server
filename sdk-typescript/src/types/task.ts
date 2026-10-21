@@ -193,8 +193,8 @@ export interface TaskOrigin {
  *
  * Either verified ({@link TaskCanceledByVerified}: the server read what it
  * needed and `requester_request` is its finding) or unverified
- * ({@link TaskCanceledByUnverified}: it could not read the cancel requests,
- * so it does not know whether the original requester asked). Test
+ * ({@link TaskCanceledByUnverified}: it does not know, or does not know yet,
+ * whether the original requester asked). Test
  * `unverified` first; an unverified attribution carries no
  * `requester_request` at all, so it can never be read as "the requester did
  * not ask".
@@ -216,14 +216,15 @@ export interface TaskCanceledByVerified {
    *  (`origin.requester`) before the transition: the requester's own
    *  `canceled` update (`via: "update"`) or a `task.cancel` request it sent
    *  the responder (`via: "cancel_request"`). `null` when the server READ its
-   *  cancel requests and found none, which includes every Task without an
-   *  `origin`. */
+   *  cancel requests over a complete window, at least the grace period after
+   *  `at`, and found none (always with `resolved_at`: never at the
+   *  transition). */
   requester_request: TaskCancelRequestSeen | null;
   /** When the server recorded the transition (the server's clock). */
   at: string;
   /** Present when the attribution was first written unverified and the server
-   *  settled it later (the server's clock). Only cancel requests observed at
-   *  or before `at` count. */
+   *  settled it later (the server's clock). With `task_id`, the dedupe key for
+   *  `mesh.event.task.canceled_by_settled`, which is at-least-once. */
   resolved_at?: string;
   unverified?: never;
   unverified_reason?: never;
@@ -234,20 +235,34 @@ export interface TaskCanceledByUnverified {
   party: "requester" | "responder";
   /** When the server recorded the transition (the server's clock). */
   at: string;
-  /** The server could not read the cancel requests it needed (a store read
-   *  failure or a timeout), so whether the original requester asked for this
-   *  cancel is UNKNOWN. Not a responder's cancel: a consumer refunds nothing
+  /** Whether the original requester asked for this cancel is UNKNOWN (or not
+   *  known yet). Not a responder's cancel: a consumer refunds nothing
    *  automatically on it. The server retries and replaces it with a verified
-   *  attribution (with `resolved_at`) when the read succeeds. */
+   *  attribution (with `resolved_at`), announced on
+   *  `mesh.event.task.canceled_by_settled`, or, 24 hours after `at`, with
+   *  unverified `expired` (final). */
   unverified: true;
   /** Why: `"read_failed"` (the store refused the read), `"read_timed_out"`,
    *  `"ledger_unavailable"` (no ledger to read), or `"window_incomplete"` (the
    *  reads worked, but a cancel request received for this Task is not
-   *  written yet, so "none seen" is not the whole story). A reader keeps an
-   *  unknown reason as given. */
-  unverified_reason: "read_failed" | "read_timed_out" | "ledger_unavailable" | "window_incomplete" | (string & {});
+   *  written yet, so "none seen" is not the whole story), `"settling"` (no
+   *  cancel request seen, and the grace period after `at` has not passed:
+   *  every responder-signed cancel without one starts here), or `"expired"`
+   *  (still unverified 24 hours after `at`: final, for an operator), or
+   *  `"no_origin"` (the Task has no origin, so there is no original
+   *  requester to vouch for). A reader keeps an unknown reason as given. */
+  unverified_reason:
+    | "read_failed"
+    | "read_timed_out"
+    | "ledger_unavailable"
+    | "window_incomplete"
+    | "settling"
+    | "expired"
+    | "no_origin"
+    | (string & {});
   requester_request?: never;
-  resolved_at?: never;
+  /** Only with `"expired"`: when it became final. */
+  resolved_at?: string;
 }
 
 export interface Task {
@@ -400,6 +415,7 @@ export function taskCanceledByOf(record: unknown): TaskCanceledBy | null {
       at: c.at,
       unverified: true,
       unverified_reason: isStr(c.unverified_reason) ? c.unverified_reason : "read_failed",
+      ...(isIso(c.resolved_at) ? { resolved_at: c.resolved_at } : {}),
     };
   }
   const resolved = isIso(c.resolved_at) ? { resolved_at: c.resolved_at } : {};

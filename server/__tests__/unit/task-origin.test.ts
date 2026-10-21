@@ -3,7 +3,15 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createEnvelope, encode, decode, signEnvelope, nkeys } from "../../src/sdk.js";
 import type { Envelope, TaskCanceledBy, TaskOrigin } from "../../src/sdk.js";
 import { handleTaskUpdate, publishCanceledBySettled } from "../../src/task-manager/handlers/task-update.js";
-import { OriginLedger, ORIGIN_SKEW_MS, CANCEL_READ_TIMEOUT_MS, CANCEL_SETTLE_DELAYS_MS, requestKey } from "../../src/task-manager/origin.js";
+import {
+  OriginLedger,
+  ORIGIN_SKEW_MS,
+  CANCEL_READ_TIMEOUT_MS,
+  CANCEL_SETTLE_GRACE_MS,
+  CANCEL_SETTLE_HORIZON_MS,
+  cancelWindowKey,
+  requestKey,
+} from "../../src/task-manager/origin.js";
 import { OriginTap, flushOriginMisses, inboxAgentOf } from "../../src/task-manager/origin-tap.js";
 import { OverdueSweep } from "../../src/task-manager/overdue-sweep.js";
 import { handleTaskGet } from "../../src/task-manager/handlers/task-get.js";
@@ -474,14 +482,31 @@ describe("cancel attribution", () => {
     expect(record(T).cancel_reason).toBe("user_requested");
   });
 
-  it("a responder's cancel signed user_requested, with no cancel from the buyer: the responder's", async () => {
+  /** A settle run at `at` + G + `extra` (the clock as the settle sees it). */
+  const settleAfterGrace = (T: string, extra = 1_000, l: OriginLedger = ledger) =>
+    l.settleCanceledBy(T, CANCEL_READ_TIMEOUT_MS, Date.parse(record(T).canceled_by!.at) + CANCEL_SETTLE_GRACE_MS + extra);
+
+  const expectSettling = (T: string) =>
+    expect(record(T).canceled_by).toEqual({ party: "responder", at: record(T).canceled_by!.at, unverified: true, unverified_reason: "settling" });
+
+  const expectSettledNull = (T: string) => {
+    const c = record(T).canceled_by!;
+    expect(c).toMatchObject({ party: "responder", requester_request: null });
+    expect(Object.keys(c).sort()).toEqual([...fixture.fields.canceled_by.required, "resolved_at"].sort());
+    expect(Date.parse(c.resolved_at!) - Date.parse(c.at)).toBeGreaterThanOrEqual(CANCEL_SETTLE_GRACE_MS);
+  };
+
+  it("a responder's cancel with no cancel from the buyer: settling at the transition, null only after the grace period", async () => {
     const T = "cancel-seller-claims-user";
     await started(T);
     await update(cancelUpdate(T, sellerKp, "user_requested"));
-    const c = record(T).canceled_by;
-    expectShape(c);
-    expect(c).toMatchObject({ party: "responder", requester_request: null });
+    expectSettling(T);
     expect(record(T).cancel_reason).toBe("user_requested");
+    // Before G: still settling, whatever the reads say.
+    expect(await settleAfterGrace(T, -1_000)).toMatchObject({ outcome: "unverified" });
+    expectSettling(T);
+    expect(await settleAfterGrace(T)).toMatchObject({ outcome: "settled" });
+    expectSettledNull(T);
   });
 
   it("a responder's cancel after the buyer's task.cancel request: the responder signed it, the buyer asked", async () => {
@@ -498,11 +523,13 @@ describe("cancel attribution", () => {
   });
 
   for (const reason of ["superseded", "budget_exhausted", "policy"]) {
-    it(`a responder's own reason (${reason}) is the responder's`, async () => {
+    it(`a responder's own reason (${reason}) is the responder's, after the grace period`, async () => {
       const T = `cancel-seller-${reason}`;
       await started(T);
       await update(cancelUpdate(T, sellerKp, reason));
-      expect(record(T).canceled_by).toMatchObject({ party: "responder", requester_request: null });
+      expectSettling(T);
+      await settleAfterGrace(T);
+      expectSettledNull(T);
       expect(record(T).cancel_reason).toBe(reason);
     });
   }
@@ -512,22 +539,33 @@ describe("cancel attribution", () => {
     await started(T);
     await tap(cancelRequest(T, strangerKp));
     await update(cancelUpdate(T, sellerKp, "user_requested"));
-    expect(record(T).canceled_by).toMatchObject({ party: "responder", requester_request: null });
+    expectSettling(T);
+    await settleAfterGrace(T);
+    expectSettledNull(T);
   });
 
-  it("a buyer's cancel request seen only after the responder canceled does not count", async () => {
+  it("a buyer's cancel request sent and received only after the responder canceled does not count", async () => {
     const T = "cancel-ask-after";
     await started(T);
     await update(cancelUpdate(T, sellerKp, "superseded"));
-    await tap(cancelRequest(T));
-    expect(record(T).canceled_by).toMatchObject({ party: "responder", requester_request: null });
+    const at = Date.parse(record(T).canceled_by!.at);
+    vi.useFakeTimers({ toFake: ["Date"], now: at + 1_000 });
+    try {
+      await tap(cancelRequest(T));
+    } finally {
+      vi.useRealTimers();
+    }
+    await settleAfterGrace(T);
+    expectSettledNull(T);
   });
 
-  it("without an origin, the requester's cancel is the requester's and vouches for nothing", async () => {
+  it("without an origin there is no original requester to vouch for: unverified no_origin", async () => {
     const T = "cancel-no-origin";
     await update(taskUpdate(T, { status: "working" }));
     await update(cancelUpdate(T, buyerKp, "user_requested"));
-    expect(record(T).canceled_by).toMatchObject({ party: "requester", requester_request: null });
+    expect(record(T).canceled_by).toMatchObject({ party: "requester", unverified: true, unverified_reason: "no_origin" });
+    expect(record(T).canceled_by).not.toHaveProperty("requester_request");
+    expect(await settleAfterGrace(T)).toMatchObject({ outcome: "nothing" });
   });
 
   /** Make the ledger's reads of cancel requests (keys `c.`) fail or hang. */
@@ -607,10 +645,11 @@ describe("cancel attribution", () => {
       await update(cancelUpdate(T, sellerKp, "user_requested"));
       expectUnverified(record(T).canceled_by, "read_failed");
       // Still failing at the first retry: stays unverified.
-      await vi.advanceTimersByTimeAsync(CANCEL_SETTLE_DELAYS_MS[0]! + 1);
+      await vi.advanceTimersByTimeAsync(1_001);
       expectUnverified(record(T).canceled_by, "read_failed");
       restore();
-      await vi.advanceTimersByTimeAsync(CANCEL_SETTLE_DELAYS_MS[1]! + 1);
+      // A seen request settles at once, without waiting for the grace period.
+      await vi.advanceTimersByTimeAsync(4_001);
     } finally {
       vi.useRealTimers();
       restore();
@@ -621,7 +660,22 @@ describe("cancel attribution", () => {
     expect(Object.keys(c).sort()).toEqual([...fixture.fields.canceled_by.required, "resolved_at"].sort());
   });
 
-  it("settling ignores a cancel request observed after the transition", async () => {
+  it("the background retries conclude null only past the grace period", async () => {
+    const T = "cancel-background-null";
+    await started(T);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      await update(cancelUpdate(T, sellerKp, "superseded"));
+      await vi.advanceTimersByTimeAsync(CANCEL_SETTLE_GRACE_MS - 1_000);
+      expectSettling(T);
+      await vi.advanceTimersByTimeAsync(2_001);
+    } finally {
+      vi.useRealTimers();
+    }
+    expectSettledNull(T);
+  });
+
+  it("settling ignores a cancel request sent and received after the transition", async () => {
     const T = "cancel-settles-late-ask";
     await started(T);
     const restore = breakCancelReads("fail");
@@ -634,10 +688,9 @@ describe("cancel attribution", () => {
     } finally {
       vi.useRealTimers();
     }
-    expect((await ledger.settleCanceledBy(T)).outcome).toBe("settled");
-    expect(record(T).canceled_by).toMatchObject({ party: "responder", requester_request: null });
-    expect(record(T).canceled_by).toHaveProperty("resolved_at");
-    expect((await ledger.settleCanceledBy(T)).outcome).toBe("nothing");
+    expect((await settleAfterGrace(T)).outcome).toBe("settled");
+    expectSettledNull(T);
+    expect((await settleAfterGrace(T)).outcome).toBe("nothing");
   });
 
   /** A ledger that announces settles the way the service does. */
@@ -680,30 +733,151 @@ describe("cancel attribution", () => {
     expect(evs[0]).toMatchObject({ task_id: T, canceled_by: { requester_request: { request_id: ask.id } } });
   });
 
-  it("the sweep settles a record still unverified past the retries, and leaves a fresh one to them", async () => {
+  const entriesOf = (...ids: string[]) => async () =>
+    ids.map((T) => [T, { json: <X,>() => record(T) as unknown as X }]) as [string, { json<X>(): X }][];
+
+  it("the sweep settles a record still unverified past the grace period, and leaves a fresh one", async () => {
     const announced = announcingLedger();
     const T = "cancel-sweep";
     await started(T);
     const restore = breakCancelReads("fail");
     await update(cancelUpdate(T, sellerKp, "superseded"));
     restore();
-    const entries = async () => [[T, { json: <X,>() => record(T) as unknown as X }]] as [string, { json<X>(): X }][];
     const at = Date.parse(record(T).canceled_by!.at);
-    expect(await ledger.sweepCanceledBy(entries, at + 1_000)).toEqual([]);
+    expect(await ledger.sweepCanceledBy(entriesOf(T), at + 1_000)).toEqual([]);
     expect(record(T).canceled_by).toMatchObject({ unverified: true });
-    const after = CANCEL_SETTLE_DELAYS_MS.reduce((a, b) => a + b, 0);
-    expect(await ledger.sweepCanceledBy(entries, at + after + 1)).toEqual([T]);
+    expect(await ledger.sweepCanceledBy(entriesOf(T), at + CANCEL_SETTLE_GRACE_MS + 1)).toEqual([T]);
     expect(record(T).canceled_by).toMatchObject({ party: "responder", requester_request: null });
+    expect(announced).toHaveLength(1);
+    expect(record(T) as unknown as Record<string, unknown>).toHaveProperty("canceled_by_announced_at");
+    // Announced and flagged: a later sweep says nothing.
+    await ledger.sweepCanceledBy(entriesOf(T), at + CANCEL_SETTLE_GRACE_MS + 2);
     expect(announced).toHaveLength(1);
   });
 
-  it("the transition applies the same rule: a cancel request received after it does not count", async () => {
+  it("the event is at least once: a failed announce is repeated by the sweep, then flagged", async () => {
+    const T = "cancel-reannounce";
+    let fail = true;
+    const announced: string[] = [];
+    ledger = new OriginLedger(store, tasks, {
+      onCanceledBySettled: (r) => {
+        if (fail) throw new Error("bus down");
+        announced.push((r.canceled_by as TaskCanceledBy).resolved_at!);
+      },
+    });
+    await started(T);
+    await update(cancelUpdate(T, sellerKp, "superseded"));
+    await settleAfterGrace(T);
+    expect(record(T) as unknown as Record<string, unknown>).not.toHaveProperty("canceled_by_announced_at");
+    fail = false;
+    await ledger.sweepCanceledBy(entriesOf(T));
+    expect(announced).toEqual([record(T).canceled_by!.resolved_at]);
+    expect(record(T) as unknown as Record<string, unknown>).toHaveProperty("canceled_by_announced_at");
+    await ledger.sweepCanceledBy(entriesOf(T));
+    expect(announced).toHaveLength(1);
+  });
+
+  it("sweeps do not overlap in one process", async () => {
+    let loads = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const slow = async () => {
+      loads++;
+      await gate;
+      return [] as [string, { json<X>(): X }][];
+    };
+    const first = ledger.sweepCanceledBy(slow);
+    expect(await ledger.sweepCanceledBy(slow)).toEqual([]);
+    release();
+    await first;
+    expect(loads).toBe(1);
+    await ledger.sweepCanceledBy(slow);
+    expect(loads).toBe(2);
+  });
+
+  it("two instances: B handles the cancel while A's write of the buyer's ask is in flight; never null", async () => {
+    const instanceA = new OriginLedger(store, tasks);
+    const instanceB = ledger; // handles the update
+    const T = "cancel-two-instances";
+    await started(T);
+    const ask = cancelRequest(T);
+    const received = Date.now();
+    instanceA.cancelArrived(decode(encode(ask))); // A's tap has it; its write has not landed
+    await update(cancelUpdate(T, sellerKp, "user_requested"));
+    // B sees no request, no marker and no mark of its own: settling, not null.
+    expectSettling(T);
+    expect(await settleAfterGrace(T, -5_000, instanceB)).toMatchObject({ outcome: "unverified" });
+    expectSettling(T);
+    // A's write lands within the grace period.
+    await instanceA.observe(decode(encode(ask)), SELLER, { receivedAt: received });
+    expect(await settleAfterGrace(T, 1_000, instanceB)).toMatchObject({ outcome: "settled" });
+    expect(record(T).canceled_by).toMatchObject({ party: "responder", requester_request: { request_id: ask.id, via: "cancel_request" } });
+  });
+
+  it("a buffered backlog under G: received after the cancel but sent before it counts", async () => {
+    const T = "cancel-buffered-backlog";
+    await started(T);
+    const ask = cancelRequest(T); // signed now, before the cancel
+    await update(cancelUpdate(T, sellerKp, "user_requested"));
+    expectSettling(T);
+    const at = Date.parse(record(T).canceled_by!.at);
+    // The subscription buffer was behind: the tap stamps it 20 s after the cancel.
+    await ledger.observe(decode(encode(ask)), SELLER, { receivedAt: at + 20_000 });
+    expect(await settleAfterGrace(T)).toMatchObject({ outcome: "settled" });
+    expect(record(T).canceled_by).toMatchObject({ requester_request: { request_id: ask.id, via: "cancel_request" } });
+  });
+
+  it("a request received past the grace period does not count, whatever its own ts says", async () => {
+    const T = "cancel-backlog-past-grace";
+    await started(T);
+    const ask = cancelRequest(T);
+    await update(cancelUpdate(T, sellerKp, "user_requested"));
+    const at = Date.parse(record(T).canceled_by!.at);
+    await ledger.observe(decode(encode(ask)), SELLER, { receivedAt: at + CANCEL_SETTLE_GRACE_MS + 5_000 });
+    await settleAfterGrace(T, 10_000);
+    expectSettledNull(T);
+  });
+
+  it("past 24 hours an unverified attribution is expired: final, announced, never swept again", async () => {
+    const announced = announcingLedger();
+    const T = "cancel-marker-expired";
+    await started(T);
+    const restoreWrites = breakCancelWrites();
+    await expect(ledger.observe(decode(encode(cancelRequest(T))), SELLER)).rejects.toThrow();
+    restoreWrites();
+    await update(cancelUpdate(T, sellerKp, "user_requested"));
+    expectUnverified(record(T).canceled_by, "window_incomplete");
+    // The marker's TTL runs out before the record's, and the process restarts.
+    store.map.delete(cancelWindowKey(T, BUYER, SELLER));
+    ledger = new OriginLedger(store, tasks, { onCanceledBySettled: (r) => announced.push(r) });
+    const at = Date.parse(record(T).canceled_by!.at);
+    expect(await ledger.sweepCanceledBy(entriesOf(T), at + CANCEL_SETTLE_HORIZON_MS + 1)).toEqual([T]);
+    const c = record(T).canceled_by!;
+    expect(c).toMatchObject({ party: "responder", unverified: true, unverified_reason: "expired" });
+    expect(c).not.toHaveProperty("requester_request");
+    expect(c).toHaveProperty("resolved_at");
+    expect(announced).toHaveLength(1);
+    await ledger.sweepCanceledBy(entriesOf(T), at + CANCEL_SETTLE_HORIZON_MS + 2);
+    expect(await ledger.settleCanceledBy(T)).toMatchObject({ outcome: "nothing" });
+    expect(record(T).canceled_by).toEqual(c);
+    expect(announced).toHaveLength(1);
+  });
+
+  it("the transition applies the same rule: a cancel request received after it and sent after it does not count", async () => {
     const T = "cancel-ask-stamped-later";
     await started(T);
-    // Recorded before the transition is handled, but received after it.
-    await ledger.observe(decode(encode(cancelRequest(T))), SELLER, { receivedAt: Date.now() + 60_000 });
+    const later = Date.now() + 60_000;
+    vi.useFakeTimers({ toFake: ["Date"], now: later });
+    let ask: Envelope;
+    try {
+      ask = cancelRequest(T);
+    } finally {
+      vi.useRealTimers();
+    }
+    // Recorded before the transition is handled, but sent and received after it.
+    await ledger.observe(decode(encode(ask)), SELLER, { receivedAt: later });
     await update(cancelUpdate(T, sellerKp, "user_requested"));
-    expect(record(T).canceled_by).toMatchObject({ party: "responder", requester_request: null });
+    expectSettling(T);
   });
 
   it("a backlogged tap stamps the cancel request with when it was received", async () => {
@@ -765,6 +939,17 @@ describe("cancel attribution", () => {
     expect(announced).toHaveLength(1);
   });
 
+  it("an incomplete window never concludes null, even past the grace period", async () => {
+    const T = "cancel-window-past-grace";
+    await started(T);
+    const restoreWrites = breakCancelWrites();
+    await expect(ledger.observe(decode(encode(cancelRequest(T))), SELLER)).rejects.toThrow();
+    restoreWrites();
+    await update(cancelUpdate(T, sellerKp, "user_requested"));
+    expect(await settleAfterGrace(T, 60_000)).toMatchObject({ outcome: "unverified" });
+    expectUnverified(record(T).canceled_by, "window_incomplete");
+  });
+
   it("with the store unwritable, the window mark is kept in memory and flushed by the sweep", async () => {
     const T = "cancel-window-memory";
     await started(T);
@@ -822,7 +1007,8 @@ describe("cancel attribution", () => {
     );
     for (const subject of ["mesh.event.task.canceled", "mesh.event.metering.task_canceled"]) {
       const data = (bySubject.get(subject)!.payload as { data: { canceled_by?: TaskCanceledBy } }).data;
-      expect(data.canceled_by).toMatchObject({ party: "responder", requester_request: null });
+      expect(data.canceled_by).toMatchObject({ party: "responder", unverified: true, unverified_reason: "settling" });
+      expect(data.canceled_by).not.toHaveProperty("requester_request");
     }
   });
 });

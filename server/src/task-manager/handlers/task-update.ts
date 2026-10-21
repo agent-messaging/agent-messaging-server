@@ -40,6 +40,7 @@ import {
   ORIGIN_SKEW_MS,
   readCancelRequest,
   cancelAttribution,
+  CANCEL_SETTLE_GRACE_MS,
   type ContestEvidence,
   type OriginLedger,
 } from "../origin.js";
@@ -869,10 +870,11 @@ export async function handleTaskUpdate(
 
 /**
  * `mesh.event.task.canceled_by_settled`: a canceled Task whose `canceled_by`
- * was written unverified has been settled to a verified attribution (with
- * `resolved_at`). Signed by this service, once per record (the settle is a
- * compare-and-set). The `mesh.event.task.canceled` before it carried the
- * unverified attribution.
+ * was written unverified has been settled, to a verified attribution or to
+ * unverified `expired`, both with `resolved_at`. Signed by this service. At
+ * least once: a consumer dedupes on `task_id` plus `canceled_by.resolved_at`.
+ * The `mesh.event.task.canceled` before it carried the unverified
+ * attribution.
  */
 export function publishCanceledBySettled(nc: Messaging, serviceId: ServiceIdentity, record: Record<string, unknown>): void {
   const task = record as unknown as TaskRecord;
@@ -946,10 +948,14 @@ function createdLongBefore(createdAt: string | undefined, observedAt: string): b
  * requester, the origin's, before this transition: this update itself when the
  * original requester signed it, else the first `task.cancel` request it sent
  * the responder about this Task. Without an origin there is no original
- * requester the server can vouch for, and it is null.
+ * requester the server can vouch for: unverified `no_origin`.
  *
- * A cancel request counts only when received at or before this transition,
- * the same rule every later retry applies (origin.ts cancelAttribution).
+ * The same rule every later retry applies (origin.ts cancelAttribution): a
+ * seen cancel request that counts is verified now; "did not ask"
+ * (`requester_request: null`) is never written here, only by a retry at
+ * least the grace period later, so a cancel request another instance is still
+ * writing, or a tap that is behind, is not missed. Until then it is
+ * unverified `settling`.
  * When the cancel requests cannot be read (the ledger store fails, the read
  * times out, or there is no ledger), or a received one is not written (the
  * window is incomplete), whether the original requester asked is UNKNOWN:
@@ -967,11 +973,17 @@ async function canceledBy(
   const now = new Date().toISOString();
   const party: TaskCanceledBy["party"] = env.from === task.responder ? "responder" : "requester";
   const origin = task.origin;
-  if (!origin) return { party, requester_request: null, at: now };
+  // No origin: no original requester the server can vouch for. Unknown, and
+  // final unless an origin is attached later (origin.ts settleCanceledBy).
+  if (!origin) return { party, at: now, unverified: true, unverified_reason: "no_origin" };
   if (env.from === origin.requester && env.from !== origin.responder) {
     return { party, requester_request: { request_id: env.id, observed_at: now, via: "update" }, at: now };
   }
-  return cancelAttribution(party, now, await readCancelRequest(origins, taskId, origin.requester, origin.responder));
+  return cancelAttribution(party, now, await readCancelRequest(origins, taskId, origin.requester, origin.responder), {
+    nowMs: Date.parse(now),
+    graceMs: origins?.graceMs ?? CANCEL_SETTLE_GRACE_MS,
+    atTransition: true,
+  });
 }
 
 /**

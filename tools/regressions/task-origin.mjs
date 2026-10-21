@@ -244,11 +244,20 @@ const cancelled = (taskId) => until(taskId, (x) => x.state === "canceled" && x.c
   const c = (await cancelled(T))?.canceled_by;
   results.push([c?.party === "requester" && c?.requester_request?.via === "update", `a buyer's cancel is the requester's (${JSON.stringify(c)})`]);
 }
+// A responder's cancel with no ask from the buyer: unverified `settling` at
+// the transition (null is never written then), and `requester_request: null`
+// only from a settle at least the grace period (60 s) later. Both are started
+// here and checked after one wait.
+const unasked = [];
 {
   const T = await pausedTask();
   sellerCancel(T, "user_requested");
   const c = (await cancelled(T))?.canceled_by;
-  results.push([c?.party === "responder" && c?.requester_request === null, `a responder's cancel signed user_requested, unasked, is the responder's (${JSON.stringify(c)})`]);
+  results.push([
+    c?.party === "responder" && c?.unverified === true && c?.unverified_reason === "settling" && !("requester_request" in (c ?? {})),
+    `a responder's cancel signed user_requested, unasked, is settling at the transition (${JSON.stringify(c)})`,
+  ]);
+  unasked.push([T, "a responder's cancel signed user_requested, unasked, settles as the responder's"]);
 }
 {
   const T = await pausedTask();
@@ -270,7 +279,12 @@ const cancelled = (taskId) => until(taskId, (x) => x.state === "canceled" && x.c
   const T = await pausedTask();
   sellerCancel(T, "superseded");
   const c = (await cancelled(T))?.canceled_by;
-  results.push([c?.party === "responder" && c?.requester_request === null, `a responder's own reason is the responder's (${JSON.stringify(c)})`]);
+  results.push([c?.party === "responder" && c?.unverified_reason === "settling", `a responder's own reason is settling at the transition (${JSON.stringify(c)})`]);
+  unasked.push([T, "a responder's own reason settles as the responder's"]);
+}
+for (const [T, what] of unasked) {
+  const c = (await until(T, (x) => x.canceled_by?.resolved_at, 120_000))?.canceled_by;
+  results.push([c?.party === "responder" && c?.requester_request === null && !c?.unverified, `${what} (${JSON.stringify(c)})`]);
 }
 
 await buyer.close();

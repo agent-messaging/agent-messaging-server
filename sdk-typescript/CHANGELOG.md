@@ -2,58 +2,85 @@
 
 ## Unreleased
 
-A cancel the server cannot attribute is recorded as unknown, never as the
-responder's.
+The server never confirms "the requester did not ask for this cancel" until it
+can know.
 
 - **A missing `requester_request` means unknown.** For a consumer reading
   `canceled_by` as raw JSON: no `requester_request` means the server does
-  not know whether the requester asked. It never means "did not ask". Only an
-  explicit `requester_request: null` says that.
-- **`canceled_by.unverified`.** The task manager writes
-  `{ party, at, unverified: true, unverified_reason }`, with no
-  `requester_request`, when it cannot vouch for whether the original
-  requester asked for a cancel. Before this it wrote `requester_request: null`
-  in that case, so a buyer's cancel could look like the responder's own.
-  `unverified_reason` is one of:
+  not know, or does not know yet, whether the requester asked. It never means
+  "did not ask". Only an explicit `requester_request: null` says that, and the
+  server writes it only from a settle, so it always carries `resolved_at`.
+- **Responder cancels start unverified.** When the responder signs the
+  cancel and no counting cancel request from the original requester has been
+  seen, the task manager writes `{ party, at, unverified: true,
+  unverified_reason: "settling" }`, with no `requester_request`. Before this it
+  wrote `requester_request: null` at once, so a buyer's cancel that another
+  instance was still writing, or that a backlogged tap had not reached, could
+  look like the responder's own. A cancel request already seen that counts is
+  verified at once. A buyer's own canceled update needs no read and is
+  verified at once.
+- **When "did not ask" is concluded.** A settle writes `requester_request:
+  null` only when all of these hold:
+  - it runs at least the grace period G after `at` (60 seconds by default;
+    `TASK_CANCEL_SETTLE_GRACE_MS` on the server);
+  - it runs before `at` plus 24 hours;
+  - the reads worked;
+  - no cancel request for the Task is marked received and unwritten, in the
+    store or in the settling process's memory.
+
+  Past `at` plus 24 hours a settle writes unverified `"expired"`, with
+  `resolved_at`: final, for an operator, and never swept again.
+- **When a cancel request counts.** It counts when the server received it at
+  or before `at`. It also counts when the server received it within G after
+  `at` and the requester's own signed `ts` is at or before `at`, which covers a
+  tap whose subscription buffer was behind. `observed_at` is when the server
+  received the request (the tap's arrival time), and the earliest-received
+  request is kept.
+- **`unverified_reason`** is one of:
+  - `"settling"`: nothing seen yet, and a settle cannot conclude yet.
   - `"read_failed"`: the ledger store refused the read.
   - `"read_timed_out"`: the read took longer than 5 seconds.
   - `"ledger_unavailable"`: there is no ledger.
   - `"window_incomplete"`: the reads worked, but a `task.cancel` request
     received for the Task is not written (its write failed, or it is still in
     flight).
+  - `"expired"`: still unverified 24 hours after `at`; final.
+  - `"no_origin"`: the Task has no origin, so there is no original requester
+    to vouch for. Before this a Task without an origin got
+    `requester_request: null`.
 
   A consumer refunds nothing automatically on an unverified attribution. The
-  lifecycle event and the receipt carry it as written. A buyer's own canceled
-  update needs no read and is never unverified.
-- **One rule for when a cancel request counts.** At the transition and on
-  every retry, the original requester's cancel request counts only when the
-  server received it at or before `at`. `observed_at` is now when the server
-  received the request (the tap's arrival time), not when a tap that was
-  behind got to it, and the earliest-received request is kept.
-  `requester_request: null` is written only when the reads worked and no
-  received cancel request is unwritten.
+  lifecycle event and the receipt carry the attribution as written at the
+  transition.
 - **A failed cancel-request write is marked and retried.** The ledger marks
   that Task's cancel window incomplete, in the store when it can and always
   in memory, and the sweep writes the in-memory marks to the store later. The
   tap retries the write after 0.25, 1, 5, 30 and 120 seconds, keeping the
   received time.
-- **Settled later, persisted and announced.** An unverified attribution is
-  retried in the background after 1, 5, 30 and 120 seconds. After that, a
-  sweep every 5 minutes retries it, which also covers a restart.
-  `mesh.task.get` and the privileged read also retry it. Each writes a
-  verified result to the record by compare-and-set, adding `resolved_at`, and
-  announces it once on `mesh.event.task.canceled_by_settled`. The event is
-  signed by the task manager and carries `task_id`, `state`, `requester`,
-  `responder`, `offering`, `origin`, `cancel_reason` and `canceled_by`. An
-  attribution that stays unverified is not announced again.
+- **Settled later, persisted, announced at least once.** An unverified
+  attribution is retried in the background (after 1, 5 and 30 seconds, then
+  G + 1, G + 30 and G + 120 seconds). A sweep every 5 minutes (one at a time
+  per process) retries every record still unverified at least G after `at`,
+  which also covers a restart. `mesh.task.get` and the privileged read retry
+  too. Each writes a settled result to the record by compare-and-set, adding
+  `resolved_at`, and publishes `mesh.event.task.canceled_by_settled`. The
+  event is signed by the task manager and carries `task_id`, `state`,
+  `requester`, `responder`, `offering`, `origin`, `cancel_reason` and
+  `canceled_by`. Delivery is at least once: the record is flagged
+  `canceled_by_announced_at` once the event is published, and the sweep
+  publishes it again for a settled record without the flag. Consumers dedupe
+  on `task_id` plus `canceled_by.resolved_at`.
+- **Upgrade every task-manager instance together.** An instance on an older
+  release still writes `requester_request: null` at the transition.
 - **`TaskCanceledBy` is a union** of `TaskCanceledByVerified` and
   `TaskCanceledByUnverified`; test `unverified` first. `taskCanceledByOf`
   fails toward unknown: any `unverified` other than absent or `false` reads as
   unverified, whatever else the object holds. An older reader, which requires
   `requester_request`, returns null for an unverified attribution and so
   never reads it as the responder's cancel. Pinned by
-  `conformance/task-origin.json` (new shapes `canceled_by_unverified` and
-  `canceled_by_settled`).
+  `conformance/task-origin.json` (new shapes `canceled_by_unverified`,
+  `canceled_by_settling`, `canceled_by_expired` and `canceled_by_settled`;
+  `canceled_by_responder_unasked` now carries `resolved_at`).
 
 ## 0.62.3 (2026-10-20)
 

@@ -54,6 +54,9 @@ export type OriginMiss =
   /** A request named somebody else's Task id and was answered under it:
    *  the requester's choice, recorded nowhere but here. */
   | "foreign_task_named"
+  /** A cancel attribution was still unverified 24 hours after the cancel
+   *  and became unverified `expired`, for an operator. */
+  | "canceled_by_expired"
   /** The ledger threw. */
   | "error";
 
