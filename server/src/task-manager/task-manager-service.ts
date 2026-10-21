@@ -178,6 +178,9 @@ export class TaskManagerService {
 
     if (this.origins) {
       const origins = this.origins;
+      // Every instance must use the same TASK_CANCEL_SETTLE_GRACE_MS; a
+      // mismatch is logged here and on every sweep (origin.ts).
+      void origins.checkGraceConfig();
       this.cancelSweep = setInterval(() => {
         origins
           .sweepCanceledBy(async () => (await this.kv.list()).entries)

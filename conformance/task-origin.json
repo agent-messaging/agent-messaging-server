@@ -68,6 +68,10 @@
         "a settle concludes `requester_request: null` only when ALL hold: it runs at least the grace period G (`grace_ms`, configurable, default 60 s) after `at` and before `at` + 24 h (`horizon_ms`); the reads worked; no cancel request for the Task is marked received-and-unwritten, in the store or in the settling process's memory",
         "past `at` + 24 h a settle writes unverified `expired`: final, for an operator, never swept again",
         "a cancel request seen from the original requester settles as soon as it is seen, before or after G, when it counts",
+        "a cancel the REQUESTER signed (party `requester`) is the requester asking: a settle writes `requester_request` `via: \"update\"` naming its own canceled update, and never null, whatever the cancel requests say (a Task with no origin at the cancel is settled this way once an origin is attached)",
+        "every cancel request is kept and weighed, up to 8 per (Task, sender, addressee), ordered by when it was received: a later-received one that counts is never hidden by an earlier one that does not; more than 8 make 'none counts' unknowable (`window_incomplete`)",
+        "a received-and-unwritten mark reaches the store at once (retried in the background when that write fails, and by the sweep), so a settle on any instance sees it",
+        "every task-manager instance must use the same G (TASK_CANCEL_SETTLE_GRACE_MS); each compares its G with the one last written to the ledger store at start and on every sweep, and logs a warning when they differ",
         "it counts when the server received it at or before `at`, or received it within G after `at` and the requester's own signed `ts` is at or before `at` (a tap whose subscription buffer was behind stamps arrival late; the requester's `ts` can only cost the requester)",
         "`requester_request.observed_at` is when the server received the cancel request (the tap's arrival time); the earliest-received one is kept",
         "a settle is a compare-and-set on the record; the settled event is at least once, repeated by the sweep until the record is flagged `canceled_by_announced_at`, and a consumer dedupes on `task_id` plus `canceled_by.resolved_at`",
@@ -256,6 +260,12 @@
       { "case": "settled_by_sweep", "path": "unverified at least G after `at` (or across a restart); the store reads again", "resolved_at": "present", "event": "mesh.event.task.canceled_by_settled" },
       { "case": "settled_by_read", "path": "task.get or the privileged read of an unverified record once a settle can conclude", "record": "persisted, announced" },
       { "case": "announce_repeated", "path": "the settled event could not be published", "sweep": "publishes it again until the record carries canceled_by_announced_at", "consumer": "dedupes on task_id + canceled_by.resolved_at" },
+      { "case": "buyer_cancels_no_origin_then_origin_attached", "signer": "requester", "path": "the buyer signs the canceled update on a Task with no origin; the origin is attached afterwards; a settle runs", "at_transition": "unverified no_origin", "settled": { "party": "requester", "via": "update", "request_id": "the buyer's canceled update" }, "never": "requester_request: null" },
+      { "case": "later_request_counts", "path": "a cancel request signed after `at` is received first; one signed before `at` is received later, within G", "settled_after_grace": { "via": "cancel_request", "request_id": "the one signed before `at`" } },
+      { "case": "cancel_requests_past_the_cap", "path": "nine cancel requests, none counting", "kept": 8, "overflow": 1, "unverified_reason": "window_incomplete" },
+      { "case": "mark_reaches_the_store_at_once", "path": "instance A's tap receives the buyer's task.cancel; instance B handles the cancel before A writes the request", "at_transition": "unverified window_incomplete (A's marker)", "then": "settled to the buyer's ask once A's write lands" },
+      { "case": "mark_store_write_retried", "path": "the marker write fails, then the store recovers", "marker": "in the store after the first background retry, without a sweep" },
+      { "case": "grace_mismatch", "path": "two instances with different TASK_CANCEL_SETTLE_GRACE_MS", "log": "a warning naming both values" },
       { "case": "buyer_cancels_while_ledger_down", "signer": "requester", "reason": "user_requested", "party": "requester", "via": "update", "why": "the buyer's own update needs no read" }
     ]
   }

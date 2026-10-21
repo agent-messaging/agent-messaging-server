@@ -103,9 +103,11 @@
  *  - `q.<sha(request id)>` → `{ task_id }`: the Task id the request is bound to
  *  - `t.<sha(requester \n responder \n task id)>` → {@link TaskOrigin}
  *  - `a.<sha(request id)>` → {@link FirstAnswer}: the request's first answer
- *  - `c.<sha(task id \n sender \n addressee)>` → {@link ObservedCancel}: the
- *    earliest-received `task.cancel` request, stamped when the server
- *    received it
+ *  - `c.<sha(task id \n sender \n addressee)>` → {@link CancelRequests}: every
+ *    `task.cancel` request (up to MAX_CANCEL_REQUESTS, earliest received
+ *    first), each stamped when the server received it
+ *  - `g.settle_grace_ms` → `{ grace_ms }`: the grace period an instance last
+ *    said it uses (checkGraceConfig)
  *  - `w.<sha(task id \n sender \n addressee)>` → `{ pending }`: the cancel
  *    requests received there whose write did not succeed (yet), so a read
  *    knows the window is incomplete
@@ -368,11 +370,39 @@ export type CancelReadFailure =
   | "no_origin";
 
 /** The cancel-request read: what it found, or why it could not tell. `seen`
- *  is the earliest-received cancel request recorded; `incomplete` says a
- *  received one is not recorded. */
+ *  is every cancel request recorded, earliest received first, and `overflow`
+ *  whether more did not fit; `incomplete` says a received one is not
+ *  recorded. */
 export type CancelRead =
-  | { ok: true; seen: ObservedCancel | null; incomplete: boolean }
+  | { ok: true; seen: ObservedCancel[]; overflow?: boolean; incomplete: boolean }
   | { ok: false; reason: "read_failed" | "read_timed_out" | "ledger_unavailable" };
+
+/** Every `task.cancel` request `from` sent `to` about one Task, as kept under
+ *  its cancel key: up to MAX_CANCEL_REQUESTS, earliest received first, and how
+ *  many more did not fit. A v1 value (one request) reads as a list of one. */
+export interface CancelRequests {
+  v: 2;
+  requests: ObservedCancel[];
+  /** Requests received past the cap; any makes "none counts" unknowable. */
+  overflow?: number;
+}
+
+/** How many cancel requests are kept per (Task id, sender, addressee). */
+export const MAX_CANCEL_REQUESTS = 8;
+
+function cancelListOf(raw: unknown): CancelRequests | null {
+  const r = raw as { requests?: ObservedCancel[]; overflow?: number; request_id?: unknown } | null;
+  if (!r || typeof r !== "object") return null;
+  if (Array.isArray(r.requests)) return { v: 2, requests: r.requests, ...(r.overflow ? { overflow: r.overflow } : {}) };
+  if (typeof r.request_id === "string") return { v: 2, requests: [r as ObservedCancel] };
+  return null;
+}
+
+/** Background retries of a window marker write that failed. */
+export const WINDOW_RETRY_DELAYS_MS: readonly number[] = [250, 1_000, 5_000, 30_000];
+
+/** The store key holding the grace period the instances last said they use. */
+export const GRACE_CONFIG_KEY = "g.settle_grace_ms";
 
 /** The `task.cancel` requests received and not yet written, per window key. */
 interface CancelWindow {
@@ -399,8 +429,8 @@ export async function readCancelRequest(
     timer = setTimeout(() => resolve({ ok: false, reason: "read_timed_out" }), timeoutMs);
     (timer as { unref?: () => void }).unref?.();
   });
-  const read = Promise.all([origins.cancelRequest(taskId, from, to), origins.cancelWindowIncomplete(taskId, from, to)]).then(
-    ([seen, incomplete]): CancelRead => ({ ok: true, seen, incomplete }),
+  const read = Promise.all([origins.cancelRequests(taskId, from, to), origins.cancelWindowIncomplete(taskId, from, to)]).then(
+    ([list, incomplete]): CancelRead => ({ ok: true, seen: list?.requests ?? [], overflow: !!list?.overflow, incomplete }),
     (err): CancelRead => {
       console.warn(`[task-manager] could not read the cancel requests of task ${taskId}:`, err);
       return { ok: false, reason: "read_failed" };
@@ -441,6 +471,12 @@ export function cancelRequestCounts(seen: ObservedCancel, atMs: number, graceMs:
  *    transition; a retry concludes it only from a read that worked, over a
  *    complete window, at least `graceMs` after `at` and within 24 hours;
  *  - past `at` + 24 h a retry writes unverified `expired`, final.
+ * Every recorded request is weighed, so a later request that counts is not
+ * hidden by an earlier one that does not; more requests than were kept make
+ * "none counts" unknowable (`window_incomplete`).
+ * A cancel the REQUESTER signed is the requester asking, whatever the reads
+ * say: with `requesterUpdate` (its canceled update) it is verified
+ * `via: "update"`, and without it it is never concluded null.
  * Everything else is unverified, `settling` while nothing says otherwise. A
  * retry's verified or expired result carries `resolved_at` (`nowMs`).
  */
@@ -448,16 +484,20 @@ export function cancelAttribution(
   party: TaskCanceledBy["party"],
   at: string,
   got: CancelRead,
-  o: { nowMs: number; graceMs: number; atTransition?: boolean },
+  o: { nowMs: number; graceMs: number; atTransition?: boolean; requesterUpdate?: { request_id: string } | null },
 ): TaskCanceledBy {
   const atMs = Date.parse(at);
   const resolved = o.atTransition ? {} : { resolved_at: new Date(o.nowMs).toISOString() };
+  if (party === "requester" && o.requesterUpdate) {
+    return { party, requester_request: { request_id: o.requesterUpdate.request_id, observed_at: at, via: "update" }, at, ...resolved };
+  }
   if (!o.atTransition && o.nowMs > atMs + CANCEL_SETTLE_HORIZON_MS) {
     return { party, at, unverified: true, unverified_reason: "expired", resolved_at: new Date(o.nowMs).toISOString() };
   }
+  if (party === "requester") return { party, at, unverified: true, unverified_reason: "settling" };
   if (!got.ok) return { party, at, unverified: true, unverified_reason: got.reason };
-  const seen = got.seen;
-  if (seen && cancelRequestCounts(seen, atMs, o.graceMs)) {
+  const seen = got.seen.find((x) => cancelRequestCounts(x, atMs, o.graceMs));
+  if (seen) {
     return {
       party,
       requester_request: { request_id: seen.request_id, observed_at: seen.observed_at, via: "cancel_request" },
@@ -465,9 +505,23 @@ export function cancelAttribution(
       ...resolved,
     };
   }
-  if (got.incomplete) return { party, at, unverified: true, unverified_reason: "window_incomplete" };
+  if (got.incomplete || got.overflow) return { party, at, unverified: true, unverified_reason: "window_incomplete" };
   if (o.atTransition || o.nowMs < atMs + o.graceMs) return { party, at, unverified: true, unverified_reason: "settling" };
   return { party, requester_request: null, at, ...resolved };
+}
+
+/** The requester's own canceled update in a record's history (the signed
+ *  envelope that moved it to `canceled`), when the requester signed it. */
+export function requesterCancelUpdateOf(record: { requester?: string; responder?: string; history?: unknown }): { request_id: string } | null {
+  const history = Array.isArray(record.history) ? (record.history as Envelope[]) : [];
+  for (let i = history.length - 1; i >= 0; i--) {
+    const h = history[i];
+    const status = (h?.payload as { status?: unknown } | undefined)?.status;
+    if (status !== "canceled") continue;
+    if (!h.from || h.from === record.responder || h.from !== record.requester) return null;
+    return typeof h.id === "string" && h.id ? { request_id: h.id } : null;
+  }
+  return null;
 }
 
 /** The (Task id, sender, addressee) a `task.cancel` request is recorded
@@ -520,6 +574,11 @@ export class OriginLedger {
    *  this process's copy of the window markers, kept even when the store
    *  cannot be written. */
   private readonly pendingCancels = new Map<string, Set<string>>();
+  /** Envelope ids this process took out of a window and has not yet seen
+   *  removed from the store's marker. */
+  private readonly clearedCancels = new Map<string, Set<string>>();
+  /** One store write of a window marker at a time, per window, in order. */
+  private readonly windowChains = new Map<string, Promise<void>>();
 
   /**
    * One envelope from the inbox tap, already decoded with its signature
@@ -934,16 +993,24 @@ export class OriginLedger {
     return read<TaskOrigin>(this.store, taskBindingKey(requester, responder, taskId));
   }
 
-  /** The first `task.cancel` request `from` sent `to` about this Task, if seen. */
+  /** Every `task.cancel` request `from` sent `to` about this Task (kept up to
+   *  MAX_CANCEL_REQUESTS, earliest received first), if any. */
+  async cancelRequests(taskId: string, from: string, to: string): Promise<CancelRequests | null> {
+    return cancelListOf(await read<unknown>(this.store, cancelKey(taskId, from, to)));
+  }
+
+  /** The earliest-received `task.cancel` request `from` sent `to` about this Task, if seen. */
   async cancelRequest(taskId: string, from: string, to: string): Promise<ObservedCancel | null> {
-    return read<ObservedCancel>(this.store, cancelKey(taskId, from, to));
+    return (await this.cancelRequests(taskId, from, to))?.requests[0] ?? null;
   }
 
   /**
-   * Record a `task.cancel` request, keeping the EARLIEST received one (a retried
-   * write can land after a later request's). A write that fails leaves the
-   * envelope pending in this (Task id, sender, addressee)'s window, in memory
-   * and, when it can be written, in the store, and throws so the tap retries.
+   * Record a `task.cancel` request beside the others for this (Task id,
+   * sender, addressee): every one up to MAX_CANCEL_REQUESTS, ordered by when
+   * it was received (a retried write can land after a later request's), and a
+   * count of the rest. A write that fails leaves the envelope pending in the
+   * window, in memory and in the store's marker (written at once, retried in
+   * the background), and throws so the tap retries.
    */
   private async recordCancel(taskId: string, from: string, to: string, rec: ObservedCancel): Promise<void> {
     const key = cancelKey(taskId, from, to);
@@ -951,15 +1018,22 @@ export class OriginLedger {
     try {
       for (let attempt = 0; ; attempt++) {
         try {
-          await this.store.create(key, enc(rec));
+          await this.store.create(key, enc({ v: 2, requests: [rec] } satisfies CancelRequests));
           break;
         } catch (err) {
           const e = await this.store.get(key);
           if (!e || e.operation === "DEL" || e.operation === "PURGE" || e.length === 0) throw err;
-          const have = e.json<ObservedCancel>();
-          if (have.request_id === rec.request_id || Date.parse(have.observed_at) <= Date.parse(rec.observed_at)) break;
+          const have = cancelListOf(e.json<unknown>()) ?? { v: 2 as const, requests: [] };
+          if (have.requests.some((x) => x.request_id === rec.request_id)) break;
+          const next: CancelRequests =
+            have.requests.length < MAX_CANCEL_REQUESTS
+              ? {
+                  ...have,
+                  requests: [...have.requests, rec].sort((a, b) => Date.parse(a.observed_at) - Date.parse(b.observed_at)),
+                }
+              : { ...have, overflow: (have.overflow ?? 0) + 1 };
           try {
-            await this.store.update(key, enc(rec), e.revision);
+            await this.store.update(key, enc(next), e.revision);
             break;
           } catch (lost) {
             if (attempt >= 10) throw lost;
@@ -967,27 +1041,30 @@ export class OriginLedger {
         }
       }
     } catch (err) {
-      this.markCancelPending(wkey, rec.request_id);
-      await this.writeWindow(wkey, (w) => (w.pending.includes(rec.request_id) ? null : { ...w, pending: [...w.pending, rec.request_id] })).catch(
-        () => console.warn(`[task-manager] could not mark the cancel window of task ${taskId} incomplete in the store; kept in memory`),
-      );
+      await this.markCancelPending(wkey, rec.request_id);
       throw err;
     }
     await this.cancelWritten(wkey, rec.request_id);
   }
 
-  /** A received `task.cancel` request whose write has not succeeded yet: the
-   *  tap marks it as it arrives, so a read in between knows. */
-  markCancelPending(wkey: string, envelopeId: string): void {
+  /**
+   * A received `task.cancel` request whose write has not succeeded yet: kept
+   * in memory, and written to the store's marker at once (in order with the
+   * window's other marker writes, retried in the background when it fails),
+   * so a settle on ANOTHER instance sees the window incomplete too.
+   */
+  markCancelPending(wkey: string, envelopeId: string): Promise<void> {
     const set = this.pendingCancels.get(wkey) ?? new Set<string>();
     set.add(envelopeId);
     this.pendingCancels.set(wkey, set);
+    this.clearedCancels.get(wkey)?.delete(envelopeId);
+    return this.syncWindow(wkey);
   }
 
   /** The tap's mark for an envelope it received, before it is written. */
-  cancelArrived(env: Envelope): void {
+  cancelArrived(env: Envelope): Promise<void> {
     const id = cancelIdentity(env);
-    if (id) this.markCancelPending(cancelWindowKey(id.taskId, id.from, id.to), env.id);
+    return id ? this.markCancelPending(cancelWindowKey(id.taskId, id.from, id.to), env.id) : Promise.resolve();
   }
 
   /** The tap is done with an envelope the ledger ignored or wrote. */
@@ -998,16 +1075,58 @@ export class OriginLedger {
 
   /** An envelope's write succeeded (or it was never one to write): out of the
    *  window's pending list, in memory and in the store. A store marker that
-   *  cannot be cleared stays, which reads as incomplete. */
-  private async cancelWritten(wkey: string, envelopeId: string): Promise<void> {
+   *  cannot be cleared is retried; until then it reads as incomplete. */
+  private cancelWritten(wkey: string, envelopeId: string): Promise<void> {
     const set = this.pendingCancels.get(wkey);
     if (set) {
       set.delete(envelopeId);
       if (!set.size) this.pendingCancels.delete(wkey);
     }
-    await this.writeWindow(wkey, (w) =>
-      w.pending.includes(envelopeId) ? { ...w, pending: w.pending.filter((x) => x !== envelopeId) } : null,
-    ).catch(() => undefined);
+    const cleared = this.clearedCancels.get(wkey) ?? new Set<string>();
+    cleared.add(envelopeId);
+    this.clearedCancels.set(wkey, cleared);
+    return this.syncWindow(wkey);
+  }
+
+  /**
+   * Bring the store's marker for one window in line with this process: add
+   * every id pending here, remove every id cleared here. Queued per window so
+   * an add never lands after its own removal; a failure is retried in the
+   * background (WINDOW_RETRY_DELAYS_MS) and by the sweep. Resolves when this
+   * attempt is done, whatever its outcome.
+   */
+  private syncWindow(wkey: string, attempt = 0): Promise<void> {
+    const prev = this.windowChains.get(wkey) ?? Promise.resolve();
+    const run = prev.then(async () => {
+      const add = [...(this.pendingCancels.get(wkey) ?? [])];
+      const remove = [...(this.clearedCancels.get(wkey) ?? [])];
+      if (!add.length && !remove.length) return;
+      try {
+        await this.writeWindow(wkey, (w) => {
+          const kept = w.pending.filter((x) => !remove.includes(x));
+          const next = [...kept, ...add.filter((x) => !kept.includes(x))];
+          const same = next.length === w.pending.length && next.every((x) => w.pending.includes(x));
+          return same ? null : { ...w, pending: next };
+        });
+        const cleared = this.clearedCancels.get(wkey);
+        if (cleared) {
+          for (const x of remove) cleared.delete(x);
+          if (!cleared.size) this.clearedCancels.delete(wkey);
+        }
+      } catch {
+        if (attempt < WINDOW_RETRY_DELAYS_MS.length) {
+          const t = setTimeout(() => void this.syncWindow(wkey, attempt + 1), WINDOW_RETRY_DELAYS_MS[attempt]);
+          (t as { unref?: () => void }).unref?.();
+        } else {
+          console.warn(`[task-manager] the cancel window marker ${wkey} could not be written; the sweep keeps trying`);
+        }
+      }
+    });
+    this.windowChains.set(wkey, run);
+    void run.finally(() => {
+      if (this.windowChains.get(wkey) === run) this.windowChains.delete(wkey);
+    });
+    return run;
   }
 
   /** Compare-and-set the window marker; `next` returns null for no change. */
@@ -1038,16 +1157,37 @@ export class OriginLedger {
     return !!w?.pending?.length;
   }
 
-  /** Write this process's pending marks to the store (the sweep), so a
-   *  restart does not forget a window it could not mark at the time. */
+  /** Bring every window marker this process holds marks for in line with
+   *  the store (the sweep), past the background retries. */
   async flushPendingCancels(): Promise<void> {
-    for (const [wkey, ids] of this.pendingCancels) {
-      const list = [...ids];
-      await this.writeWindow(wkey, (w) => {
-        const add = list.filter((x) => !w.pending.includes(x));
-        return add.length ? { ...w, pending: [...w.pending, ...add] } : null;
-      }).catch(() => undefined);
+    const keys = new Set([...this.pendingCancels.keys(), ...this.clearedCancels.keys()]);
+    for (const wkey of keys) await this.syncWindow(wkey, WINDOW_RETRY_DELAYS_MS.length);
+  }
+
+  /**
+   * The grace period G must be the same on every task-manager instance: a
+   * settle on an instance with a shorter G could conclude "did not ask"
+   * before another instance's in-flight write lands. Each instance compares
+   * its G with the one last written to the store, warns when they differ, and
+   * writes its own. Run at start and on every sweep. Returns the G the store
+   * held before (null when none).
+   */
+  async checkGraceConfig(): Promise<number | null> {
+    let before: number | null = null;
+    try {
+      const v = await read<{ grace_ms?: unknown }>(this.store, GRACE_CONFIG_KEY);
+      before = typeof v?.grace_ms === "number" ? v.grace_ms : null;
+      if (before !== null && before !== this.graceMs) {
+        console.warn(
+          `[task-manager] TASK_CANCEL_SETTLE_GRACE_MS differs between task-manager instances: this one uses ${this.graceMs} ms, ` +
+            `another wrote ${before} ms. Every instance must use the same grace period.`,
+        );
+      }
+      if (before !== this.graceMs) await this.store.put(GRACE_CONFIG_KEY, enc({ grace_ms: this.graceMs }));
+    } catch (err) {
+      console.warn("[task-manager] could not check the cancel settle grace period against the other instances:", err);
     }
+    return before;
   }
 
   /**
@@ -1066,7 +1206,7 @@ export class OriginLedger {
   ): Promise<CancelSettlement> {
     const e = await this.tasks.get(taskId);
     if (!e || e.operation === "DEL" || e.operation === "PURGE" || e.length === 0) return { outcome: "nothing" };
-    let stored: { origin?: TaskOrigin; canceled_by?: TaskCanceledBy };
+    let stored: { origin?: TaskOrigin; canceled_by?: TaskCanceledBy; requester?: string; responder?: string; history?: unknown };
     try {
       stored = e.json<typeof stored>();
     } catch {
@@ -1076,11 +1216,15 @@ export class OriginLedger {
     if (!c?.unverified || c.unverified_reason === "expired" || !stored.origin) {
       return { outcome: "nothing", ...(c ? { canceled_by: c } : {}) };
     }
+    // The requester signed the canceled state itself: it asked. Its own
+    // update is the evidence, never a read of cancel requests, never null.
+    const requesterUpdate = c.party === "requester" ? requesterCancelUpdateOf(stored) : null;
     const expired = nowMs > Date.parse(c.at) + CANCEL_SETTLE_HORIZON_MS;
-    const got: CancelRead = expired
-      ? { ok: false, reason: "read_failed" } // not read: the horizon decides
-      : await readCancelRequest(this, taskId, stored.origin.requester, stored.origin.responder, timeoutMs);
-    const next = cancelAttribution(c.party, c.at, got, { nowMs, graceMs: this.graceMs });
+    const got: CancelRead =
+      expired || c.party === "requester"
+        ? { ok: false, reason: "read_failed" } // not read: the horizon or the requester's own update decides
+        : await readCancelRequest(this, taskId, stored.origin.requester, stored.origin.responder, timeoutMs);
+    const next = cancelAttribution(c.party, c.at, got, { nowMs, graceMs: this.graceMs, requesterUpdate });
     if (next.unverified && next.unverified_reason !== "expired") {
       if (next.unverified_reason !== c.unverified_reason && got.ok) {
         const w = await rewriteTask<{ canceled_by?: TaskCanceledBy }>(this.tasks, taskId, (t) => {
@@ -1172,6 +1316,7 @@ export class OriginLedger {
     this.sweeping = true;
     try {
       await this.flushPendingCancels();
+      await this.checkGraceConfig();
       const settled: string[] = [];
       for (const [key, entry] of await loadEntries()) {
         let rec: Record<string, unknown> & { canceled_by?: TaskCanceledBy };

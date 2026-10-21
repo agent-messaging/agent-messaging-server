@@ -151,7 +151,7 @@ export class OriginTap {
     }
     // A cancel request is in its window from the moment it arrives, so a
     // cancel attribution read before it is written knows it is missing.
-    this.ledger.cancelArrived(env);
+    void this.ledger.cancelArrived(env);
     this.enqueue(env, agent, Date.now(), 0);
     const max = this.opts.maxInFlight ?? MAX_IN_FLIGHT;
     if (this.inFlight.size >= max) {

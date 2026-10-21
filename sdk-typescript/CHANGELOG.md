@@ -30,6 +30,15 @@ can know.
 
   Past `at` plus 24 hours a settle writes unverified `"expired"`, with
   `resolved_at`: final, for an operator, and never swept again.
+- **A requester-signed cancel is the requester asking.** When the requester
+  signed the canceled update, a settle writes `requester_request` with
+  `via: "update"`, naming that update, and never null. This also covers a Task
+  that had no origin at the cancel and gets one attached later.
+- **Every cancel request is weighed.** The ledger keeps up to 8 cancel
+  requests per Task, sender and addressee, ordered by when each was received.
+  A later-received request that counts is no longer hidden by an earlier one
+  that does not. More than 8 make "none counts" unknowable, which reads as
+  `window_incomplete`.
 - **When a cancel request counts.** It counts when the server received it at
   or before `at`. It also counts when the server received it within G after
   `at` and the requester's own signed `ts` is at or before `at`, which covers a
@@ -53,8 +62,11 @@ can know.
   lifecycle event and the receipt carry the attribution as written at the
   transition.
 - **A failed cancel-request write is marked and retried.** The ledger marks
-  that Task's cancel window incomplete, in the store when it can and always
-  in memory, and the sweep writes the in-memory marks to the store later. The
+  that Task's cancel window incomplete in memory and writes the mark to the
+  store at once, so a settle on any instance sees it. A mark that cannot be
+  written is retried in the background (after 0.25, 1, 5 and 30 seconds) and
+  by the sweep. A cancel request the tap has received but not yet written is
+  marked the same way. The
   tap retries the write after 0.25, 1, 5, 30 and 120 seconds, keeping the
   received time.
 - **Settled later, persisted, announced at least once.** An unverified
@@ -70,8 +82,12 @@ can know.
   `canceled_by_announced_at` once the event is published, and the sweep
   publishes it again for a settled record without the flag. Consumers dedupe
   on `task_id` plus `canceled_by.resolved_at`.
-- **Upgrade every task-manager instance together.** An instance on an older
-  release still writes `requester_request: null` at the transition.
+- **Upgrade every task-manager instance together, with the same grace
+  period.** An instance on an older release still writes
+  `requester_request: null` at the transition. Every instance must use the
+  same `TASK_CANCEL_SETTLE_GRACE_MS`. Each one compares its value with the one
+  last written to the ledger store, at start and on every sweep, and logs a
+  warning when they differ.
 - **`TaskCanceledBy` is a union** of `TaskCanceledByVerified` and
   `TaskCanceledByUnverified`; test `unverified` first. `taskCanceledByOf`
   fails toward unknown: any `unverified` other than absent or `false` reads as

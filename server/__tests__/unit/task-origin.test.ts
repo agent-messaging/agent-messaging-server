@@ -11,6 +11,9 @@ import {
   CANCEL_SETTLE_HORIZON_MS,
   cancelWindowKey,
   requestKey,
+  attachOrigin,
+  MAX_CANCEL_REQUESTS,
+  GRACE_CONFIG_KEY,
 } from "../../src/task-manager/origin.js";
 import { OriginTap, flushOriginMisses, inboxAgentOf } from "../../src/task-manager/origin-tap.js";
 import { OverdueSweep } from "../../src/task-manager/overdue-sweep.js";
@@ -802,16 +805,141 @@ describe("cancel attribution", () => {
     await started(T);
     const ask = cancelRequest(T);
     const received = Date.now();
-    instanceA.cancelArrived(decode(encode(ask))); // A's tap has it; its write has not landed
+    // A's tap has it, and its mark reaches the store at once; its write of
+    // the request has not landed.
+    await instanceA.cancelArrived(decode(encode(ask)));
     await update(cancelUpdate(T, sellerKp, "user_requested"));
-    // B sees no request, no marker and no mark of its own: settling, not null.
-    expectSettling(T);
-    expect(await settleAfterGrace(T, -5_000, instanceB)).toMatchObject({ outcome: "unverified" });
-    expectSettling(T);
+    // B has no request and no mark of its own, but reads A's marker.
+    expectUnverified(record(T).canceled_by, "window_incomplete");
+    expect(await settleAfterGrace(T, 60_000, instanceB)).toMatchObject({ outcome: "unverified" });
+    expectUnverified(record(T).canceled_by, "window_incomplete");
     // A's write lands within the grace period.
     await instanceA.observe(decode(encode(ask)), SELLER, { receivedAt: received });
     expect(await settleAfterGrace(T, 1_000, instanceB)).toMatchObject({ outcome: "settled" });
     expect(record(T).canceled_by).toMatchObject({ party: "responder", requester_request: { request_id: ask.id, via: "cancel_request" } });
+  });
+
+  it("two instances: A's mark has not reached the store either; B never concludes null before G", async () => {
+    const instanceA = new OriginLedger(store, tasks);
+    const T = "cancel-two-instances-unmarked";
+    await started(T);
+    const ask = cancelRequest(T);
+    const received = Date.now();
+    const create = store.create.bind(store);
+    const spy = vi.spyOn(store, "create").mockImplementation(async (k: string, v) => {
+      if (k.startsWith("w.")) throw new Error("store busy");
+      return create(k, v);
+    });
+    await instanceA.cancelArrived(decode(encode(ask)));
+    spy.mockRestore();
+    await update(cancelUpdate(T, sellerKp, "user_requested"));
+    expectSettling(T);
+    expect(await settleAfterGrace(T, -5_000)).toMatchObject({ outcome: "unverified" });
+    expectSettling(T);
+    await instanceA.observe(decode(encode(ask)), SELLER, { receivedAt: received });
+    expect(await settleAfterGrace(T)).toMatchObject({ outcome: "settled" });
+    expect(record(T).canceled_by).toMatchObject({ requester_request: { request_id: ask.id, via: "cancel_request" } });
+  });
+
+  it("a window mark whose store write fails is retried in the background, not only by the sweep", async () => {
+    const T = "cancel-mark-retried";
+    await started(T);
+    const create = store.create.bind(store);
+    let broken = true;
+    const spy = vi.spyOn(store, "create").mockImplementation(async (k: string, v) => {
+      if (broken && (k.startsWith("w.") || k.startsWith("c."))) throw new Error("store unavailable");
+      return create(k, v);
+    });
+    try {
+      await expect(ledger.observe(decode(encode(cancelRequest(T))), SELLER)).rejects.toThrow();
+      expect(await new OriginLedger(store, tasks).cancelWindowIncomplete(T, BUYER, SELLER)).toBe(false);
+      broken = false;
+      // The first background retry (250 ms), with no sweep run.
+      const other = new OriginLedger(store, tasks);
+      const end = Date.now() + 5_000;
+      while (Date.now() < end && !(await other.cancelWindowIncomplete(T, BUYER, SELLER))) await new Promise((r) => setTimeout(r, 25));
+    } finally {
+      spy.mockRestore();
+    }
+    expect(await new OriginLedger(store, tasks).cancelWindowIncomplete(T, BUYER, SELLER)).toBe(true);
+  });
+
+  it("a buyer-signed cancel with no origin, whose origin is attached later, settles to the buyer's own update, never null", async () => {
+    const announced = announcingLedger();
+    const T = "cancel-buyer-origin-later";
+    await update(taskUpdate(T, { status: "working" }));
+    const env = cancelUpdate(T, buyerKp, "user_requested");
+    await update(env);
+    expect(record(T).canceled_by).toMatchObject({ party: "requester", unverified: true, unverified_reason: "no_origin" });
+    const req = request({ taskId: T });
+    expect(
+      await attachOrigin(tasks, T, {
+        request_id: req.id,
+        requester: BUYER,
+        responder: SELLER,
+        offering: "summarize",
+        observed_at: new Date().toISOString(),
+        bound_by: "request",
+      }),
+    ).toBe(true);
+    // Before or after G, with or without cancel requests: the buyer's own update.
+    expect(await settleAfterGrace(T, -30_000)).toMatchObject({ outcome: "settled" });
+    const c = record(T).canceled_by!;
+    expect(c).toMatchObject({ party: "requester", requester_request: { request_id: env.id, via: "update" } });
+    expect(c.requester_request).not.toBeNull();
+    expect(c).toHaveProperty("resolved_at");
+    expect(announced).toHaveLength(1);
+  });
+
+  it("a later-received cancel request that counts is not hidden by an earlier one that does not", async () => {
+    const T = "cancel-second-counts";
+    await started(T);
+    const sentEarly = cancelRequest(T); // signed before the cancel
+    await update(cancelUpdate(T, sellerKp, "user_requested"));
+    const at = Date.parse(record(T).canceled_by!.at);
+    // Another one, signed after the cancel, reaches the tap first.
+    vi.useFakeTimers({ toFake: ["Date"], now: at + 2_000 });
+    let sentLate: Envelope;
+    try {
+      sentLate = cancelRequest(T);
+    } finally {
+      vi.useRealTimers();
+    }
+    await ledger.observe(decode(encode(sentLate)), SELLER, { receivedAt: at + 3_000 });
+    await ledger.observe(decode(encode(sentEarly)), SELLER, { receivedAt: at + 10_000 });
+    expect((await ledger.cancelRequests(T, BUYER, SELLER))!.requests.map((r) => r.request_id)).toEqual([sentLate.id, sentEarly.id]);
+    expect(await settleAfterGrace(T)).toMatchObject({ outcome: "settled" });
+    expect(record(T).canceled_by).toMatchObject({ requester_request: { request_id: sentEarly.id, via: "cancel_request" } });
+  });
+
+  it("more cancel requests than are kept make 'none counts' unknowable", async () => {
+    const T = "cancel-overflow";
+    await started(T);
+    await update(cancelUpdate(T, sellerKp, "user_requested"));
+    const at = Date.parse(record(T).canceled_by!.at);
+    vi.useFakeTimers({ toFake: ["Date"], now: at + 1_000 });
+    let asks: Envelope[];
+    try {
+      asks = Array.from({ length: MAX_CANCEL_REQUESTS + 1 }, () => cancelRequest(T));
+    } finally {
+      vi.useRealTimers();
+    }
+    for (const [i, a] of asks.entries()) await ledger.observe(decode(encode(a)), SELLER, { receivedAt: at + 1_000 + i });
+    const list = (await ledger.cancelRequests(T, BUYER, SELLER))!;
+    expect(list.requests).toHaveLength(MAX_CANCEL_REQUESTS);
+    expect(list.overflow).toBe(1);
+    expect(await settleAfterGrace(T)).toMatchObject({ outcome: "unverified" });
+    expectUnverified(record(T).canceled_by, "window_incomplete");
+  });
+
+  it("an instance with a different grace period is warned about", async () => {
+    const warn = vi.mocked(console.warn);
+    warn.mockClear();
+    expect(await new OriginLedger(store, tasks).checkGraceConfig()).toBeNull();
+    expect(JSON.parse(store.map.get(GRACE_CONFIG_KEY)!.v)).toEqual({ grace_ms: CANCEL_SETTLE_GRACE_MS });
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("TASK_CANCEL_SETTLE_GRACE_MS"))).toBe(false);
+    expect(await new OriginLedger(store, tasks, { graceMs: 5_000 }).checkGraceConfig()).toBe(CANCEL_SETTLE_GRACE_MS);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("TASK_CANCEL_SETTLE_GRACE_MS differs"))).toBe(true);
   });
 
   it("a buffered backlog under G: received after the cancel but sent before it counts", async () => {
