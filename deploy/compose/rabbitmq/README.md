@@ -6,8 +6,8 @@ One host, one command:
 docker compose up -d
 ```
 
-It pulls the released images, `ghcr.io/agent-messaging/agent-messaging-server:0.4.2`
-and `ghcr.io/agent-messaging/agent-messaging-a2a-gateway:0.4.2`, which
+It pulls the released images, `ghcr.io/agent-messaging/agent-messaging-server:0.4.3`
+and `ghcr.io/agent-messaging/agent-messaging-a2a-gateway:0.4.3`, which
 `compose.yaml` pins.
 
 ## What starts
@@ -30,8 +30,8 @@ As for NATS ([.env.example](.env.example) lists them): `BIND_ADDRESS`,
 `MESH_AMQP_ENDPOINTS` (the broker addresses agents are given, default
 `amqp://localhost:<AMQP_PORT>/mesh`), `MESH_PUBLIC_URL`, `GATEWAY_PUBLIC_URL`,
 `GATEWAY_API_KEYS`, `SERVER_IMAGE` and `GATEWAY_IMAGE` (the images, by default
-the latest release, `ghcr.io/agent-messaging/agent-messaging-server:0.4.2` and
-`ghcr.io/agent-messaging/agent-messaging-a2a-gateway:0.4.2`).
+the latest release, `ghcr.io/agent-messaging/agent-messaging-server:0.4.3` and
+`ghcr.io/agent-messaging/agent-messaging-a2a-gateway:0.4.3`).
 
 To upgrade, change the version in `compose.yaml` or set `SERVER_IMAGE` and `GATEWAY_IMAGE` to the new release's images, then run `docker compose pull && docker compose up -d` (back up first: [operator handbook, upgrading](../../../docs/operator-handbook.md#9-upgrading)).
 
