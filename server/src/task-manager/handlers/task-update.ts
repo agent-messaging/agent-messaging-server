@@ -39,6 +39,7 @@ import {
   partiesMatch,
   ORIGIN_SKEW_MS,
   readCancelRequest,
+  cancelAttribution,
   type ContestEvidence,
   type OriginLedger,
 } from "../origin.js";
@@ -866,6 +867,37 @@ export async function handleTaskUpdate(
   console.log(`[task-manager] task ${taskId}: ${newState}`);
 }
 
+/**
+ * `mesh.event.task.canceled_by_settled`: a canceled Task whose `canceled_by`
+ * was written unverified has been settled to a verified attribution (with
+ * `resolved_at`). Signed by this service, once per record (the settle is a
+ * compare-and-set). The `mesh.event.task.canceled` before it carried the
+ * unverified attribution.
+ */
+export function publishCanceledBySettled(nc: Messaging, serviceId: ServiceIdentity, record: Record<string, unknown>): void {
+  const task = record as unknown as TaskRecord;
+  const ev = createEnvelope({
+    type: "emit",
+    from: idOf(serviceId),
+    payload: {
+      domain: "task",
+      event_type: "canceled_by_settled",
+      data: {
+        task_id: task.id,
+        state: task.state,
+        requester: task.requester,
+        responder: task.responder,
+        offering: task.offering,
+        ...(task.origin ? { origin: broadcastOrigin(task.origin) } : {}),
+        ...(task.cancel_reason ? { cancel_reason: task.cancel_reason } : {}),
+        canceled_by: task.canceled_by,
+      },
+    },
+  });
+  nc.publish(Subjects.event("task.canceled_by_settled"), sealEnvelope(ev, serviceId));
+  console.log(`[task-manager] task ${task.id}: canceled_by settled`);
+}
+
 /** An origin as the broadcast lifecycle event carries it: no request ids
  *  beyond the origin's own. */
 function broadcastOrigin(origin: TaskOrigin): TaskOrigin {
@@ -916,12 +948,15 @@ function createdLongBefore(createdAt: string | undefined, observedAt: string): b
  * the responder about this Task. Without an origin there is no original
  * requester the server can vouch for, and it is null.
  *
+ * A cancel request counts only when received at or before this transition,
+ * the same rule every later retry applies (origin.ts cancelAttribution).
  * When the cancel requests cannot be read (the ledger store fails, the read
- * times out, or there is no ledger), whether the original requester asked is
- * UNKNOWN: the attribution is written `unverified: true` with an
- * `unverified_reason` and no `requester_request`, never as a confirmed
- * `requester_request: null`, which a refund consumer would read as the
- * responder's own cancel. The handler then retries it in the background.
+ * times out, or there is no ledger), or a received one is not written (the
+ * window is incomplete), whether the original requester asked is UNKNOWN:
+ * the attribution is written `unverified: true` with an `unverified_reason`
+ * and no `requester_request`, never as a confirmed `requester_request: null`,
+ * which a refund consumer would read as the responder's own cancel. The
+ * handler then retries it in the background.
  */
 async function canceledBy(
   task: TaskRecord,
@@ -936,14 +971,7 @@ async function canceledBy(
   if (env.from === origin.requester && env.from !== origin.responder) {
     return { party, requester_request: { request_id: env.id, observed_at: now, via: "update" }, at: now };
   }
-  const got = await readCancelRequest(origins, taskId, origin.requester, origin.responder);
-  if (!got.ok) return { party, at: now, unverified: true, unverified_reason: got.reason };
-  const seen = got.seen;
-  return {
-    party,
-    requester_request: seen ? { request_id: seen.request_id, observed_at: seen.observed_at, via: "cancel_request" } : null,
-    at: now,
-  };
+  return cancelAttribution(party, now, await readCancelRequest(origins, taskId, origin.requester, origin.responder));
 }
 
 /**

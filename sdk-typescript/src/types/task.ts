@@ -240,10 +240,12 @@ export interface TaskCanceledByUnverified {
    *  automatically on it. The server retries and replaces it with a verified
    *  attribution (with `resolved_at`) when the read succeeds. */
   unverified: true;
-  /** Why: `"read_failed"` (the store refused the read), `"read_timed_out"`, or
-   *  `"ledger_unavailable"` (no ledger to read). A reader keeps an unknown
-   *  reason as given. */
-  unverified_reason: "read_failed" | "read_timed_out" | "ledger_unavailable" | (string & {});
+  /** Why: `"read_failed"` (the store refused the read), `"read_timed_out"`,
+   *  `"ledger_unavailable"` (no ledger to read), or `"window_incomplete"` (the
+   *  reads worked, but a cancel request received for this Task is not
+   *  written yet, so "none seen" is not the whole story). A reader keeps an
+   *  unknown reason as given. */
+  unverified_reason: "read_failed" | "read_timed_out" | "ledger_unavailable" | "window_incomplete" | (string & {});
   requester_request?: never;
   resolved_at?: never;
 }

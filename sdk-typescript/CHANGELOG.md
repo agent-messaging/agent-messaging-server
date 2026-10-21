@@ -5,23 +5,47 @@
 A cancel the server cannot attribute is recorded as unknown, never as the
 responder's.
 
-- **`canceled_by.unverified`.** When the task manager cannot read the cancel
-  requests it needs to decide whether the original requester asked for a
-  cancel (the ledger store fails, the read takes longer than 5 seconds, or
-  there is no ledger), it now writes
-  `{ party, at, unverified: true, unverified_reason }` with no
-  `requester_request` at all. `unverified_reason` is `"read_failed"`,
-  `"read_timed_out"` or `"ledger_unavailable"`. Before this it wrote
-  `requester_request: null`, the same as "the requester did not ask", so a
-  buyer's cancel could look like the responder's own. A consumer refunds
-  nothing automatically on an unverified attribution. The lifecycle event and
-  the receipt carry it as written. A buyer's own canceled update needs no
-  read and is never unverified.
-- **Settled later.** The task manager retries the read in the background
-  (after 1, 5, 30 and 120 seconds). When a read succeeds it replaces the
-  attribution with a verified one that adds `resolved_at`, counting only a
-  cancel request observed at or before `at`. `mesh.task.get` and the
-  privileged read settle it the same way on the copy they answer with.
+- **A missing `requester_request` means unknown.** For a consumer reading
+  `canceled_by` as raw JSON: no `requester_request` means the server does
+  not know whether the requester asked. It never means "did not ask". Only an
+  explicit `requester_request: null` says that.
+- **`canceled_by.unverified`.** The task manager writes
+  `{ party, at, unverified: true, unverified_reason }`, with no
+  `requester_request`, when it cannot vouch for whether the original
+  requester asked for a cancel. Before this it wrote `requester_request: null`
+  in that case, so a buyer's cancel could look like the responder's own.
+  `unverified_reason` is one of:
+  - `"read_failed"`: the ledger store refused the read.
+  - `"read_timed_out"`: the read took longer than 5 seconds.
+  - `"ledger_unavailable"`: there is no ledger.
+  - `"window_incomplete"`: the reads worked, but a `task.cancel` request
+    received for the Task is not written (its write failed, or it is still in
+    flight).
+
+  A consumer refunds nothing automatically on an unverified attribution. The
+  lifecycle event and the receipt carry it as written. A buyer's own canceled
+  update needs no read and is never unverified.
+- **One rule for when a cancel request counts.** At the transition and on
+  every retry, the original requester's cancel request counts only when the
+  server received it at or before `at`. `observed_at` is now when the server
+  received the request (the tap's arrival time), not when a tap that was
+  behind got to it, and the earliest-received request is kept.
+  `requester_request: null` is written only when the reads worked and no
+  received cancel request is unwritten.
+- **A failed cancel-request write is marked and retried.** The ledger marks
+  that Task's cancel window incomplete, in the store when it can and always
+  in memory, and the sweep writes the in-memory marks to the store later. The
+  tap retries the write after 0.25, 1, 5, 30 and 120 seconds, keeping the
+  received time.
+- **Settled later, persisted and announced.** An unverified attribution is
+  retried in the background after 1, 5, 30 and 120 seconds. After that, a
+  sweep every 5 minutes retries it, which also covers a restart.
+  `mesh.task.get` and the privileged read also retry it. Each writes a
+  verified result to the record by compare-and-set, adding `resolved_at`, and
+  announces it once on `mesh.event.task.canceled_by_settled`. The event is
+  signed by the task manager and carries `task_id`, `state`, `requester`,
+  `responder`, `offering`, `origin`, `cancel_reason` and `canceled_by`. An
+  attribution that stays unverified is not announced again.
 - **`TaskCanceledBy` is a union** of `TaskCanceledByVerified` and
   `TaskCanceledByUnverified`; test `unverified` first. `taskCanceledByOf`
   fails toward unknown: any `unverified` other than absent or `false` reads as

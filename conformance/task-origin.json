@@ -59,16 +59,29 @@
       "comment": "Written once, on the canceled transition, beside `cancel_reason`, which stays the canceling party's own signed claim. Verified (the server read what it needed: `required`, `requester_request` its finding) or unverified (it could not: see `unverified`). A reader tests `unverified` first.",
       "required": ["party", "requester_request", "at"],
       "optional": ["resolved_at"],
-      "resolved_at": "ISO-8601: present when the attribution was first written unverified and the server settled it later; only cancel requests observed at or before `at` count",
+      "resolved_at": "ISO-8601: present when the attribution was first written unverified and the server settled it later",
+      "rules": [
+        "a missing `requester_request` means UNKNOWN, never 'the requester did not ask'; only an explicit null says that",
+        "one rule at the transition and on every retry: the original requester's cancel request counts only when the server RECEIVED it at or before `at`",
+        "`requester_request.observed_at` is when the server received the cancel request (the tap's arrival time), not when a tap that was behind got to it; the earliest-received one is kept",
+        "`requester_request: null` is written only from a read that worked over a complete window: no cancel request for the Task was received and left unwritten",
+        "a settle is a compare-and-set on the record, written once and announced once on `mesh.event.task.canceled_by_settled`"
+      ],
+      "settled_event": {
+        "subject": "mesh.event.task.canceled_by_settled",
+        "data": ["task_id", "state", "requester", "responder", "offering", "origin", "cancel_reason", "canceled_by"],
+        "comment": "Signed by the task manager when an unverified attribution is settled to a verified one. `origin` without its contest lists, as on the lifecycle event. An attribution that stays unverified is not announced again."
+      },
       "unverified": {
-        "comment": "The server could not read the cancel requests it needed to decide whether the original requester asked (a store read failure, a timeout, or no ledger). Whether the requester asked is UNKNOWN, so there is no `requester_request` at all: it is never written null as if confirmed. A consumer refunds nothing automatically on it and alerts an operator. The server retries in the background and replaces it with a verified attribution carrying `resolved_at` when the read succeeds; a read of the record (task.get, the privileged read) settles it on the copy it answers with. The lifecycle event and the receipt carry it as written at the transition.",
+        "comment": "The server cannot vouch for whether the original requester asked: it could not read the cancel requests (a store read failure, a timeout, or no ledger), or a cancel request it received for this Task is not written (the window is incomplete). Whether the requester asked is UNKNOWN, so there is no `requester_request` at all: it is never written null as if confirmed. A consumer refunds nothing automatically on it and alerts an operator. The server retries in the background (1, 5, 30 and 120 s), a sweep every 5 minutes retries what is still unverified after that, and every read of the record (task.get, the privileged read) tries too; each persists a verified result by compare-and-set and announces it on `mesh.event.task.canceled_by_settled`. The lifecycle event and the receipt carry it as written at the transition. `window_incomplete` lasts until the missing write succeeds; past the tap's retries it is operator territory.",
         "required": ["party", "at", "unverified", "unverified_reason"],
         "absent": ["requester_request", "resolved_at"],
         "unverified": "true",
         "unverified_reason": {
           "read_failed": "the store refused the read",
           "read_timed_out": "the read did not answer in time",
-          "ledger_unavailable": "the server had no ledger to read"
+          "ledger_unavailable": "the server had no ledger to read",
+          "window_incomplete": "the reads worked, but a cancel request received for this Task is not written (its write failed, or it is still in flight), so 'none seen' is not the whole story"
         },
         "reader": "any `unverified` other than absent or false reads as unverified, whatever else the object holds; an unknown reason is kept as given"
       },
@@ -201,6 +214,13 @@
       { "case": "cancel_requests_unreadable", "signer": "responder", "reason": "user_requested", "party": "responder", "unverified": true, "unverified_reason": "read_failed", "requester_request": "absent", "why": "the buyer may have asked; unknown is never written as 'did not ask'" },
       { "case": "cancel_read_timed_out", "signer": "responder", "reason": "superseded", "party": "responder", "unverified": true, "unverified_reason": "read_timed_out", "requester_request": "absent" },
       { "case": "unverified_then_settled", "path": "written unverified; the read succeeds later", "party": "responder", "requester_request": "the buyer's task.cancel request observed before `at`, else null", "resolved_at": "present" },
+      { "case": "cancel_write_failed", "path": "the buyer's task.cancel arrives while its ledger write fails; the responder cancels", "party": "responder", "unverified": true, "unverified_reason": "window_incomplete", "requester_request": "absent", "why": "a retry that reads 'none' must not settle to null while a received cancel request is unwritten" },
+      { "case": "cancel_write_retried", "path": "as above; the tap's retry writes the cancel request, stamped when it was received", "party": "responder", "via": "cancel_request", "resolved_at": "present", "event": "mesh.event.task.canceled_by_settled" },
+      { "case": "cancel_request_in_flight", "path": "the tap has received the buyer's task.cancel and not yet written it when the responder cancels", "unverified": true, "unverified_reason": "window_incomplete" },
+      { "case": "cancel_received_after_transition", "path": "a cancel request received after `at`, whenever it is written", "party": "responder", "requester_request": null },
+      { "case": "backlogged_tap", "path": "the tap reaches the buyer's task.cancel late, after the transition, but received it before", "via": "cancel_request", "observed_at": "when it was received" },
+      { "case": "settled_by_sweep", "path": "unverified past every background retry (or across a restart); the store reads again", "resolved_at": "present", "event": "mesh.event.task.canceled_by_settled" },
+      { "case": "settled_by_read", "path": "task.get or the privileged read of an unverified record once the store reads again", "record": "persisted, announced once" },
       { "case": "buyer_cancels_while_ledger_down", "signer": "requester", "reason": "user_requested", "party": "requester", "via": "update", "why": "the buyer's own update needs no read" }
     ]
   }

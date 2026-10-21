@@ -4,11 +4,11 @@ import { keyedOf, storageOf, type KeyedLike, type KeyedStore, type StorageLike }
 import { subscribeWithHandler } from "../shared/handler.js";
 import { serviceQueue } from "../shared/queue-groups.js";
 import { identityFromEnv } from "../shared/seed.js";
-import { handleTaskUpdate } from "./handlers/task-update.js";
+import { handleTaskUpdate, publishCanceledBySettled } from "./handlers/task-update.js";
 import { handleTaskGet } from "./handlers/task-get.js";
 import { OverdueSweep } from "./overdue-sweep.js";
 import { declaredNeedRefs, type DeclaredNeedsFn } from "./cancel.js";
-import { OriginLedger } from "./origin.js";
+import { OriginLedger, CANCEL_SWEEP_INTERVAL_MS } from "./origin.js";
 import { OriginTap } from "./origin-tap.js";
 
 export class TaskManagerService {
@@ -20,6 +20,9 @@ export class TaskManagerService {
   /** §7.7 deadline enforcement: marks non-terminal tasks overdue on this
    *  service's clock and notifies the requester. */
   private overdueSweep: OverdueSweep | null = null;
+  /** Settles `canceled_by` attributions still unverified past their
+   *  background retries (origin.ts sweepCanceledBy). */
+  private cancelSweep: ReturnType<typeof setInterval> | null = null;
 
   private kv: KeyedStore;
   /** The registry's bucket, once it has opened (see `declaredNeeds`). */
@@ -36,7 +39,11 @@ export class TaskManagerService {
     origins?: KeyedLike,
   ) {
     this.kv = keyedOf(kv, js);
-    this.origins = origins ? new OriginLedger(keyedOf(origins, js), this.kv) : null;
+    this.origins = origins
+      ? new OriginLedger(keyedOf(origins, js), this.kv, {
+          onCanceledBySettled: (record) => publishCanceledBySettled(this.nc, this.kp, record),
+        })
+      : null;
   }
 
   /**
@@ -156,6 +163,16 @@ export class TaskManagerService {
     this.overdueSweep = new OverdueSweep(this.nc, this.js, this.kv, this.kp);
     this.overdueSweep.start();
 
+    if (this.origins) {
+      const origins = this.origins;
+      this.cancelSweep = setInterval(() => {
+        origins
+          .sweepCanceledBy(async () => (await this.kv.list()).entries)
+          .catch((err) => console.error("[task-manager] canceled_by sweep failed:", err));
+      }, CANCEL_SWEEP_INTERVAL_MS);
+      this.cancelSweep.unref?.();
+    }
+
     console.log("[task-manager] service started (task updates + task lookup + overdue sweep)");
   }
 
@@ -164,6 +181,8 @@ export class TaskManagerService {
       sub.unsubscribe();
     }
     this.overdueSweep?.stop();
+    if (this.cancelSweep) clearInterval(this.cancelSweep);
+    this.cancelSweep = null;
     console.log("[task-manager] service stopped");
   }
 }
