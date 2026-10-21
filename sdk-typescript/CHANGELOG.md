@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.63.0 (2026-10-20)
 
 The server never confirms "the requester did not ask for this cancel" until it
 can know.
