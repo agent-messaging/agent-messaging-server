@@ -51,6 +51,7 @@ import {
   rpcToRest,
   type RestRoute,
 } from "../core/httpjson.js";
+import { resultToA2A10 } from "../core/a2a10.js";
 import { clientAddress } from "./client-address.js";
 import { forward, forwardFor, handleAdminRelay, type ForwardRoute } from "./relay.js";
 import {
@@ -405,17 +406,57 @@ async function handleRest(
   }
 
   const rpc: JsonRpcRequest = { jsonrpc: "2.0", id: 1, method: REST_METHOD[route.op], ...(params !== undefined ? { params } : {}) };
-  const capture = new RestCapture(res, { unwrapTask: route.op === "getTask" || route.op === "cancelTask" });
+  const capture = new ReshapedResponse(res, restShaper(route.op === "getTask" || route.op === "cancelTask"));
   await handleRpc(bridge, req, capture as unknown as ServerResponse, agentId, manager, rpc);
   capture.finish();
 }
 
+/** How a {@link ReshapedResponse} rewrites what the shared handler wrote. */
+interface Shaper {
+  /** The whole unary answer: the handler's parsed body, status and headers. */
+  unary(parsed: unknown, status: number, headers: Record<string, string>): { http: number; body: unknown; headers: Record<string, string> };
+  /** One parsed `data:` event of a stream. */
+  event(parsed: unknown): unknown;
+}
+
+/** The HTTP+JSON form (BRIDGE-A2A.md §13): AIP-193 errors, unwrapped tasks,
+ *  1.0 shapes, `application/a2a+json`. */
+function restShaper(unwrapTask: boolean): Shaper {
+  return {
+    unary(parsed, status, headers) {
+      const answer = rpcToRest(parsed, status, headers, { unwrapTask });
+      return { http: answer.http, body: answer.body, headers: { "Content-Type": A2A_JSON, ...(answer.headers ?? {}) } };
+    },
+    event: rpcStreamEventToRest,
+  };
+}
+
+/** JSON-RPC still, for a caller that asked for A2A 1.0: the status, headers
+ *  and errors stay as the handler wrote them, and each result takes its 1.0
+ *  shape. GetTask and CancelTask answer with the Task itself (a2a.proto:
+ *  `rpc GetTask(GetTaskRequest) returns (Task)`). */
+function rpc10Shaper(unwrapTask: boolean): Shaper {
+  const shape = (parsed: unknown): unknown => {
+    const body = parsed as { result?: unknown } | null;
+    if (!body || typeof body !== "object" || body.result === undefined) return parsed;
+    let result = body.result as { task?: unknown } | null;
+    if (unwrapTask && result && typeof result === "object" && result.task !== undefined) result = result.task as { task?: unknown };
+    return { ...body, result: resultToA2A10(result) };
+  };
+  return {
+    unary(parsed, status, headers) {
+      return { http: status, body: shape(parsed), headers: { ...headers, "Content-Type": "application/json" } };
+    },
+    event: shape,
+  };
+}
+
 /**
  * Stands in for the ServerResponse the shared handler writes to, and writes
- * the HTTP+JSON form to the real one. A unary answer is buffered and reshaped
+ * the reshaped form to the real one. A unary answer is buffered and reshaped
  * whole; a stream is reshaped one `data:` event at a time as it is written.
  */
-class RestCapture {
+class ReshapedResponse {
   headersSent = false;
   private status = 200;
   private headers: Record<string, string> = {};
@@ -425,7 +466,7 @@ class RestCapture {
 
   constructor(
     private readonly real: ServerResponse,
-    private readonly opts: { unwrapTask: boolean },
+    private readonly shaper: Shaper,
   ) {}
 
   setHeader(name: string, value: string | number | readonly string[]): this {
@@ -460,7 +501,7 @@ class RestCapture {
       } catch {
         continue;
       }
-      this.real.write(`data: ${JSON.stringify(rpcStreamEventToRest(parsed))}\n\n`);
+      this.real.write(`data: ${JSON.stringify(this.shaper.event(parsed))}\n\n`);
     }
     return true;
   }
@@ -486,8 +527,9 @@ class RestCapture {
     } catch {
       parsed = null;
     }
-    const answer = rpcToRest(parsed, this.status, this.headers, { unwrapTask: this.opts.unwrapTask });
-    restJson(this.real, answer.http, answer.body, answer.headers);
+    const answer = this.shaper.unary(parsed, this.status, this.headers);
+    this.real.writeHead(answer.http, answer.headers);
+    this.real.end(JSON.stringify(answer.body));
   }
 }
 
@@ -543,9 +585,23 @@ async function handleRpc(
   }
 
   // Version negotiation (BRIDGE-A2A.md §3).
-  const versionHeader = header(req, "a2a-version");
+  const versionHeader = header(req, "a2a-version")?.trim();
   if (versionHeader && !SUPPORTED_A2A_VERSIONS.has(versionHeader)) {
     return json(res, 200, rpcError(id, RpcCode.VERSION_NOT_SUPPORTED, `A2A version ${versionHeader} is not supported; supported: ${[...SUPPORTED_A2A_VERSIONS].join(", ")}`));
+  }
+
+  // A caller that says `A2A-Version: 1.0` is answered in 1.0's shapes
+  // (a2a10.ts): task states as TASK_STATE_*, files as `url` parts, no `final`
+  // on a status update, and GetTask and CancelTask answering with the Task
+  // itself. A stock 1.0 client parses strictly and refuses anything else (the
+  // Python a2a-sdk 1.1.0 does). A caller that names no version, or 0.3, keeps
+  // the shapes this route has always answered with. The HTTP+JSON binding
+  // reshapes on its own (it is 1.0 only), so its requests are not wrapped here.
+  if (!preparsed && versionHeader === "1.0") {
+    const shaped = new ReshapedResponse(res, rpc10Shaper(rpc.method === "GetTask" || rpc.method === "CancelTask"));
+    await handleRpc(bridge, req, shaped as unknown as ServerResponse, agentId, manager, rpc);
+    shaped.finish();
+    return;
   }
 
   // Caller identity + rate limit (BRIDGE-A2A.md §9). Fail-closed: no key and no
@@ -578,6 +634,8 @@ async function handleRpc(
       return json(res, 200, rpcError(id, RpcCode.UNSUPPORTED_OPERATION, `${rpc.method} is not supported by this bridge (BRIDGE-A2A.md 4.2)`));
     case "CreateTaskPushNotificationConfig":
     case "GetTaskPushNotificationConfig":
+    case "ListTaskPushNotificationConfigs":
+    // The 1.0 release candidate's singular name, still answered the same way.
     case "ListTaskPushNotificationConfig":
     case "DeleteTaskPushNotificationConfig":
       return json(res, 200, rpcError(id, RpcCode.PUSH_NOTIFICATION_NOT_SUPPORTED, "Push notifications are not supported by this bridge (BRIDGE-A2A.md 4.2)"));

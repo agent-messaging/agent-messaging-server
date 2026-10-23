@@ -9,7 +9,8 @@ import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { Bridge } from "../src/bridge.js";
 import { startInboundServer } from "../src/inbound/server.js";
-import { matchRestRoute, rpcErrorToRest, stateEnum, withEnumStates, A2A_REASONS } from "../src/core/httpjson.js";
+import { matchRestRoute, rpcErrorToRest, stateEnum, A2A_REASONS } from "../src/core/httpjson.js";
+import { resultToA2A10 } from "../src/core/a2a10.js";
 import { RpcCode } from "../src/core/jsonrpc.js";
 import { MeshError, ErrorCode } from "../../sdk-typescript/src/types/errors.js";
 import { fakeConnect, manifestFixture, type FakeMesh } from "./helpers.js";
@@ -127,9 +128,10 @@ describe("enum spellings (A2A §5.5)", () => {
   it("writes task states as TASK_STATE_* names", () => {
     expect(stateEnum("input-required")).toBe("TASK_STATE_INPUT_REQUIRED");
     expect(stateEnum("TASK_STATE_WORKING")).toBe("TASK_STATE_WORKING");
-    expect(withEnumStates({ task: { id: "t", status: { state: "submitted" } } })).toEqual({ task: { id: "t", status: { state: "TASK_STATE_SUBMITTED" } } });
-    expect(withEnumStates({ statusUpdate: { taskId: "t", status: { state: "completed" }, final: true } })).toEqual({
-      statusUpdate: { taskId: "t", status: { state: "TASK_STATE_COMPLETED" }, final: true },
+    expect(resultToA2A10({ task: { id: "t", status: { state: "submitted" } } })).toEqual({ task: { id: "t", status: { state: "TASK_STATE_SUBMITTED" } } });
+    // 1.0's TaskStatusUpdateEvent has no `final`; a strict client refuses it.
+    expect(resultToA2A10({ statusUpdate: { taskId: "t", status: { state: "completed" }, final: true } })).toEqual({
+      statusUpdate: { taskId: "t", status: { state: "TASK_STATE_COMPLETED" } },
     });
   });
 });
@@ -335,7 +337,8 @@ describe("POST message:stream (A2A §11.7)", () => {
       .map((l) => JSON.parse(l.slice(5)));
     expect(events[0]).toEqual({ task: { id: "st-1", status: { state: "TASK_STATE_WORKING", timestamp: expect.any(String) } } });
     expect(events.some((e) => "jsonrpc" in e)).toBe(false);
-    expect(events.at(-1)).toMatchObject({ statusUpdate: { taskId: "st-1", status: { state: "TASK_STATE_COMPLETED" }, final: true } });
+    expect(events.at(-1)).toMatchObject({ statusUpdate: { taskId: "st-1", status: { state: "TASK_STATE_COMPLETED" } } });
+    expect((events.at(-1) as { statusUpdate: Record<string, unknown> }).statusUpdate).not.toHaveProperty("final");
   });
 });
 

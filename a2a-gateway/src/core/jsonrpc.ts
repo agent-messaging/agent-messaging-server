@@ -132,13 +132,15 @@ export interface A2ATask {
   artifacts?: A2AArtifact[];
 }
 
-/** SendMessage request params (a2a_spec.md §3.2.1, subset). */
+/** SendMessage request params (a2a.proto 1.0 `SendMessageRequest`, subset). */
 export interface SendMessageParams {
   message: A2AMessage;
+  /** `SendMessageConfiguration`. The 1.0 release candidate's `blocking` is
+   *  gone: 1.0 blocks by default and says `returnImmediately` for the other. */
   configuration?: {
-    blocking?: boolean;
     acceptedOutputModes?: string[];
     historyLength?: number;
+    returnImmediately?: boolean;
   };
   metadata?: Record<string, unknown>;
 }

@@ -150,8 +150,11 @@ export interface AgentCard {
     extendedAgentCard: boolean;
     extensions?: Array<{ uri: string; description?: string; required?: boolean; params?: Record<string, unknown> }>;
   };
+  /** a2a.proto 1.0 `SecurityScheme`s by name: each a oneof, such as
+   *  `{httpAuthSecurityScheme: {scheme: "bearer"}}`. */
   securitySchemes?: Record<string, unknown>;
-  security?: Array<Record<string, string[]>>;
+  /** a2a.proto 1.0 `SecurityRequirement`s: any one satisfies the card. */
+  securityRequirements?: Array<{ schemes: Record<string, { list: string[] }> }>;
   defaultInputModes: string[];
   defaultOutputModes: string[];
   skills: AgentCardSkill[];
@@ -184,24 +187,27 @@ export interface CardSecurityPolicy {
  *  for this door, so a developer reading either card sees one scheme. */
 const BEARER_SCHEME = "a2a-gateway";
 
-/** `securitySchemes` / `security` for a policy. An empty requirement object is
- *  the OpenAPI spelling of "no credential needed", so a bridge that accepts
- *  both says so in one list instead of leaving a client to guess. */
-function securityFor(policy: CardSecurityPolicy): Pick<AgentCard, "securitySchemes" | "security"> {
-  const security: Array<Record<string, string[]>> = [];
-  if (policy.apiKey) security.push({ [BEARER_SCHEME]: [] });
-  if (policy.anonymous) security.push({});
-  if (!policy.apiKey) return { security };
+/** `securitySchemes` / `securityRequirements` for a policy, in A2A 1.0's
+ *  shapes (a2a.proto `SecurityScheme`, `SecurityRequirement`), which replaced
+ *  the OpenAPI-style `{type: "http"}` and `security` before 1.0. A requirement
+ *  naming no scheme is "no credential needed", so a bridge that accepts both
+ *  says so in one list instead of leaving a client to guess. */
+function securityFor(policy: CardSecurityPolicy): Pick<AgentCard, "securitySchemes" | "securityRequirements"> {
+  const securityRequirements: NonNullable<AgentCard["securityRequirements"]> = [];
+  if (policy.apiKey) securityRequirements.push({ schemes: { [BEARER_SCHEME]: { list: [] } } });
+  if (policy.anonymous) securityRequirements.push({ schemes: {} });
+  if (!policy.apiKey) return { securityRequirements };
   return {
     securitySchemes: {
       [BEARER_SCHEME]: {
-        type: "http",
-        scheme: "bearer",
-        description:
-          "A gateway key issued to an AgentMesh account, sent as `Authorization: Bearer <key>`.",
+        httpAuthSecurityScheme: {
+          scheme: "bearer",
+          description:
+            "A gateway key issued to an AgentMesh account, sent as `Authorization: Bearer <key>`.",
+        },
       },
     },
-    security,
+    securityRequirements,
   };
 }
 

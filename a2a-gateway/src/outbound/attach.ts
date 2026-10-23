@@ -15,6 +15,7 @@ import {
 } from "../core/card.js";
 import { linkFiles, meshLinker, partsToInput, outputToParts, type FileLinker, type FileSink, type MeshFile } from "../core/parts.js";
 import { a2aStateToMesh } from "../core/states.js";
+import { partsToA2A10 } from "../core/a2a10.js";
 import { rpcErrorToMesh } from "../core/errors.js";
 import { BucketPool, TokenBucket } from "../core/ratelimit.js";
 import type {
@@ -349,15 +350,21 @@ function makeForwardHandler(
         role: "ROLE_USER",
         // A mesh file goes to the remote by a signed link this agent asks
         // for: the run-file door needs its owner's session, and the remote
-        // has none (AgentMesh technical debt 447).
-        parts: outputToParts(await linkFiles(input, linker)),
+        // has none (AgentMesh technical debt 447). In 1.0's part shape, a
+        // `url` part: a stock 1.0 server refuses the 0.3 `file` wrapper.
+        parts: partsToA2A10(outputToParts(await linkFiles(input, linker))),
         messageId: ctx.taskId,
         // Both spellings during the §8.5 deprecation window: the far side may
         // be a bridge that has not renamed yet. Metadata is advisory, so the
         // duplicate costs nothing and strands nobody.
         metadata: { "agentmesh.offering": skillId, "agentmesh.skill": skillId },
       },
-      configuration: { blocking: true },
+      // No `configuration`. A2A 1.0 waits for a terminal or interrupted
+      // state by default (`returnImmediately` false), which is what this
+      // call wants, and the 1.0 release candidate's `blocking` is not a 1.0
+      // field: a stock 1.0 server (a2a-sdk 1.1.0) refuses the whole request
+      // over it with -32602. A server that answers early with a working task
+      // anyway, as the candidate's default did, is polled to the end below.
     };
 
     try {

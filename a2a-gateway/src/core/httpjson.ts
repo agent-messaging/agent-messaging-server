@@ -1,7 +1,7 @@
 /**
  * The A2A 1.0 HTTP+JSON binding (A2A §11; BRIDGE-A2A.md §13). Pure functions:
- * route matching, the AIP-193 error envelope, the enum spellings, and the
- * reshaping of a JSON-RPC answer into its HTTP+JSON form.
+ * route matching, the AIP-193 error envelope, and the reshaping of a JSON-RPC
+ * answer into its HTTP+JSON form, in A2A 1.0 shapes (a2a10.ts).
  *
  * The HTTP+JSON routes run the same operations as the JSON-RPC route. The
  * server turns each REST call into the JSON-RPC request it stands for, runs it
@@ -10,6 +10,7 @@
  * records in one place, and JSON-RPC behaves exactly as it did.
  */
 import { RpcCode, type JsonRpcError } from "./jsonrpc.js";
+import { resultToA2A10 } from "./a2a10.js";
 
 export const A2A_JSON = "application/a2a+json";
 export const ERROR_INFO_TYPE = "type.googleapis.com/google.rpc.ErrorInfo";
@@ -253,44 +254,9 @@ export function rpcErrorToRest(err: JsonRpcError, handlerStatus: number): { http
 
 // ─── Enum spellings (A2A §5.5) ──────────────────────────────────────
 
-const STATE_ENUM: Record<string, string> = {
-  submitted: "TASK_STATE_SUBMITTED",
-  working: "TASK_STATE_WORKING",
-  "input-required": "TASK_STATE_INPUT_REQUIRED",
-  "auth-required": "TASK_STATE_AUTH_REQUIRED",
-  completed: "TASK_STATE_COMPLETED",
-  failed: "TASK_STATE_FAILED",
-  canceled: "TASK_STATE_CANCELED",
-  rejected: "TASK_STATE_REJECTED",
-};
-
-/** A task state in its ProtoJSON enum name. An enum name already is one. */
-export function stateEnum(state: string): string {
-  return STATE_ENUM[state] ?? state;
-}
-
-/** A task, a status update, or a whole send/stream result with every task
- *  state in its enum spelling. Returns new objects; never edits its input. */
-export function withEnumStates<T>(value: T): T {
-  if (!value || typeof value !== "object") return value;
-  const v = value as Record<string, unknown>;
-  const out: Record<string, unknown> = { ...v };
-  if (v.task && typeof v.task === "object") out.task = taskWithEnumState(v.task as Record<string, unknown>);
-  if (v.statusUpdate && typeof v.statusUpdate === "object") {
-    const su = v.statusUpdate as Record<string, unknown>;
-    out.statusUpdate = { ...su, ...(su.status ? { status: statusWithEnum(su.status as Record<string, unknown>) } : {}) };
-  }
-  if (typeof v.id === "string" && v.status && typeof v.status === "object") return taskWithEnumState(v) as T;
-  return out as T;
-}
-
-function taskWithEnumState(task: Record<string, unknown>): Record<string, unknown> {
-  return { ...task, ...(task.status ? { status: statusWithEnum(task.status as Record<string, unknown>) } : {}) };
-}
-
-function statusWithEnum(status: Record<string, unknown>): Record<string, unknown> {
-  return { ...status, ...(typeof status.state === "string" ? { state: stateEnum(status.state) } : {}) };
-}
+// The 1.0 shapes, task states among them, are a2a10.ts's: the JSON-RPC route
+// writes them too, to a caller that asks for 1.0.
+export { stateEnum } from "./a2a10.js";
 
 // ─── Reshaping a JSON-RPC answer ────────────────────────────────────
 
@@ -322,7 +288,7 @@ export function rpcToRest(
   }
   let result = body.result as Record<string, unknown>;
   if (opts.unwrapTask && result && typeof result === "object" && result.task) result = result.task as Record<string, unknown>;
-  return { http: 200, body: withEnumStates(result), headers: carry };
+  return { http: 200, body: resultToA2A10(result), headers: carry };
 }
 
 /** One SSE `data:` payload from the JSON-RPC stream, as its HTTP+JSON line:
@@ -330,5 +296,5 @@ export function rpcToRest(
 export function rpcStreamEventToRest(rpcEvent: unknown): unknown {
   const e = rpcEvent as { result?: unknown; error?: JsonRpcError } | null;
   if (e && e.error) return rpcErrorToRest(e.error, 200).body;
-  return withEnumStates(e?.result);
+  return resultToA2A10(e?.result);
 }
