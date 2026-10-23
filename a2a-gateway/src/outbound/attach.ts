@@ -15,6 +15,7 @@ import {
 } from "../core/card.js";
 import { linkFiles, meshLinker, partsToInput, outputToParts, type FileLinker, type FileSink, type MeshFile } from "../core/parts.js";
 import { a2aStateToMesh } from "../core/states.js";
+import { partsToA2A10 } from "../core/a2a10.js";
 import { rpcErrorToMesh } from "../core/errors.js";
 import { BucketPool, TokenBucket } from "../core/ratelimit.js";
 import type {
@@ -146,6 +147,7 @@ export interface Attachment {
 
 const HEALTH_INTERVAL_MS = 60_000;
 const POLL_INTERVAL_MS = 2_000;
+const POLL_FIRST_MS = 250;
 const POLL_BUDGET_MS = 55_000;
 const DEFAULT_OUTBOUND_PER_MINUTE = 120;
 const DEFAULT_OUTBOUND_PER_CALLER_PER_MINUTE = 30;
@@ -349,15 +351,21 @@ function makeForwardHandler(
         role: "ROLE_USER",
         // A mesh file goes to the remote by a signed link this agent asks
         // for: the run-file door needs its owner's session, and the remote
-        // has none (AgentMesh technical debt 447).
-        parts: outputToParts(await linkFiles(input, linker)),
+        // has none (AgentMesh technical debt 447). In 1.0's part shape, a
+        // `url` part: a stock 1.0 server refuses the 0.3 `file` wrapper.
+        parts: partsToA2A10(outputToParts(await linkFiles(input, linker))),
         messageId: ctx.taskId,
         // Both spellings during the §8.5 deprecation window: the far side may
         // be a bridge that has not renamed yet. Metadata is advisory, so the
         // duplicate costs nothing and strands nobody.
         metadata: { "agentmesh.offering": skillId, "agentmesh.skill": skillId },
       },
-      configuration: { blocking: true },
+      // No `configuration`. A2A 1.0 waits for a terminal or interrupted
+      // state by default (`returnImmediately` false), which is what this
+      // call wants, and the 1.0 release candidate's `blocking` is not a 1.0
+      // field: a stock 1.0 server (a2a-sdk 1.1.0) refuses the whole request
+      // over it with -32602. A server that answers early with a working task
+      // anyway, as the candidate's default did, is polled to the end below.
     };
 
     try {
@@ -395,6 +403,7 @@ async function awaitTask(
 ): Promise<unknown> {
   const deadline = Date.now() + POLL_BUDGET_MS;
   let current = task;
+  let polls = 0;
   while (true) {
     const state = a2aStateToMesh(current.status?.state ?? "");
     if (state === "completed") {
@@ -411,7 +420,9 @@ async function awaitTask(
     if (Date.now() > deadline) {
       throw new MeshError(ErrorCode.TRANSPORT_TIMEOUT, "Remote A2A task did not reach a terminal state in time");
     }
-    await sleep(POLL_INTERVAL_MS);
+    // Soon at first, then every POLL_INTERVAL_MS: a server that answered
+    // early (the 1.0 release candidate's default) is often done in moments.
+    await sleep(Math.min(POLL_INTERVAL_MS, POLL_FIRST_MS * 2 ** polls++));
     const resp = await rpcCall(rpcUrl, headers, "GetTask", { id: task.id });
     if (resp.error) {
       const mesh = rpcErrorToMesh(resp.error);

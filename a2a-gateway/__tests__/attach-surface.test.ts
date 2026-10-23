@@ -139,7 +139,9 @@ describe("what an A2A eval agent must expose to be attachable", () => {
       taskId: "t1",
       envelope: { from: "UCALLER" },
     });
-    expect(out).toEqual({ echoed: { message: expect.anything(), configuration: { blocking: true } } });
+    // No `configuration`: 1.0 blocks by default, and the release candidate's
+    // `blocking` is refused by a stock 1.0 server (a2a-sdk-interop.test.ts).
+    expect(out).toEqual({ echoed: { message: expect.anything() } });
     expect(remote.calls).toBe(1);
   });
 

@@ -2,8 +2,9 @@ name: CI
 
 # Every push to main and every pull request:
 #   checks    typecheck and unit tests of the server, the A2A gateway and the
-#             SDK; the secret check; the boundary check; the Kubernetes
-#             manifests checked against the Kubernetes schemas
+#             SDK; the gateway against the Python a2a-sdk 1.1.0; the secret
+#             check; the boundary check; the Kubernetes manifests checked
+#             against the Kubernetes schemas
 #   mesh      for each broker: the Compose setup brought up from empty (images
 #             built from this commit, first-run, broker, server, gateway), the
 #             core conformance profile against it with --ci, and every example
@@ -59,6 +60,21 @@ jobs:
           npm ci --no-audit --no-fund
           npm run typecheck
           npm test
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The A2A project's Hello World sample on a2a-sdk 1.1.0, attached
+      # through the gateway, and a 1.1.0 client calling the gateway. 1.1.0
+      # parses A2A 1.0 strictly, so this is where a shape 1.0 does not have
+      # shows up. The step sets A2A_SDK_PYTHON, so nothing here is skipped.
+      - name: The A2A gateway against a2a-sdk 1.1.0
+        working-directory: a2a-gateway
+        run: |
+          python -m venv "$RUNNER_TEMP/a2a-sdk"
+          "$RUNNER_TEMP/a2a-sdk/bin/pip" install --quiet -r __tests__/a2a-sdk/requirements.txt
+          A2A_SDK_PYTHON="$RUNNER_TEMP/a2a-sdk/bin/python" npx vitest run __tests__/a2a-sdk-interop.test.ts
 
       - name: The Kubernetes manifests
         run: |

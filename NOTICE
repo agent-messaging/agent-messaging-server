@@ -20,3 +20,6 @@ This repository also contains:
 - conformance/SPEC.md, the Agent Messaging specification, as published at
   https://agentmessaging.ai, and the conformance suite's core profile, from
   https://github.com/agent-messaging/agent-messaging.
+- a2a-gateway/__tests__/a2a-sdk/sample_agent.py, a test copy of the A2A
+  project's Hello World sample (Apache-2.0), from
+  https://github.com/a2aproject/a2a-samples.

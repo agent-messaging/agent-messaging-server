@@ -132,13 +132,15 @@ export interface A2ATask {
   artifacts?: A2AArtifact[];
 }
 
-/** SendMessage request params (a2a_spec.md §3.2.1, subset). */
+/** SendMessage request params (a2a.proto 1.0 `SendMessageRequest`, subset). */
 export interface SendMessageParams {
   message: A2AMessage;
+  /** `SendMessageConfiguration`. The 1.0 release candidate's `blocking` is
+   *  gone: 1.0 blocks by default and says `returnImmediately` for the other. */
   configuration?: {
-    blocking?: boolean;
     acceptedOutputModes?: string[];
     historyLength?: number;
+    returnImmediately?: boolean;
   };
   metadata?: Record<string, unknown>;
 }
@@ -150,5 +152,5 @@ export type SendMessageResult = { task: A2ATask } | { message: A2AMessage };
 export type StreamEvent =
   | { task: A2ATask }
   | { message: A2AMessage }
-  | { artifactUpdate: { taskId: string; artifact: A2AArtifact } }
-  | { statusUpdate: { taskId: string; status: A2ATaskStatus; final: boolean } };
+  | { artifactUpdate: { taskId: string; contextId?: string; artifact: A2AArtifact } }
+  | { statusUpdate: { taskId: string; contextId?: string; status: A2ATaskStatus; final: boolean } };
