@@ -46,26 +46,29 @@ async def main() -> None:
     base, key = sys.argv[1], sys.argv[2]
     headers = {'Authorization': f'Bearer {key}'}
     async with httpx.AsyncClient(headers=headers, timeout=20) as http:
-        unary = await create_client(
-            base,
-            client_config=ClientConfig(streaming=False, httpx_client=http),
-            resolver_http_kwargs={'headers': headers},
-        )
-        streaming = await create_client(
-            base,
-            client_config=ClientConfig(streaming=True, httpx_client=http),
-            resolver_http_kwargs={'headers': headers},
-        )
+        # The card names both bindings; each is run, JSON-RPC's steps bare
+        # and HTTP+JSON's prefixed `rest_`.
+        for binding, prefix in (('JSONRPC', ''), ('HTTP+JSON', 'rest_')):
+            unary = await create_client(
+                base,
+                client_config=ClientConfig(streaming=False, httpx_client=http, supported_protocol_bindings=[binding]),
+                resolver_http_kwargs={'headers': headers},
+            )
+            streaming = await create_client(
+                base,
+                client_config=ClientConfig(streaming=True, httpx_client=http, supported_protocol_bindings=[binding]),
+                resolver_http_kwargs={'headers': headers},
+            )
 
-        await run_step('message', collect(unary, 'message'))
-        await run_step('file', collect(unary, 'file'))
-        events = await run_step('task', collect(unary, 'task'))
-        task_id = None
-        if events:
-            task_id = events[0].get('task', {}).get('id')
-        if task_id:
-            await run_step('get_task', _get(unary, task_id))
-        await run_step('stream', collect(streaming, 'stream'))
+            await run_step(f'{prefix}message', collect(unary, 'message'))
+            await run_step(f'{prefix}file', collect(unary, 'file'))
+            events = await run_step(f'{prefix}task', collect(unary, 'task'))
+            task_id = None
+            if events:
+                task_id = events[0].get('task', {}).get('id')
+            if task_id:
+                await run_step(f'{prefix}get_task', _get(unary, task_id))
+            await run_step(f'{prefix}stream', collect(streaming, 'stream'))
 
 
 async def _get(client, task_id: str) -> dict:

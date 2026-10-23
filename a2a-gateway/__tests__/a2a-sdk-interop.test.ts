@@ -210,6 +210,7 @@ async function startGateway(): Promise<{ agent: string; mesh: FakeMesh }> {
   const manifest = manifestFixture({ offerings: [{ id: "echo", name: "Echo", description: "Returns input", streaming: true }] });
   const mesh = fakeConnect(bridge, { discover: async () => ({ agents: [manifest], total: 1 }), getManifest: async () => manifest });
   mesh.answer = (req) => {
+    if (req.offering === "task.cancel") return { task_id: null, payload: { status: "canceled" }, envelope: { id: "e-cancel" } };
     const text = (req.input as { text?: string })?.text;
     if (text === "task") return { task_id: "task-1", payload: { status: "working" }, envelope: { id: "e-task" } };
     if (text === "file") {
@@ -243,10 +244,16 @@ async function startGateway(): Promise<{ agent: string; mesh: FakeMesh }> {
   return { agent: `${base}/agents/UAGENTPUBKEY`, mesh };
 }
 
-async function rpc10(agent: string, method: string, params: unknown, version: string | null = "1.0"): Promise<Response> {
-  return fetch(`${agent}/rpc`, {
+async function rpc10(
+  agent: string,
+  method: string,
+  params: unknown,
+  version: string | null = "1.0",
+  opts: { auth?: boolean; query?: string } = {},
+): Promise<Response> {
+  return fetch(`${agent}/rpc${opts.query ?? ""}`, {
     method: "POST",
-    headers: { ...AUTH, "Content-Type": "application/json", ...(version ? { "A2A-Version": version } : {}) },
+    headers: { ...(opts.auth === false ? {} : AUTH), "Content-Type": "application/json", ...(version ? { "A2A-Version": version } : {}) },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
   });
 }
@@ -282,6 +289,37 @@ describe("inbound from an A2A 1.0 client (fixture)", () => {
     expect(events.length).toBeGreaterThanOrEqual(3);
     for (const e of events) expect(strict("StreamResponse", e)).toEqual([]);
     expect(events.at(-1)).toMatchObject({ statusUpdate: { taskId: "st-1", status: { state: "TASK_STATE_COMPLETED" } } });
+    // A2A 1.0 requires a context on each update event.
+    for (const e of events.slice(1) as Array<Record<string, { contextId?: string }>>) {
+      expect(Object.values(e)[0].contextId).toBe("st-1");
+    }
+  });
+
+  it("answers CancelTask with the Task itself", async () => {
+    const { agent } = await startGateway();
+    await rpc10(agent, "SendMessage", send("task"));
+    const body = (await (await rpc10(agent, "CancelTask", { id: "task-1" })).json()) as { result: Obj };
+    expect(strict("Task", body.result)).toEqual([]);
+    expect(body.result).toMatchObject({ id: "task-1", status: { state: "TASK_STATE_CANCELED" } });
+  });
+
+  it("hears the version as a request parameter too (A2A 1.0 §3.2.6)", async () => {
+    const { agent } = await startGateway();
+    await rpc10(agent, "SendMessage", send("task"));
+    const body = (await (await rpc10(agent, "GetTask", { id: "task-1" }, null, { query: "?A2A-Version=1.0" })).json()) as { result: Obj };
+    expect(body.result).toMatchObject({ id: "task-1", status: { state: "TASK_STATE_WORKING" } });
+  });
+
+  it("keeps a refusal's status and headers, with 1.0's error details", async () => {
+    const { agent } = await startGateway();
+    const res = await rpc10(agent, "SendMessage", send("message"), "1.0", { auth: false });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("www-authenticate")).toMatch(/Bearer/);
+    const body = (await res.json()) as { error: { code: number; data: Array<Record<string, unknown>> } };
+    expect(Array.isArray(body.error.data)).toBe(true);
+    expect(body.error.data[0]).toMatchObject({ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "UNAUTHORIZED" });
+    const missing = (await (await rpc10(agent, "GetTask", { id: "nope" })).json()) as { error: { code: number; data: Array<Record<string, unknown>> } };
+    expect(missing.error).toMatchObject({ code: -32001, data: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "TASK_NOT_FOUND", domain: "a2a-protocol.org" }] });
   });
 
   it("answers the 1.0 name ListTaskPushNotificationConfigs, as unsupported", async () => {
@@ -365,11 +403,14 @@ describe.skipIf(!PYTHON)("with the real a2a-sdk 1.1.0 (A2A_SDK_PYTHON)", () => {
     expect(out).toEqual({ text: "Hello, World! I have received your request (with a file)" });
   }, 60_000);
 
-  it("serves a 1.1.0 client: card, message, file, task, GetTask and a stream all parse", async () => {
+  it("serves a 1.1.0 client on both bindings: card, message, file, task, GetTask and a stream all parse", async () => {
     const { agent } = await startGateway();
     const steps = await runClient(agent);
-    for (const step of ["message", "file", "task", "get_task", "stream"]) {
-      expect(steps[step], `${step}: ${steps[step]?.error ?? "missing"}`).toMatchObject({ ok: true });
+    for (const prefix of ["", "rest_"]) {
+      for (const name of ["message", "file", "task", "get_task", "stream"]) {
+        const step = `${prefix}${name}`;
+        expect(steps[step], `${step}: ${steps[step]?.error ?? "missing"}`).toMatchObject({ ok: true });
+      }
     }
     expect(steps.message.result).toEqual([
       { message: { messageId: "e-msg", role: "ROLE_AGENT", parts: [{ text: "you said message" }] } },

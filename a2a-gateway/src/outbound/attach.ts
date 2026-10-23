@@ -147,6 +147,7 @@ export interface Attachment {
 
 const HEALTH_INTERVAL_MS = 60_000;
 const POLL_INTERVAL_MS = 2_000;
+const POLL_FIRST_MS = 250;
 const POLL_BUDGET_MS = 55_000;
 const DEFAULT_OUTBOUND_PER_MINUTE = 120;
 const DEFAULT_OUTBOUND_PER_CALLER_PER_MINUTE = 30;
@@ -402,6 +403,7 @@ async function awaitTask(
 ): Promise<unknown> {
   const deadline = Date.now() + POLL_BUDGET_MS;
   let current = task;
+  let polls = 0;
   while (true) {
     const state = a2aStateToMesh(current.status?.state ?? "");
     if (state === "completed") {
@@ -418,7 +420,9 @@ async function awaitTask(
     if (Date.now() > deadline) {
       throw new MeshError(ErrorCode.TRANSPORT_TIMEOUT, "Remote A2A task did not reach a terminal state in time");
     }
-    await sleep(POLL_INTERVAL_MS);
+    // Soon at first, then every POLL_INTERVAL_MS: a server that answered
+    // early (the 1.0 release candidate's default) is often done in moments.
+    await sleep(Math.min(POLL_INTERVAL_MS, POLL_FIRST_MS * 2 ** polls++));
     const resp = await rpcCall(rpcUrl, headers, "GetTask", { id: task.id });
     if (resp.error) {
       const mesh = rpcErrorToMesh(resp.error);

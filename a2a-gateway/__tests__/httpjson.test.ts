@@ -335,7 +335,7 @@ describe("POST message:stream (A2A §11.7)", () => {
       .split("\n\n")
       .filter((l) => l.startsWith("data:"))
       .map((l) => JSON.parse(l.slice(5)));
-    expect(events[0]).toEqual({ task: { id: "st-1", status: { state: "TASK_STATE_WORKING", timestamp: expect.any(String) } } });
+    expect(events[0]).toEqual({ task: { id: "st-1", contextId: "st-1", status: { state: "TASK_STATE_WORKING", timestamp: expect.any(String) } } });
     expect(events.some((e) => "jsonrpc" in e)).toBe(false);
     expect(events.at(-1)).toMatchObject({ statusUpdate: { taskId: "st-1", status: { state: "TASK_STATE_COMPLETED" } } });
     expect((events.at(-1) as { statusUpdate: Record<string, unknown> }).statusUpdate).not.toHaveProperty("final");

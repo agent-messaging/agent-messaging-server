@@ -60,6 +60,7 @@ import {
   rpcResult,
   A2A_PROTOCOL_VERSION,
   type A2ATask,
+  type JsonRpcError,
   type JsonRpcRequest,
   type JsonRpcResponse,
   type SendMessageParams,
@@ -436,18 +437,26 @@ function restShaper(unwrapTask: boolean): Shaper {
  *  shape. GetTask and CancelTask answer with the Task itself (a2a.proto:
  *  `rpc GetTask(GetTaskRequest) returns (Task)`). */
 function rpc10Shaper(unwrapTask: boolean): Shaper {
-  const shape = (parsed: unknown): unknown => {
-    const body = parsed as { result?: unknown } | null;
-    if (!body || typeof body !== "object" || body.result === undefined) return parsed;
+  const shape = (parsed: unknown, status = 200): unknown => {
+    const body = parsed as { result?: unknown; error?: JsonRpcError } | null;
+    if (!body || typeof body !== "object") return parsed;
+    if (body.error) {
+      // 1.0's `error.data` is a list of ProtoJSON `Any`s (A2A §9.5): the same
+      // google.rpc.ErrorInfo the HTTP+JSON binding sends, whose metadata
+      // carries what the gateway's own `data` object held.
+      const { data: _data, ...error } = body.error;
+      return { ...body, error: { ...error, data: rpcErrorToRest(body.error, status).body.error.details } };
+    }
+    if (body.result === undefined) return parsed;
     let result = body.result as { task?: unknown } | null;
     if (unwrapTask && result && typeof result === "object" && result.task !== undefined) result = result.task as { task?: unknown };
     return { ...body, result: resultToA2A10(result) };
   };
   return {
     unary(parsed, status, headers) {
-      return { http: status, body: shape(parsed), headers: { ...headers, "Content-Type": "application/json" } };
+      return { http: status, body: shape(parsed, status), headers: { ...headers, "Content-Type": "application/json" } };
     },
-    event: shape,
+    event: (parsed) => shape(parsed),
   };
 }
 
@@ -584,8 +593,9 @@ async function handleRpc(
     return json(res, 200, rpcError(id, RpcCode.INVALID_REQUEST, "Not a JSON-RPC 2.0 request"));
   }
 
-  // Version negotiation (BRIDGE-A2A.md §3).
-  const versionHeader = header(req, "a2a-version")?.trim();
+  // Version negotiation (BRIDGE-A2A.md §3). A2A 1.0 lets the version ride as
+  // a request parameter instead of the header.
+  const versionHeader = requestedVersion(header(req, "a2a-version"), new URL(req.url ?? "/", "http://gateway"));
   if (versionHeader && !SUPPORTED_A2A_VERSIONS.has(versionHeader)) {
     return json(res, 200, rpcError(id, RpcCode.VERSION_NOT_SUPPORTED, `A2A version ${versionHeader} is not supported; supported: ${[...SUPPORTED_A2A_VERSIONS].join(", ")}`));
   }
@@ -994,13 +1004,14 @@ async function sendStreamingMessage(
   const tap = (outcome: "ok" | "error") =>
     tapInbound(bridge, callerKey, { responder: manifest.id, offering: prep.skill, outcome, startedAt });
 
+  const askedContext = typeof params?.message?.contextId === "string" && params.message.contextId ? params.message.contextId : undefined;
   let stream;
   try {
     stream = await requester.requestStream(
       manifest.id,
       prep.skill,
       prep.input,
-      withAttribution(bridge, callerKey, { timeout_ms: 60_000 }),
+      withAttribution(bridge, callerKey, { timeout_ms: 60_000, ...(askedContext ? { context_id: askedContext } : {}) }),
     );
   } catch (err) {
     // Queued for an attended session: one event, the submitted task, and the
@@ -1029,7 +1040,11 @@ async function sendStreamingMessage(
   };
 
   const taskId = stream.task_id;
-  const task: A2ATask = { id: taskId, status: { state: "working", timestamp: new Date().toISOString() } };
+  // A2A 1.0 requires a context on every stream event. The caller's, when it
+  // named one; otherwise the task is a context of its own, as a server that
+  // generates one per new task would say.
+  const contextId = askedContext ?? taskId;
+  const task: A2ATask = { id: taskId, contextId, status: { state: "working", timestamp: new Date().toISOString() } };
   bridge.putTask({ task, responder: manifest.id, callerKey });
   send({ task });
 
@@ -1040,13 +1055,14 @@ async function sendStreamingMessage(
       send({
         artifactUpdate: {
           taskId,
+          contextId,
           artifact: { artifactId: `${taskId}-${chunk.chunk_index}`, parts: outputToParts(await linkFiles(chunk.data, meshLinker(requester))) },
         },
       });
       if (chunk.final) {
         const status = { state: "completed" as const, timestamp: new Date().toISOString() };
         bridge.updateTask(taskId, { ...task, status });
-        send({ statusUpdate: { taskId, status, final: true } });
+        send({ statusUpdate: { taskId, contextId, status, final: true } });
       }
     }
     tap("ok");

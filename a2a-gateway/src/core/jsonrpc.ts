@@ -152,5 +152,5 @@ export type SendMessageResult = { task: A2ATask } | { message: A2AMessage };
 export type StreamEvent =
   | { task: A2ATask }
   | { message: A2AMessage }
-  | { artifactUpdate: { taskId: string; artifact: A2AArtifact } }
-  | { statusUpdate: { taskId: string; status: A2ATaskStatus; final: boolean } };
+  | { artifactUpdate: { taskId: string; contextId?: string; artifact: A2AArtifact } }
+  | { statusUpdate: { taskId: string; contextId?: string; status: A2ATaskStatus; final: boolean } };
