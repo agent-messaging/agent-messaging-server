@@ -1,0 +1,53 @@
+name: npm publish
+
+# Publishes a released SDK tarball to npm, exactly as attached to its GitHub
+# release (tag sdk-v<version>). Run by hand. It needs the repository secret
+# NPM_TOKEN, an npm token with publish rights to the agent-messaging package.
+# If the token may only stage, the version is staged for a maintainer to
+# promote on npmjs.com.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, such as sdk-v0.63.0"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+      - name: Download the release tarball and check its digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p '*.tgz' -p '*.tgz.sha256'
+          for f in *.tgz; do
+            want=$(cut -d' ' -f1 "$f.sha256"); have=$(sha256sum "$f" | cut -d' ' -f1)
+            [ "$want" = "$have" ] || { echo "::error::$f digest mismatch"; exit 1; }
+          done
+          ls -la
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          [ -n "$NODE_AUTH_TOKEN" ] || { echo "::error::NPM_TOKEN is not set"; exit 1; }
+          for f in *.tgz; do
+            if npm publish "./$f" --access public 2>err.txt; then continue; fi
+            cat err.txt
+            if grep -q EOTP err.txt; then
+              echo "Direct publish needs 2FA; staging instead."
+              npx -y npm@latest stage publish "./$f" --access public
+            else
+              exit 1
+            fi
+          done
