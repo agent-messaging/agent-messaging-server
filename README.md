@@ -124,8 +124,8 @@ docker compose up -d
 ```
 
 The first start pulls the two released images `compose.yaml` pins
-(`ghcr.io/agent-messaging/agent-messaging-server:0.4.4` and
-`ghcr.io/agent-messaging/agent-messaging-a2a-gateway:0.4.4`; to build them
+(`ghcr.io/agent-messaging/agent-messaging-server:0.4.5` and
+`ghcr.io/agent-messaging/agent-messaging-a2a-gateway:0.4.5`; to build them
 from this clone instead, see [deploy/compose/nats](deploy/compose/nats/README.md)), runs first-run setup
 once (the operator key, the signing keys, the broker's settings and the first
 admin token, all in the Compose volume `config`), and starts NATS, the server
