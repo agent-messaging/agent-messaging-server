@@ -1181,6 +1181,12 @@ async function handleAdmin(
         abandoned: settlements.filter((s) => s.state === "abandoned").length,
       });
     }
+    // The owner's statement, replaced whole. The body IS the statement
+    // ({ refusals?, records? }); an empty body clears it.
+    const statementMatch = path.match(/^\/admin\/attachments\/([^/]+)\/statement$/);
+    if (req.method === "PUT" && statementMatch) {
+      return json(res, 200, await manager.setStatement(statementMatch[1], await readJsonOrEmpty(req)));
+    }
     const approveMatch = path.match(/^\/admin\/attachments\/([^/]+)\/approve$/);
     if (req.method === "POST" && approveMatch) {
       return json(res, 200, await manager.approve(approveMatch[1]));
@@ -1205,6 +1211,18 @@ async function handleAdmin(
   } catch (err) {
     if (err instanceof AdminError) return json(res, err.status, { error: err.message });
     throw err;
+  }
+}
+
+/** readJson, except that a body with nothing in it reads as no value at all
+ *  rather than as malformed JSON. */
+async function readJsonOrEmpty(req: IncomingMessage): Promise<unknown> {
+  const raw = await readBody(req);
+  if (raw.trim() === "") return undefined;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new AdminError(400, "body must be JSON");
   }
 }
 

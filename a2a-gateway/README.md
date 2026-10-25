@@ -46,6 +46,18 @@ says so at start.
 answer only callers on the gateway's own host that did not come through a
 proxy.
 
+**An attached agent's owner can say what its card cannot**: what it refuses
+to do, and what records it keeps of each task. Send `statement: { refusals,
+records }` with `POST /admin/attachments`, or replace it later with `PUT
+/admin/attachments/:id/statement` (an empty body clears it). `refusals` is up
+to 2000 characters of prose; `records` is up to 20 distinct names of up to 120
+characters each. While a statement is set, the gateway puts an
+`agent-descriptor-v1` descriptor to the registry as the attached agent's own
+identity each time the agent comes up, built from the card, the exposed
+offerings and the statement. The record shows when that last worked
+(`descriptorPublishedAt`) or why it did not (`descriptorError`); a failed put
+never takes the agent off the mesh.
+
 ## Development
 
 ```sh
