@@ -65,6 +65,17 @@ export interface AttachmentPolicy {
   rateCredits: number;
 }
 
+/**
+ * The owner's statement: the part of an Agent Descriptor that only the owner
+ * can write, because an A2A card has no place for it. `refusals` is prose
+ * (what the agent will not do); `records` names what the agent keeps of each
+ * task. Both are optional; a statement with neither is stored as null.
+ */
+export interface AttachmentStatement {
+  refusals?: string;
+  records?: string[];
+}
+
 export interface AttachmentRecord {
   id: string;
   /** The account standing behind this attachment. Null for operator-side
@@ -92,6 +103,20 @@ export interface AttachmentRecord {
    *  see them without a usage-ingest service existing yet. The emitted events
    *  remain the ledger; these are the odometer. */
   usage?: { requests: number; errors: number; lastAt: string | null };
+  /** What the owner says about the agent that its card cannot: what it
+   *  refuses to do, and what records it keeps of the work. Null (or absent,
+   *  on a record written before the field existed) means the owner has said
+   *  nothing, and the gateway publishes no descriptor for the attachment.
+   *  Shaped and checked by descriptor.ts; set at create time or replaced
+   *  whole with PUT /admin/attachments/:id/statement. */
+  statement?: AttachmentStatement | null;
+  /** When the registry last accepted a descriptor for this attachment's
+   *  identity. Null or absent: none has been published from here. */
+  descriptorPublishedAt?: string | null;
+  /** Why the last descriptor put failed, in the registry's (or the
+   *  transport's) words. Null after a put that worked. A failed put never
+   *  takes the attachment off the mesh; this is where it shows instead. */
+  descriptorError?: string | null;
   state: AttachmentState;
   createdAt: string;
   updatedAt: string;
@@ -122,6 +147,7 @@ export function newRecord(fields: {
   policy?: Partial<AttachmentPolicy>;
   headers?: Record<string, string>;
   identitySeed: string;
+  statement?: AttachmentStatement | null;
 }): AttachmentRecord {
   const now = new Date().toISOString();
   return {
@@ -136,6 +162,9 @@ export function newRecord(fields: {
     headers: fields.headers,
     identitySeed: fields.identitySeed,
     agentId: null,
+    statement: fields.statement ?? null,
+    descriptorPublishedAt: null,
+    descriptorError: null,
     state: "active",
     createdAt: now,
     updatedAt: now,
@@ -171,6 +200,9 @@ export class FileAttachmentStore implements AttachmentStore {
             delete legacy.priceCredits;
           }
           rec.policy = { ...DEFAULT_POLICY, ...rec.policy };
+          // Records written before owners could make a statement have no
+          // field at all; that reads as "nothing said", the same as null.
+          rec.statement ??= null;
           this.records.set(rec.id, rec);
         }
       } catch (err) {
