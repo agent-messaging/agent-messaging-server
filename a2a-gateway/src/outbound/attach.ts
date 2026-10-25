@@ -277,6 +277,11 @@ export async function attach(bridge: Bridge, config: AttachConfig): Promise<Atta
       // the mesh id) is preserved; without one it is minted fresh, as before.
       const fresh = await attach(bridge, config);
       attachment.agent = fresh.agent;
+      // The card the fresh registration was built from, so anything that
+      // describes this attachment afterwards (its descriptor) describes the
+      // registration that is actually up.
+      attachment.card = fresh.card;
+      attachment.rpcUrl = fresh.rpcUrl;
       attachment.detach = fresh.detach;
       clearInterval(healthTimer);
       try {

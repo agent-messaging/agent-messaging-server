@@ -88,7 +88,7 @@ interface Put {
 
 /** A bridge whose hosted agents record registrations and service requests.
  *  `failPuts` makes the registry refuse every descriptor. */
-function fakeBridge(opts: { failPuts?: boolean } = {}) {
+function fakeBridge(opts: { failPuts?: boolean; registerGate?: Promise<void> } = {}) {
   const registered: string[] = [];
   const puts: Put[] = [];
   const keys = new Map<string, string>();
@@ -104,6 +104,7 @@ function fakeBridge(opts: { failPuts?: boolean } = {}) {
         onRequest: () => undefined,
         register: async () => {
           registered.push(id);
+          await opts.registerGate;
         },
         deregister: async () => undefined,
         serviceRequest: async (subject: string, payload: { descriptor: string }) => {
@@ -269,6 +270,60 @@ describe("the statement on an attachment", () => {
     await m.stop();
   });
 
+  it("puts the descriptor again when a changed card is approved", async () => {
+    const remote = await startRemote();
+    const fb = fakeBridge();
+    const store = new FileAttachmentStore(tmpStorePath());
+    const m = new AttachmentManager(fb.bridge, store);
+    const rec = await m.create({ url: remote, statement: { refusals: "No medical advice." } });
+    const stored = (await store.get(rec.id))!;
+    stored.pendingCard = card(remote) as never;
+    stored.state = "review";
+    await m.approve(rec.id);
+    expect(fb.puts).toHaveLength(2);
+    expect(fb.puts[1].doc.refusals).toBe("No medical advice.");
+    await m.stop();
+  });
+
+  it("does not put while the health probe has the agent off the mesh, and puts on recovery", async () => {
+    const remote = await startRemote();
+    const fb = fakeBridge();
+    const m = new AttachmentManager(fb.bridge, new FileAttachmentStore(tmpStorePath()));
+    const rec = await m.create({ url: remote, statement: { refusals: "No medical advice." } });
+    const live = (m as unknown as { live: Map<string, { healthy: boolean }> }).live;
+    live.get(rec.id)!.healthy = false;
+    const changed = await m.setStatement(rec.id, { refusals: "No legal advice." });
+    expect(changed.statement).toEqual({ refusals: "No legal advice." });
+    expect(fb.puts).toHaveLength(1);
+
+    live.get(rec.id)!.healthy = true;
+    await (m as unknown as { recordHealth(id: string, h: boolean): Promise<void> }).recordHealth(rec.id, true);
+    expect(fb.puts).toHaveLength(2);
+    expect(fb.puts[1].doc.refusals).toBe("No legal advice.");
+    await m.stop();
+  });
+
+  it("a statement PUT while the attachment is still coming up is the one that stands", async () => {
+    const remote = await startRemote();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const fb = fakeBridge({ registerGate: gate });
+    const m = new AttachmentManager(fb.bridge, new FileAttachmentStore(tmpStorePath()));
+    const creating = m.create({ url: remote, statement: { refusals: "Old words." } });
+    while (fb.registered.length === 0) await new Promise((r) => setTimeout(r, 5));
+    const [pending] = await m.list();
+    const changed = await m.setStatement(pending.id, { refusals: "New words." });
+    expect(fb.puts).toHaveLength(0); // nothing live yet, so it only stored
+    release();
+    const rec = await creating;
+    expect(rec.statement).toEqual({ refusals: "New words." });
+    expect(changed.statement).toEqual({ refusals: "New words." });
+    expect(fb.puts).toHaveLength(1);
+    expect(fb.puts[0].doc.refusals).toBe("New words.");
+    expect((await m.get(rec.id))?.statement).toEqual({ refusals: "New words." });
+    await m.stop();
+  });
+
   it("refuses a bad statement at create, before anything is stored", async () => {
     const remote = await startRemote();
     const fb = fakeBridge();
@@ -404,7 +459,14 @@ describe("the statement on the admin surface", () => {
     const bad = await put(`${base}/admin/attachments/${rec.id}/statement`, JSON.stringify({ records: "chat log" }));
     expect(bad.status).toBe(422);
 
+    const notJson = await put(`${base}/admin/attachments/${rec.id}/statement`, "{refusals:");
+    expect(notJson.status).toBe(422);
+
     const missing = await put(`${base}/admin/attachments/no-such-id/statement`, "{}");
     expect(missing.status).toBe(404);
+
+    await fetch(`${base}/admin/attachments/${rec.id}`, { method: "DELETE" });
+    const detached = await put(`${base}/admin/attachments/${rec.id}/statement`, "{}");
+    expect(detached.status).toBe(404);
   });
 });

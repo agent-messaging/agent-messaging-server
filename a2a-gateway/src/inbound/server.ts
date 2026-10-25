@@ -1214,15 +1214,17 @@ async function handleAdmin(
   }
 }
 
-/** readJson, except that a body with nothing in it reads as no value at all
- *  rather than as malformed JSON. */
+/** The statement route's body read: a body with nothing in it is no value at
+ *  all (which clears the statement), and a body that is not JSON is invalid
+ *  input like any other bad statement, so it answers 422 rather than the 400
+ *  the older routes give. */
 async function readJsonOrEmpty(req: IncomingMessage): Promise<unknown> {
   const raw = await readBody(req);
   if (raw.trim() === "") return undefined;
   try {
     return JSON.parse(raw);
   } catch {
-    throw new AdminError(400, "body must be JSON");
+    throw new AdminError(422, "The statement must be JSON.");
   }
 }
 
