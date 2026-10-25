@@ -6,8 +6,8 @@ One host, one command:
 docker compose up -d
 ```
 
-It pulls the released images, `ghcr.io/agent-messaging/agent-messaging-server:0.4.4`
-and `ghcr.io/agent-messaging/agent-messaging-a2a-gateway:0.4.4`, which
+It pulls the released images, `ghcr.io/agent-messaging/agent-messaging-server:0.4.5`
+and `ghcr.io/agent-messaging/agent-messaging-a2a-gateway:0.4.5`, which
 `compose.yaml` pins.
 
 ## What starts
@@ -37,7 +37,7 @@ files take effect on the first start only.
 | `MESH_PUBLIC_URL` | `http://localhost:<SERVER_PORT>` | Where agents reach the credential doors (first start only). |
 | `GATEWAY_PUBLIC_URL` | `http://localhost:<GATEWAY_PORT>` | The address written into the agent cards the gateway serves. |
 | `GATEWAY_API_KEYS` | none | `key=label` pairs for A2A callers. With none, every inbound A2A call is refused until the gateway's operator makes a key. |
-| `SERVER_IMAGE`, `GATEWAY_IMAGE` | `ghcr.io/agent-messaging/agent-messaging-server:0.4.4`, `ghcr.io/agent-messaging/agent-messaging-a2a-gateway:0.4.4` | The images, the latest release by default. Set both to another release's, such as `ghcr.io/agent-messaging/agent-messaging-server:<version>`. |
+| `SERVER_IMAGE`, `GATEWAY_IMAGE` | `ghcr.io/agent-messaging/agent-messaging-server:0.4.5`, `ghcr.io/agent-messaging/agent-messaging-a2a-gateway:0.4.5` | The images, the latest release by default. Set both to another release's, such as `ghcr.io/agent-messaging/agent-messaging-server:<version>`. |
 
 To upgrade, change the version in `compose.yaml` or set `SERVER_IMAGE` and `GATEWAY_IMAGE` to the new release's images, then run `docker compose pull && docker compose up -d` (back up first: [operator handbook, upgrading](../../../docs/operator-handbook.md#9-upgrading)).
 
