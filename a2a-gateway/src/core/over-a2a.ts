@@ -28,6 +28,9 @@ export interface OverA2AMetadata {
   readable_text?: boolean;
   /** A knock (EXT-14 §9): asks to be let in, with only `via` and `grants`. */
   knock?: unknown;
+  /** The budget for the work (Agent Messaging §7.7), from a caller with no
+   *  key; a signed caller puts it in its envelope (EXT-14 §11). */
+  budget?: unknown;
 }
 
 /** The extension's entry in a generated card's `capabilities.extensions[]`. */
@@ -36,7 +39,7 @@ export function overA2ACardExtension(): { uri: string; description: string; requ
     uri: OVER_A2A_URI,
     description: OVER_A2A_DESCRIPTION,
     required: false,
-    params: { signed_envelope: true, readable_text: true },
+    params: { signed_envelope: true, readable_text: true, budget: true },
   };
 }
 

@@ -44,7 +44,9 @@ export function meshErrorToRpc(err: unknown): MappedRpcError {
       error: {
         code: mapped.rpcCode,
         message: err.message,
-        data: { agentmesh_code: err.code },
+        // A budget refusal carries its estimate and spend (Agent Messaging
+        // §7.7), which the caller needs to decide whether to try again.
+        data: { agentmesh_code: err.code, ...(String(err.code).startsWith("BUDGET_") && err.details ? { details: err.details } : {}) },
       },
     };
   }
