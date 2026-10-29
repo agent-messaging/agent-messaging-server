@@ -756,13 +756,13 @@ async function handleRpc(
     }
   }
 
-  // Agent Messaging over A2A (§16): a caller that signed its own request is
+  // Agent Messaging over A2A (EXT-14): a caller that signed its own request is
   // passed through on its own signature. No hosted identity is minted for it.
   const sendParams = rpc.method === "SendMessage" || rpc.method === "SendStreamingMessage" ? (rpc.params as SendMessageParams | undefined) : undefined;
   const carried = carriedEnvelope(sendParams?.message);
   if (carried !== undefined) {
     if (rpc.method === "SendStreamingMessage") {
-      return json(res, 200, rpcError(id, RpcCode.UNSUPPORTED_OPERATION, "A signed request (Agent Messaging over A2A) is carried on SendMessage only in this version (MAPPING.md §16)"));
+      return json(res, 200, rpcError(id, RpcCode.UNSUPPORTED_OPERATION, "A signed request (Agent Messaging over A2A) is carried on SendMessage only in this version (EXT-14 (messaging/extensions/EXT-14-agent-messaging-over-a2a.md))"));
     }
     return sendSigned(bridge, res, id, sendParams!, manifest, callerKey, carried);
   }
@@ -949,7 +949,7 @@ async function sendMessage(
   manifest: Manifest,
   requester: AgentMesh,
   callerKey: string,
-  /** The caller activated Agent Messaging over A2A (§16): its results carry
+  /** The caller activated Agent Messaging over A2A (EXT-14): its results carry
    *  the agent's own signed envelope. */
   activated = false,
 ): Promise<void> {
@@ -1016,7 +1016,7 @@ async function sendMessage(
   }
 }
 
-// ─── Agent Messaging over A2A: a signed request (§16) ────────────────
+// ─── Agent Messaging over A2A: a signed request (EXT-14) ────────────────
 
 /** CancelTask params: the task id, and (for a signed task) the caller's own
  *  signed `task.cancel` request in the extension's metadata. */
@@ -1025,13 +1025,13 @@ interface CancelParams {
   metadata?: Record<string, unknown>;
 }
 
-/** The typed refusal of a carried envelope (§16.2): nothing is relayed. */
+/** The typed refusal of a carried envelope (EXT-14 §4): nothing is relayed. */
 function refuseCarried(res: ServerResponse, id: JsonRpcRequest["id"], reason: string, message: string): void {
   json(res, 200, rpcError(id, RpcCode.INVALID_PARAMS, message, { agentmesh_code: "INVALID_ENVELOPE", reason }));
 }
 
 /**
- * A request the caller signed itself (§16): checked, relayed unchanged, and
+ * A request the caller signed itself (EXT-14): checked, relayed unchanged, and
  * answered with the agent's own signed envelope beside the A2A result.
  */
 async function sendSigned(
@@ -1110,7 +1110,7 @@ async function sendSigned(
 }
 
 /**
- * A cancel of a task the caller signed for (§16.4). The gateway holds no
+ * A cancel of a task the caller signed for (EXT-14 §7). The gateway holds no
  * identity for that caller, so the cancel too must be the caller's own signed
  * `task.cancel` request, carried in the extension's metadata.
  */
@@ -1123,7 +1123,7 @@ async function cancelSigned(
 ): Promise<void> {
   const carried = (params.metadata?.[OVER_A2A_URI] as { envelope?: unknown } | undefined)?.envelope;
   if (carried === undefined) {
-    return json(res, 200, rpcError(id, RpcCode.TASK_NOT_CANCELABLE, "This task was requested with a signed envelope; cancel it with your own signed task.cancel request in metadata (MAPPING.md §16.4)", { agentmesh_code: "SIGNED_CANCEL_REQUIRED" }));
+    return json(res, 200, rpcError(id, RpcCode.TASK_NOT_CANCELABLE, "This task was requested with a signed envelope; cancel it with your own signed task.cancel request in metadata (EXT-14 §7)", { agentmesh_code: "SIGNED_CANCEL_REQUIRED" }));
   }
   const env = carried as Envelope;
   const input = ((env?.payload as { input?: unknown } | undefined)?.input ?? {}) as { task_id?: unknown };

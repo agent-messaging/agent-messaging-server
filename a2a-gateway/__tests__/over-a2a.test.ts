@@ -1,5 +1,5 @@
 /**
- * Agent Messaging over A2A (MAPPING.md §16) and readable text (§8.4, Agent
+ * Agent Messaging over A2A (EXT-14 (messaging/extensions/EXT-14-agent-messaging-over-a2a.md)) and readable text (§8.4, Agent
  * Messaging §5.8).
  *
  * A caller that holds an Agent Messaging key signs its own request and carries

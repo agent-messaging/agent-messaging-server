@@ -1,5 +1,5 @@
 /**
- * Agent Messaging over A2A (MAPPING.md §16): the A2A extension that carries a
+ * Agent Messaging over A2A (EXT-14 (messaging/extensions/EXT-14-agent-messaging-over-a2a.md)): the A2A extension that carries a
  * signed Agent Messaging envelope across the HTTPS leg, so a caller that holds
  * an Agent Messaging key signs its own request end to end and the gateway
  * passes it through instead of signing for a hosted identity. The answer comes
@@ -58,14 +58,14 @@ export function carriedEnvelope(message: A2AMessage | undefined): unknown {
 }
 
 export type CarriedRefusal = {
-  /** Why the carried envelope was refused, closed set (MAPPING.md §16.2). */
+  /** Why the carried envelope was refused, closed set (EXT-14 §4). */
   reason: "malformed" | "signature" | "type" | "addressee" | "stale" | "offering" | "mismatch";
   message: string;
 };
 
 /**
  * The checks a gateway runs on a carried request before it relays it
- * (MAPPING.md §16.2). Any failure refuses the call and relays nothing.
+ * (EXT-14 §4). Any failure refuses the call and relays nothing.
  */
 export function checkCarriedRequest(
   carried: unknown,

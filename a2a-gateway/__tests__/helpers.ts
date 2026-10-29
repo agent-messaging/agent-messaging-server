@@ -48,7 +48,7 @@ export interface FakeMesh {
   /** The default handler each hosted identity registered, by agent id: the
    *  seam a test uses to deliver a late reply to a caller identity. */
   defaultHandlers: Map<string, (input: unknown, ctx: unknown) => unknown>;
-  /** Envelopes the node relayed unchanged (Agent Messaging over A2A, §16). */
+  /** Envelopes the node relayed unchanged (Agent Messaging over A2A, EXT-14). */
   relayed: Array<Record<string, unknown>>;
   /** Live watches by subject (MeshNode.watchEnvelopes). */
   watchers: Map<string, Array<(env: unknown) => void>>;

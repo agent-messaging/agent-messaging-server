@@ -268,7 +268,7 @@ export function manifestToCard(
           required: false,
           params: { direction: "inbound", agent_id: manifest.id },
         },
-        // Agent Messaging over A2A (§16): a caller with its own key may sign.
+        // Agent Messaging over A2A (EXT-14): a caller with its own key may sign.
         overA2ACardExtension(),
         // Messages for the person (§8.4): listed exactly when the agent declares it.
         ...(declaresExtension(manifest, AUDIENCE_URI) ? [{ uri: AUDIENCE_URI, description: AUDIENCE_DESCRIPTION, required: false }] : []),

@@ -128,7 +128,7 @@ interface TaskRecord {
    *  arrives later at the caller identity's inbox, and this record is what
    *  the reply completes. */
   queued?: { inbox_id: string | null };
-  /** Present when the caller signed the request itself (§16): the caller's
+  /** Present when the caller signed the request itself (EXT-14): the caller's
    *  agent ID. A later act on the task (a cancel, an answer) has to be signed
    *  by the same key, because the gateway holds no identity for it. */
   signer?: string;
@@ -924,7 +924,7 @@ export class Bridge {
     return { received: true };
   }
 
-  // ─── Agent Messaging over A2A: a caller's own signed request (§16) ──
+  // ─── Agent Messaging over A2A: a caller's own signed request (EXT-14) ──
 
   /** The one key besides an addressed agent that may answer for it: the
    *  mesh's admission service, whose benign queued ack (EXT-6 §7) stands in
@@ -934,7 +934,7 @@ export class Bridge {
 
   /**
    * Pass a caller's own signed request through to the mesh, unchanged, and
-   * wait for the answer at the caller's inbox (MAPPING.md §16.3). Nothing is
+   * wait for the answer at the caller's inbox (EXT-14 §5). Nothing is
    * signed here and no hosted identity is used: the envelope travels on the
    * caller's signature and the receiver checks it like any native message.
    *

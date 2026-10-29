@@ -133,7 +133,7 @@ export interface A2ATask {
   contextId?: string;
   status: A2ATaskStatus;
   artifacts?: A2AArtifact[];
-  /** A2A Task metadata: where an extension's data rides (§16). */
+  /** A2A Task metadata: where an extension's data rides (EXT-14). */
   metadata?: Record<string, unknown>;
 }
 
