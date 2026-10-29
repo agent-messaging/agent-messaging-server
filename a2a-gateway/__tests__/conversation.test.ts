@@ -132,10 +132,21 @@ describe("the conversation and the knock", () => {
     expect(out.result.task.status.message.parts[0].text).toMatch(/has not let you in/);
   });
 
-  it("a queue at the agent's own node stays a submitted task", async () => {
+  it("a hold at the agent's own door gets the same answer as the mesh's door", async () => {
     const { mesh, port } = await boot();
     mesh.answer = (req: FakeRequest) => {
-      (req.config as { onQueued?: (ack: unknown, env: unknown) => void }).onQueued?.({ queued: true, inbox_id: "i-1" }, { from: AGENT });
+      (req.config as { onQueued?: (ack: unknown, env: unknown) => void }).onQueued?.({ queued: true, inbox_id: "i-1" }, { from: AGENT, payload: { status: "completed", output: { queued: true, inbox_id: "i-1", text: "Sent; it reaches Quote if Quote admits you." } } });
+      throw new MeshError(ErrorCode.REQUEST_QUEUED, "queued", { details: { queued: true, inbox_id: "i-1", request_id: "r-3" } });
+    };
+    const out = await rpc(port, "SendMessage", say("Quote"));
+    expect(out.result.task.status.state).toBe("auth-required");
+    expect(out.result.task.metadata["agentmesh.admission"]).toBe("held");
+  });
+
+  it("a message put in the agent's inbox stays a submitted task", async () => {
+    const { mesh, port } = await boot();
+    mesh.answer = (req: FakeRequest) => {
+      (req.config as { onQueued?: (ack: unknown, env: unknown) => void }).onQueued?.({ queued: true, inbox_id: "i-1" }, { from: AGENT, payload: { status: "completed", output: { queued: true, inbox_id: "i-1", delivered: true } } });
       throw new MeshError(ErrorCode.REQUEST_QUEUED, "queued", { details: { queued: true, inbox_id: "i-1", request_id: "r-2" } });
     };
     expect((await rpc(port, "SendMessage", say("Quote"))).result.task.status.state).toBe("submitted");

@@ -26,7 +26,7 @@ export interface OverA2AMetadata {
   /** On a text part: this part is the readable text generated from the
    *  envelope beside it (Agent Messaging §5.8). */
   readable_text?: boolean;
-  /** A knock (EXT-14 §8): asks to be let in, with only `via` and `grants`. */
+  /** A knock (EXT-14 §9): asks to be let in, with only `via` and `grants`. */
   knock?: unknown;
 }
 
@@ -149,7 +149,7 @@ export async function readableTextFor(sender: string, text: string): Promise<{ v
   return readableTextMeta(personReadableText({ sender, text }));
 }
 
-// ─── The conversation and the knock (EXT-14 §7, §8) ────────────────────
+// ─── The conversation and the knock (EXT-14 §8, §9) ────────────────────
 
 /**
  * A2A task-status fields for a mesh state. A2A has no `exhausted`; the
@@ -182,3 +182,18 @@ export const HELD_SENTENCE =
 /** The answer to a knock from a caller the door has not let in. */
 export const KNOCK_SENTENCE =
   "Your knock is with this agent's owner. You are not let in yet, or there is no such agent; the answer is the same either way. Nothing more is needed from you: send your message again once you are let in.";
+
+/**
+ * Whether a queued acknowledgement means the agent's door has not let the
+ * caller in (EXT-14 §9). A door that holds or blocks a sender answers with
+ * the same words and without `delivered`, whether the agent's own node or the
+ * mesh's admission service signs it; only a message put in the agent's inbox
+ * says `delivered: true`, and a paused agent says `paused: true`. So the
+ * signer is never the test, which keeps a block from looking unlike a hold.
+ */
+export function doorHeld(ack: Pick<Envelope, "payload"> | undefined): boolean {
+  if (!ack) return false;
+  const p = (ack.payload ?? {}) as Record<string, unknown>;
+  const c = (p.output && typeof p.output === "object" ? p.output : p) as Record<string, unknown>;
+  return !(c.delivered === true || c.paused === true);
+}
