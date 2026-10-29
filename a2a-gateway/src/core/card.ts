@@ -4,8 +4,19 @@
 import type { Manifest, Offering } from "../../../sdk-typescript/src/types/manifest.js";
 import type { CallerKind } from "../inbound/identity-store.js";
 import { A2A_PROTOCOL_VERSION } from "./jsonrpc.js";
+import { overA2ACardExtension } from "./over-a2a.js";
 
 export const BRIDGE_EXTENSION_URI = "mesh://extensions/a2a-bridge/v1";
+
+/** Agent Messaging §5.7: messages for the person behind an agent (§8.4). */
+export const AUDIENCE_URI = "mesh://extensions/audience/v1";
+export const AUDIENCE_DESCRIPTION = "Messages for the person behind this agent (Agent Messaging §5.7): a marked message reaches the person and never the agent's model.";
+
+/** Whether a manifest declares an extension URI. */
+export function declaresExtension(manifest: Pick<Manifest, "extensions">, uri: string): boolean {
+  const exts = Array.isArray(manifest.extensions) ? manifest.extensions : [];
+  return exts.some((e) => e && typeof e === "object" && (e as { uri?: unknown }).uri === uri);
+}
 export const BRIDGE_EXTENSION_DESCRIPTION =
   "This agent is bridged from/to the A2A protocol; mesh signatures are the bridge node's vouch, not the far party's.";
 
@@ -257,6 +268,10 @@ export function manifestToCard(
           required: false,
           params: { direction: "inbound", agent_id: manifest.id },
         },
+        // Agent Messaging over A2A (§16): a caller with its own key may sign.
+        overA2ACardExtension(),
+        // Messages for the person (§8.4): listed exactly when the agent declares it.
+        ...(declaresExtension(manifest, AUDIENCE_URI) ? [{ uri: AUDIENCE_URI, description: AUDIENCE_DESCRIPTION, required: false }] : []),
       ],
     },
     defaultInputModes: defaulted(manifest.default_input_modes),

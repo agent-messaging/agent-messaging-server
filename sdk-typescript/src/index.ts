@@ -1057,3 +1057,18 @@ export { capabilitiesReader, meshOffers, notAvailableRefusal, CAPABILITIES_TTL_M
 // client, and the helpers for an agent that serves a business. One namespace,
 // so none of its names meets one already exported here.
 export * as pact from "./pact/index.js";
+// Readable text generated from a signed message (Agent Messaging §5.8): the
+// normalization, the digest, the text for a message written to a person, and
+// the check software runs before it shows such text.
+export {
+  READABLE_TEXT_VERSION,
+  normalizeReadableText,
+  readableTextDigest,
+  readableTextMeta,
+  personReadableText,
+  fileNamesOf,
+  signedReadableDigest,
+  checkReadableText,
+  type ReadableTextMeta,
+  type ReadableTextCheck,
+} from "./readable-text.js";

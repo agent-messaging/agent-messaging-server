@@ -4,9 +4,11 @@ import type { Availability, NodeDeclaredProfile } from "./types/manifest.js";
 import type { ConnectOptions, SecurityWarning } from "./types/options.js";
 import { ConnectionManager } from "./internal/connection.js";
 import { createEnvelope } from "./internal/envelope-builder.js";
-import { signEnvelope, type KeyPair } from "./internal/identity.js";
+import { signEnvelope, verifyEnvelopeSig, type KeyPair } from "./internal/identity.js";
 import { withDetectedDevice } from "./internal/device-profile.js";
-import { encode } from "./internal/codec.js";
+import { decode, encode } from "./internal/codec.js";
+import type { Envelope } from "./types/envelope.js";
+import { MeshError, ErrorCode } from "./types/errors.js";
 import { Subjects } from "./internal/subjects.js";
 import { setUnrefInterval, type TimerHandle } from "./internal/timers.js";
 import { vouchCheckIntervalMs } from "./internal/vouch.js";
@@ -400,6 +402,57 @@ export class MeshNode {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
     }
+  }
+
+  // ─── Relaying envelopes another key signed ─────────────────────────
+
+  /**
+   * Publish an envelope that another key signed, unchanged, to the inbox of
+   * the agent its `to` names. The node adds nothing and signs nothing: the
+   * envelope travels on its own signature, which is checked here first, so
+   * the node never carries something no receiver would accept.
+   *
+   * This is how a gateway passes a caller's own signed request through to
+   * the mesh instead of signing for it (the A2A Bridge's Agent Messaging
+   * over A2A extension). The caller's key is not hosted here; the answers to
+   * it arrive at its inbox, which `watchEnvelopes` reads.
+   */
+  relayEnvelope(env: Envelope): void {
+    if (this._closed) throw new Error("MeshNode is closed");
+    if (!env || typeof env.to !== "string" || !env.to) {
+      throw new MeshError(ErrorCode.INVALID_ENVELOPE, "A relayed envelope must name its addressee in `to`");
+    }
+    if (!verifyEnvelopeSig(env)) {
+      throw new MeshError(ErrorCode.IDENTITY_MISMATCH, `The relayed envelope's signature does not verify against 'from' (${env.from})`);
+    }
+    this.conn.publish(Subjects.agentInbox(env.to), encode(env));
+  }
+
+  /**
+   * Watch a subject for envelopes: an inbox this node does not host (the
+   * answers to an envelope it relayed), or a Task's update subject. Each
+   * message is decoded and its signature checked against its own `from`
+   * (§5.3) before the handler sees it; anything that does not verify is
+   * dropped without a word. Returns the function that stops the watch.
+   */
+  watchEnvelopes(subject: string, handler: (env: Envelope) => void): () => void {
+    if (this._closed) throw new Error("MeshNode is closed");
+    const sub = this.conn.subscribe(subject, (msg) => {
+      let env: Envelope;
+      try {
+        env = decode(msg.data);
+      } catch {
+        return;
+      }
+      handler(env);
+    });
+    return () => {
+      try {
+        sub.unsubscribe();
+      } catch {
+        /* already gone */
+      }
+    };
   }
 
   // ─── Lifecycle ─────────────────────────────────────────────────────

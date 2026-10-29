@@ -235,6 +235,7 @@ import { AdmissionGate, readKnockInput, textOfInput, type AdmissionControl, type
 import { describeDocumentOf } from "./interview.js";
 import { registrarNameLookup } from "./naming-gate.js";
 import { NoRecordCache, RESUME_HINT_FRESH_MS, ResumableTasks } from "./internal/resumable-tasks.js";
+import { personReadableText, readableTextMeta } from "./readable-text.js";
 import {
   StorefrontAdopter,
   type StorefrontAdoption,
@@ -4575,13 +4576,16 @@ export class AgentMesh {
     await this.preflightAudience([agentId], opts.sendAnyway);
     const recipient = this.manifestCache.get(agentId);
     preflightSenderText({ text }, effectiveInboundCap(recipient));
+    // §5.8: the readable text a carrier shows the person is generated from
+    // this envelope, and its digest rides under the signature.
+    const readable = await readableTextMeta(personReadableText({ sender: this.namingStatus()?.handle ?? this.agentId, text }));
     const envelope = this.newEnvelope({
       type: "request",
       from: this.agentId,
       to: agentId,
       context_id: opts.context_id,
       payload: { text },
-      meta: { audience: "person" },
+      meta: { audience: "person", readable_text: readable },
     });
     const bytes = encode(envelope);
     preflightEnvelopeSize(bytes.length, this.conn.maxPayload);
@@ -4626,13 +4630,14 @@ export class AgentMesh {
   ): Promise<{ id: string }> {
     if (this.namingGate) await this.namingGate.require();
     await this.preflightAudience([original.from], opts.sendAnyway);
+    const readable = await readableTextMeta(personReadableText({ sender: this.namingStatus()?.handle ?? this.agentId, text }));
     const envelope = this.newEnvelope({
       type: "respond",
       from: this.agentId,
       to: original.from,
       in_reply_to: original.id,
       payload: { status: "completed", text },
-      meta: { audience: "person" },
+      meta: { audience: "person", readable_text: readable },
     });
     const bytes = encode(envelope);
     preflightEnvelopeSize(bytes.length, this.conn.maxPayload);

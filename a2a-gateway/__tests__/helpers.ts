@@ -48,6 +48,18 @@ export interface FakeMesh {
   /** The default handler each hosted identity registered, by agent id: the
    *  seam a test uses to deliver a late reply to a caller identity. */
   defaultHandlers: Map<string, (input: unknown, ctx: unknown) => unknown>;
+  /** Envelopes the node relayed unchanged (Agent Messaging over A2A, §16). */
+  relayed: Array<Record<string, unknown>>;
+  /** Live watches by subject (MeshNode.watchEnvelopes). */
+  watchers: Map<string, Array<(env: unknown) => void>>;
+  /** Hand a verified envelope to every watch on a subject. */
+  deliver: (subject: string, env: unknown) => void;
+  /** The person surface each hosted identity registered, by agent id. */
+  personHandlers: Map<string, (m: unknown) => void>;
+  /** Every sendToPerson a hosted identity made. */
+  personSends: Array<{ from: string; to: string; text: string; opts?: unknown }>;
+  /** Set to decide what sendToPerson returns; unset, `queued`. */
+  personAnswer?: (send: { from: string; to: string; text: string }) => unknown;
 }
 
 /** Put a Bridge into the "connected" state with a stub node and courier, so the
@@ -67,7 +79,21 @@ export function fakeConnect(
     },
   },
 ): FakeMesh {
-  const mesh: FakeMesh = { mintedAgentIds: [], registrations: [], deregistered: [], requests: [], defaultHandlers: new Map() };
+  const watchers = new Map<string, Array<(env: unknown) => void>>();
+  const mesh: FakeMesh = {
+    mintedAgentIds: [],
+    registrations: [],
+    deregistered: [],
+    requests: [],
+    defaultHandlers: new Map(),
+    relayed: [],
+    watchers,
+    deliver: (subject, env) => {
+      for (const h of [...(watchers.get(subject) ?? [])]) h(env);
+    },
+    personHandlers: new Map(),
+    personSends: [],
+  };
   let n = 0;
   const internals = bridge as unknown as { node: unknown; courier: unknown };
   internals.node = {
@@ -94,6 +120,14 @@ export function fakeConnect(
         onDefault: (handler: (input: unknown, ctx: unknown) => unknown) => {
           mesh.defaultHandlers.set(id, handler);
         },
+        onPersonMessage: (handler: (m: unknown) => void) => {
+          mesh.personHandlers.set(id, handler);
+        },
+        sendToPerson: async (to: string, text: string, opts?: unknown) => {
+          mesh.personSends.push({ from: id, to, text, opts });
+          if (mesh.personAnswer) return await mesh.personAnswer({ from: id, to, text });
+          return { outcome: "queued", request_id: `person-${mesh.personSends.length}`, inbox_id: "inbox-1" };
+        },
         register: async (opts: FakeRegistration["opts"]) => {
           mesh.registrations.push({ agentId: id, opts });
           return {};
@@ -104,6 +138,18 @@ export function fakeConnect(
       };
     },
     removeAgent: async () => true,
+    relayEnvelope: (env: Record<string, unknown>) => {
+      mesh.relayed.push(env);
+    },
+    watchEnvelopes: (subject: string, handler: (env: unknown) => void) => {
+      const list = watchers.get(subject) ?? [];
+      list.push(handler);
+      watchers.set(subject, list);
+      return () => {
+        const now = watchers.get(subject) ?? [];
+        watchers.set(subject, now.filter((h) => h !== handler));
+      };
+    },
     drain: async () => undefined,
     startHeartbeat: () => undefined,
   };
