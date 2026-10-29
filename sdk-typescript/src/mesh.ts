@@ -2535,6 +2535,7 @@ export class AgentMesh {
       from: this.agentId,
       to: agentId,
       context_id: config?.context_id,
+      ...(config?.task_id ? { task_id: config.task_id } : {}),
       trace: config?.trace ? childSpan(config.trace) : undefined,
       budget: config?.budget,
       payload: reqPayload,

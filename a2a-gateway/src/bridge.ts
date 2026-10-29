@@ -16,7 +16,20 @@ import { MeshError, ErrorCode } from "../../sdk-typescript/src/types/errors.js";
 import type { Envelope } from "../../sdk-typescript/src/types/envelope.js";
 import { Subjects } from "../../sdk-typescript/src/internal/subjects.js";
 import { meshStateToA2A } from "./core/states.js";
-import { envelopeMetadata, markedForPerson, readableTextPart } from "./core/over-a2a.js";
+import { envelopeMetadata, markedForPerson, readableTextPart, stateMetadata } from "./core/over-a2a.js";
+
+/** The words of a responder's update, as an A2A status message: what an
+ *  `input-required` task asks for. */
+function statusMessage(u: Envelope): { message?: A2ATask["status"]["message"] } {
+  const text = (u.payload as { message?: unknown } | undefined)?.message;
+  return typeof text === "string" && text ? { message: { role: "ROLE_AGENT", parts: [{ text }], messageId: `${u.id}-status` } } : {};
+}
+
+/** Task metadata without a stale `agentmesh.state`. */
+function withoutState(meta: Record<string, unknown> | undefined): Record<string, unknown> {
+  const { ["agentmesh.state"]: _s, ...rest } = meta ?? {};
+  return rest;
+}
 import type { RequestContext } from "../../sdk-typescript/src/internal/offering-router.js";
 import { BucketPool } from "./core/ratelimit.js";
 import { meshAddress } from "./mesh-address.js";
@@ -134,6 +147,9 @@ interface TaskRecord {
   signer?: string;
   /** Stops the watch on the Task's update subject (watchSignedTask). */
   stopWatch?: () => void;
+  /** The offering the task's request named: what a caller's answer to an
+   *  `input-required` task is sent on (EXT-14 §7). */
+  offering?: string;
 }
 
 /** What the gateway's node offers for relaying (SDK MeshNode). */
@@ -1036,8 +1052,8 @@ export class Bridge {
       if (!current) return;
       current.task = {
         ...current.task,
-        status: { state: meshStateToA2A(status as never), timestamp: new Date().toISOString() },
-        metadata: { ...(current.task.metadata ?? {}), ...envelopeMetadata(u) },
+        status: { state: meshStateToA2A(status as never), timestamp: new Date().toISOString(), ...statusMessage(u) },
+        metadata: { ...withoutState(current.task.metadata), ...envelopeMetadata(u), ...stateMetadata(status) },
       };
       if (TERMINAL.has(status)) {
         current.stopWatch?.();
@@ -1108,7 +1124,28 @@ export class Bridge {
     this.recordSignedReply(rec, msg.envelope);
   }
 
-  putTask(record: { task: A2ATask; responder: string; callerKey: string; queued?: { inbox_id: string | null }; signer?: string }): void {
+  /**
+   * A hosted caller's task as its identity tracks it now (the SDK follows the
+   * responder's signed updates on the task's subject), folded into the
+   * gateway's record so GetTask says where the work stands, an
+   * `input-required` included, and not only what the first answer said.
+   */
+  refreshFromHosted(rec: TaskRecord): void {
+    if (rec.signer || rec.queued) return;
+    const entry = this.identities.get(rec.callerKey);
+    const live = (entry?.agent as { getTask?: (id: string) => { state?: string; history?: Envelope[] } | undefined } | undefined)?.getTask?.(rec.task.id);
+    if (!live?.state) return;
+    const state = meshStateToA2A(live.state as never);
+    if (state === rec.task.status.state && !stateMetadata(live.state)["agentmesh.state"]) return;
+    const last = Array.isArray(live.history) ? live.history[live.history.length - 1] : undefined;
+    rec.task = {
+      ...rec.task,
+      status: { state, timestamp: new Date().toISOString(), ...(last ? statusMessage(last) : {}) },
+      metadata: { ...withoutState(rec.task.metadata), ...stateMetadata(live.state) },
+    };
+  }
+
+  putTask(record: { task: A2ATask; responder: string; callerKey: string; queued?: { inbox_id: string | null }; signer?: string; offering?: string }): void {
     if (this.tasks.size >= TASK_MAX) {
       const first = this.tasks.keys().next().value;
       if (first) {

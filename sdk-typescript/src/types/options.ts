@@ -397,6 +397,11 @@ export interface RequestConfig {
   stream?: boolean;
   accepted_output?: string[];
   context_id?: string;
+  /** Continue an existing Task (§6.4, §7.3): the follow-up `request` that
+   *  answers a responder waiting in `input_required`. Carried as the
+   *  envelope's `task_id`; the responder resumes the Task only for its own
+   *  requester. Send the Task's `context_id` with it. */
+  task_id?: string;
   meta?: Record<string, unknown>;
   /** Evidence that this request acts for a person (Agent Messaging 0.8,
    *  §4.16): a token-exchange token, an ID-JAG, a transaction token, a CIBA
