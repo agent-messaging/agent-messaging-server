@@ -1,9 +1,9 @@
 # The A2A gateway: normative mapping between Agent Messaging and A2A
 
-**Version:** 0.4.0-draft
+**Version:** 0.8.0-draft
 **Status:** Working Draft
 **Date:** 2026-07-14
-**Revised:** 2026-10-16 (see §15)
+**Revised:** 2026-10-29 (see §15)
 **Applies to:** Agent Messaging 0.2 (SPEC.md) · Agent2Agent (A2A) Protocol v1.0, JSON-RPC and HTTP+JSON bindings · PACT 1.0 (§14)
 
 > This document specifies the translation between Agent Messaging and the
@@ -60,9 +60,12 @@ below are its rules 1, 2 and 4 applied to A2A, and §9.0 below is its rule 3.
 Where this section and §4.15 differ, §4.15 governs. What follows is kept for
 the A2A particulars.
 
-End-to-end Ed25519 signatures do not traverse the HTTP leg, in either
-direction. Inside the mesh, a signature on bridged traffic is the **bridge's
-vouch**, not the far party's signature. Therefore:
+For a caller with no Agent Messaging key, end-to-end Ed25519 signatures do
+not traverse the HTTP leg, in either direction. Inside the mesh, a signature
+on bridged traffic is the **bridge's vouch**, not the far party's signature.
+A caller that does hold a key carries its own signed envelope across the leg
+instead (EXT-14, Agent Messaging over A2A): the bridge relays it unchanged and
+signs nothing, and the rules below do not apply to it. For bridged traffic:
 
 1. A bridge MUST sign bridged envelopes with the hosted identity it minted,
    under its own node vouch. It MUST NOT present bridged traffic as
@@ -138,6 +141,8 @@ AgentMesh responders choose between a **bare terminal response**
 | Bare terminal response (`task_id: null`, status `completed`) | `{"message": {...}}` — direct Message, role `ROLE_AGENT`, parts from `output` (§6) |
 | Bare terminal response, status `failed` / `rejected` | JSON-RPC error (§7) |
 | Task response (responder-assigned `task_id`, non-terminal) | `{"task": {...}}` — Task object, states per §5 |
+| The queued acknowledgement with `delivered: true` or `paused: true` (SPEC.md §6.4a) | `{"task": {...}}` in `submitted`, whose id is the request id; a later reply that names the request completes it |
+| The queued acknowledgement without either (the agent has not let the caller in) | `{"task": {...}}` in `auth-required` that says how to be let in (EXT-14 §9) |
 
 ### 4.4. `SendStreamingMessage` Event Mapping
 
@@ -173,8 +178,10 @@ A metadata hint naming an undeclared offering MUST be rejected with
 
 ## 5. Task-State Mapping
 
-The state sets are identical by design (SPEC.md §7 mirrors A2A §4.1.3). Only
-the spelling differs per A2A binding convention:
+The state sets were identical by design (SPEC.md §7 mirrors A2A §4.1.3), and
+only the spelling differs per A2A binding convention, with one exception:
+Agent Messaging's `exhausted`, for work that stopped because its engagement's
+cap was reached (SPEC.md §7.2), has no A2A state.
 
 | AgentMesh state | A2A protobuf enum | A2A JSON string |
 |---|---|---|
@@ -186,9 +193,20 @@ the spelling differs per A2A binding convention:
 | `failed` | `TASK_STATE_FAILED` | `failed` |
 | `canceled` | `TASK_STATE_CANCELED` | `canceled` |
 | `rejected` | `TASK_STATE_REJECTED` | `rejected` |
+| `exhausted` | `TASK_STATE_CANCELED`, with `"agentmesh.state": "exhausted"` in the Task's `metadata` | `canceled`, with the same `metadata` |
 
-The mapping is total in both directions; a bridge MUST NOT invent, merge, or
-drop states.
+The mapping is total from Agent Messaging to A2A, and a bridge MUST NOT
+invent, merge, or drop states. `exhausted` maps to `canceled` because it is
+the one A2A state that means "stopped short of the objective, nobody's
+fault": `completed` would claim the work was done, and SPEC.md §7.2 forbids
+recording it as `failed`. The `metadata` member keeps the difference for a
+caller that reads it. From A2A to Agent Messaging, `canceled` is always
+`canceled`; a bridge never turns an A2A state into `exhausted`.
+
+A caller reads a Task only when it asks, so its view can skip states, such as
+`working` between `input-required` and `completed`. It applies what it reads
+as SPEC.md §7.3.1 says. A caller's answer to an `input-required` Task is
+carried to the mesh Task as EXT-14 §8 says.
 
 ## 6. Payload ↔ Parts Mapping
 
@@ -217,7 +235,9 @@ input, and structured mesh output arrives as a DataPart.
 
 Mesh error codes (SPEC.md §12) map to A2A JSON-RPC errors as follows.
 Unlisted mesh codes map to `-32603` (Internal error). The original mesh code
-MUST be preserved in the JSON-RPC error's `data.agentmesh_code` field.
+MUST be preserved in the JSON-RPC error's `data.agentmesh_code` field. A
+budget refusal (`BUDGET_INSUFFICIENT`, `BUDGET_EXHAUSTED`) also keeps its
+`details`, such as the estimate, in `data.details` (EXT-14 §11).
 
 | AgentMesh error code | JSON-RPC code | A2A error type |
 |---|---|---|
@@ -258,8 +278,15 @@ Served per exposed agent at
 | bridge marker (§8.3) | `capabilities.extensions[]` entry |
 
 Mesh `input_schema` / `output_schema` have no agent card equivalent (cards
-declare media-type modes, not schemas); they are surfaced through the bridge
-extension's `documentationUrl`.
+declare media-type modes, not schemas). A bridge that implements Agent
+Messaging over A2A carries them, with each offering's inputs and outputs, in
+that extension's `params` (EXT-14 §10).
+
+Where the agent published an Agent Descriptor (SPEC.md §8.13), the table
+above yields to it: the card's description, version and skills are generated
+from the Descriptor itself, the extension's `params` link to the Descriptor
+with its digest, and the bridge serves the Descriptor's bytes there (EXT-14
+§10). The manifest supplies only what the Descriptor does not hold.
 
 ### 8.2. Outbound: Agent Card → Mesh Manifest
 
@@ -331,20 +358,28 @@ direction on its own account.
 **Inbound (A2A client to mesh agent).** An A2A message whose `extensions`
 lists the URI and whose `metadata["agentmesh.audience"]` is `"person"` is
 carried as a request marked for the person: the bridge signs it with the
-caller's hosted identity and `meta.audience: "person"`. A value that is not a
+caller's hosted identity and `meta.audience: "person"`, and signs the digest
+of its readable text in `meta.readable_text` (Agent Messaging §5.8). The
+message's text parts, joined, are its `payload.text`. A value that is not a
 string is refused with `InvalidParamsError` (`-32602`). The bridge answers the
 A2A caller with a Task in state `submitted` (§5) from its own task record
 (§4.1, `GetTask`), since the mesh agent's person answers, if at all, later.
 When a reply marked for a person arrives, the bridge completes that record
 with the reply as a Message carrying `metadata["agentmesh.audience"]:
-"person"`. The task is the bridge's own record of the exchange; no mesh Task
+"person"`. Only the agent the message went to may complete it. The Message's
+first part is the reply's readable text, generated from the signed reply
+(Agent Messaging §5.8, EXT-14 §6), and the reply's envelope rides in the
+Message's metadata under EXT-14's URI, so software that shows the text can
+check it. The task is the bridge's own record of the exchange; no mesh Task
 exists for it (SPEC.md §7.0).
 
 **Outbound (mesh agent to remote A2A server).** The bridge is the receiving
 node for the bridged agent, so §5.7's receiver rules bind it. When the remote
 card lists the URI, the bridge forwards a marked request with the URI in the
 message's `extensions` and `metadata["agentmesh.audience"]: "person"`, and
-the remote server keeps the rules it declared. When the remote card does not
+the remote server keeps the rules it declared. The forwarded message's first
+part is the readable text generated from the sender's signed envelope (Agent
+Messaging §5.8, EXT-14 §6). When the remote card does not
 list it, the bridge MUST refuse the request with `AUDIENCE_NOT_SUPPORTED`
 (SPEC.md §12.2) and forward nothing, even when the sender chose to send
 anyway. A native receiver that does not know the mark still receives it under
@@ -363,8 +398,9 @@ that drops it, and §5.7 has every carrier keep it.
 |---|---|
 | No credentials | Ephemeral per-session identity, sandbox-flagged; subject to the guest rate tier |
 | A bridge API key (`Authorization: Bearer <key>`) | A stable identity minted at key creation, reused across calls |
+| Its own signed envelope, under EXT-14 (with whatever credential the bridge requires) | None. The envelope travels on the caller's own signature, and the bridge relays it unchanged |
 
-Either way the identity is bridge-hosted and node-vouched (§2.1 rule 1).
+For the first two the identity is bridge-hosted and node-vouched (§2.1 rule 1).
 A2A `securitySchemes` in generated cards MUST declare exactly what the bridge
 accepts.
 
@@ -574,11 +610,12 @@ already holds.
 
 Stated so nobody discovers them the hard way: A2A push notifications
 (webhooks), `ListTasks`/`SubscribeToTask`, extended agent cards, FileParts,
-the gRPC binding, multi-turn `input-required` conversations initiated by
-bridged agents on the JSON-RPC and HTTP+JSON routes (the state maps, but the
-bridge does not yet relay the continuation message; PACT conversations, §14,
-do continue by `contextId`), and OAuth flows on either leg except PACT's
-delegated authority on the inbound leg (§14.8).
+the gRPC binding, multi-turn `input-required` conversations in the outbound
+direction (a remote A2A server that asks a mesh caller for more input: the
+state maps, but the bridge does not yet relay the mesh caller's answer;
+inbound, EXT-14 §8 carries an A2A caller's answer to a mesh agent, and PACT
+conversations, §14, continue by `contextId`), and OAuth flows on either leg
+except PACT's delegated authority on the inbound leg (§14.8).
 
 ## 12. Conformance
 
@@ -592,7 +629,16 @@ each MUST document which direction it provides. An implementation MAY
 implement either A2A binding or both (§3, §13), and MUST document which. A
 bridge that serves PACT (§14) claims PACT Identity conformance by passing
 `conformance/pact-identity.json` for the Provider role, and PACT Delegated by
-also passing `conformance/pact-delegated.json`.
+also passing `conformance/pact-delegated.json`. A bridge that lists Agent
+Messaging over A2A in its cards implements EXT-14 §2 to §11.
+
+`conformance/a2a-bridge.json` is the fixture set for this mapping and EXT-14:
+signed and unsigned callers, a forged message, the state spellings with
+`exhausted`, the answer on an existing task, the knock and the reading of a
+queued acknowledgement, and readable text. An implementation reads it in its
+own tests, and `conformance/lib/check-a2a-bridge-fixture.mjs` checks it
+against reference readings. `conformance/cross-transport/` runs one quote
+over a broker, email and this bridge with the same checks.
 
 ## 13. The HTTP+JSON Binding
 
