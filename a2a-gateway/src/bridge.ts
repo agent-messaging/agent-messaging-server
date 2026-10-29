@@ -13,6 +13,10 @@ import type { Manifest } from "../../sdk-typescript/src/types/manifest.js";
 import type { A2ATask } from "./core/jsonrpc.js";
 import { linkFiles, meshLinker, outputToParts, type MeshFile } from "./core/parts.js";
 import { MeshError, ErrorCode } from "../../sdk-typescript/src/types/errors.js";
+import type { Envelope } from "../../sdk-typescript/src/types/envelope.js";
+import { Subjects } from "../../sdk-typescript/src/internal/subjects.js";
+import { meshStateToA2A } from "./core/states.js";
+import { envelopeMetadata, markedForPerson, readableTextPart } from "./core/over-a2a.js";
 import type { RequestContext } from "../../sdk-typescript/src/internal/offering-router.js";
 import { BucketPool } from "./core/ratelimit.js";
 import { meshAddress } from "./mesh-address.js";
@@ -124,6 +128,36 @@ interface TaskRecord {
    *  arrives later at the caller identity's inbox, and this record is what
    *  the reply completes. */
   queued?: { inbox_id: string | null };
+  /** Present when the caller signed the request itself (EXT-14): the caller's
+   *  agent ID. A later act on the task (a cancel, an answer) has to be signed
+   *  by the same key, because the gateway holds no identity for it. */
+  signer?: string;
+  /** Stops the watch on the Task's update subject (watchSignedTask). */
+  stopWatch?: () => void;
+}
+
+/** What the gateway's node offers for relaying (SDK MeshNode). */
+interface RelayNode {
+  relayEnvelope(env: Envelope): void;
+  watchEnvelopes(subject: string, handler: (env: Envelope) => void): () => void;
+}
+
+/** How a relayed request ended (Bridge.relaySigned). */
+export type RelayOutcome =
+  | { kind: "answer"; envelope: Envelope }
+  | { kind: "queued"; envelope: Envelope; byDoor: boolean };
+
+const TERMINAL = new Set(["completed", "failed", "canceled", "rejected", "exhausted"]);
+
+/** The §6.4a queued acknowledgement, at the top of the payload or in its
+ *  output, as the SDK reads it. */
+export function isQueuedAck(env: Envelope): boolean {
+  if (env.error) return false;
+  const p = env.payload as Record<string, unknown> | null | undefined;
+  for (const c of [p, p?.output as Record<string, unknown> | null | undefined]) {
+    if (c && typeof c === "object" && c.queued === true && typeof c.inbox_id === "string" && c.inbox_id) return true;
+  }
+  return false;
 }
 
 /** A fresh agent NKey seed. Same mint the attachment records use
@@ -794,6 +828,9 @@ export class Bridge {
     // The fake node the tests hand back is narrower than the SDK's agent.
     if (typeof (agent as { onDefault?: unknown }).onDefault !== "function") return;
     agent.onDefault((input, ctx) => this.lateReply(input, ctx, agent));
+    // The person's reply to a message an A2A caller wrote to them (§8.4).
+    const withPerson = agent as { onPersonMessage?: (h: ((m: { from: string; inReplyTo?: string; envelope: Envelope }) => void) | null) => void };
+    if (typeof withPerson.onPersonMessage === "function") withPerson.onPersonMessage((m) => this.personReply(m));
   }
 
   /**
@@ -887,10 +924,197 @@ export class Bridge {
     return { received: true };
   }
 
-  putTask(record: { task: A2ATask; responder: string; callerKey: string; queued?: { inbox_id: string | null } }): void {
+  // ─── Agent Messaging over A2A: a caller's own signed request (EXT-14) ──
+
+  /** The one key besides an addressed agent that may answer for it: the
+   *  mesh's admission service, whose benign queued ack (EXT-6 §7) stands in
+   *  for an agent that has not let the sender in. Pinned on first use, the way
+   *  the SDK pins it (Agent Messaging §6.2). */
+  private intermediaryPin: string | null = null;
+
+  /**
+   * Pass a caller's own signed request through to the mesh, unchanged, and
+   * wait for the answer at the caller's inbox (EXT-14 §5). Nothing is
+   * signed here and no hosted identity is used: the envelope travels on the
+   * caller's signature and the receiver checks it like any native message.
+   *
+   * Resolves with the substantive answer, or with the queued acknowledgement
+   * (the agent's node queued it for an attended session, or the mesh's door
+   * has not let the caller in). An accept signal (§6.4a) resets the wait.
+   * Rejects with TRANSPORT_TIMEOUT when nothing substantive arrives in time.
+   */
+  relaySigned(env: Envelope, timeoutMs = 60_000): Promise<RelayOutcome> {
+    const node = this.node as (MeshNode & Partial<RelayNode>) | null;
+    if (!node) throw new Error("bridge is not connected to the mesh yet");
+    if (typeof node.relayEnvelope !== "function" || typeof node.watchEnvelopes !== "function") {
+      throw new MeshError(ErrorCode.INTERNAL_ERROR, "This gateway's node cannot relay envelopes");
+    }
+    return new Promise<RelayOutcome>((resolve, reject) => {
+      let done = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      let accepted = false;
+      let stop: (() => void) | null = null;
+      const settle = (fn: () => void): void => {
+        if (done) return;
+        done = true;
+        if (timer) clearTimeout(timer);
+        try {
+          stop?.();
+        } catch {
+          /* already gone */
+        }
+        fn();
+      };
+      const arm = (): void => {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(
+          () =>
+            settle(() =>
+              reject(
+                new MeshError(
+                  ErrorCode.TRANSPORT_TIMEOUT,
+                  accepted
+                    ? `${env.to} accepted the request but sent no answer within ${timeoutMs} ms`
+                    : `No answer from ${env.to} within ${timeoutMs} ms`,
+                  accepted ? { details: { accepted: true } } : undefined,
+                ),
+              ),
+            ),
+          timeoutMs,
+        );
+        (timer as { unref?: () => void }).unref?.();
+      };
+      stop = node.watchEnvelopes!(Subjects.agentInbox(env.from), (r) => {
+        if (r.type !== "respond" || r.in_reply_to !== env.id) return;
+        if (r.to !== undefined && r.to !== env.from) return;
+        const queued = isQueuedAck(r);
+        if (r.from !== env.to) {
+          // Only the mesh's door answers for an agent, and only with the ack.
+          if (!queued) return;
+          if (this.intermediaryPin === null) this.intermediaryPin = r.from;
+          else if (this.intermediaryPin !== r.from) return;
+          settle(() => resolve({ kind: "queued", envelope: r, byDoor: true }));
+          return;
+        }
+        if (!r.error && (r.payload as { status?: unknown } | undefined)?.status === "accepted") {
+          accepted = true;
+          arm();
+          return;
+        }
+        if (queued) {
+          settle(() => resolve({ kind: "queued", envelope: r, byDoor: false }));
+          return;
+        }
+        settle(() => resolve({ kind: "answer", envelope: r }));
+      });
+      arm();
+      try {
+        node.relayEnvelope!(env);
+      } catch (err) {
+        settle(() => reject(err));
+      }
+    });
+  }
+
+  /**
+   * Keep a signed caller's Task record current from the responder's own
+   * signed updates on the Task's update subject (Agent Messaging §7.3), since
+   * no hosted identity tracks it. Only an update the responder signed is
+   * applied. The watch ends when the Task ends or its record is swept.
+   */
+  watchSignedTask(taskId: string, responder: string): void {
+    const node = this.node as (MeshNode & Partial<RelayNode>) | null;
+    if (!node || typeof node.watchEnvelopes !== "function") return;
+    const rec = this.tasks.get(taskId);
+    if (!rec) return;
+    rec.stopWatch?.();
+    rec.stopWatch = node.watchEnvelopes(Subjects.taskUpdate(taskId), (u) => {
+      if (u.from !== responder || u.task_id !== taskId) return;
+      const status = (u.payload as { status?: unknown } | undefined)?.status;
+      if (typeof status !== "string") return;
+      const current = this.tasks.get(taskId);
+      if (!current) return;
+      current.task = {
+        ...current.task,
+        status: { state: meshStateToA2A(status as never), timestamp: new Date().toISOString() },
+        metadata: { ...(current.task.metadata ?? {}), ...envelopeMetadata(u) },
+      };
+      if (TERMINAL.has(status)) {
+        current.stopWatch?.();
+        current.stopWatch = undefined;
+      }
+    });
+  }
+
+  /**
+   * The late answer to a signed request that was queued (§6.4a): the agent
+   * answers later, at the signer's inbox, either with a fresh request whose
+   * `input.in_reply_to` names the original (the attended-session reply) or
+   * with a respond to it (a person's reply, §5.7). Only the agent the request
+   * went to may complete it. The watch lasts as long as the task record.
+   */
+  watchSignedLateReply(requestId: string, signer: string, responder: string): void {
+    const node = this.node as (MeshNode & Partial<RelayNode>) | null;
+    if (!node || typeof node.watchEnvelopes !== "function") return;
+    const rec = this.tasks.get(requestId);
+    if (!rec) return;
+    rec.stopWatch?.();
+    rec.stopWatch = node.watchEnvelopes(Subjects.agentInbox(signer), (u) => {
+      if (u.from !== responder || (u.to !== undefined && u.to !== signer)) return;
+      const input = (u.payload as { input?: { in_reply_to?: unknown } } | undefined)?.input;
+      const names = u.type === "respond" ? u.in_reply_to === requestId && !isQueuedAck(u) && (u.payload as { status?: unknown } | undefined)?.status !== "accepted" : u.type === "request" && input?.in_reply_to === requestId;
+      if (!names) return;
+      const current = this.tasks.get(requestId);
+      if (!current) return;
+      current.stopWatch?.();
+      current.stopWatch = undefined;
+      this.recordSignedReply(current, u);
+    });
+  }
+
+  private recordSignedReply(rec: TaskRecord, u: Envelope): void {
+    const person = markedForPerson(u);
+    const p = (u.payload ?? {}) as { input?: Record<string, unknown>; output?: unknown; text?: unknown; status?: unknown };
+    const failed = !!u.error || p.status === "failed" || p.status === "rejected";
+    let body: unknown = u.type === "request" ? p.input : p.output;
+    if (u.type === "request" && body && typeof body === "object") {
+      const { in_reply_to: _i, usage: _u, cost: _c, error: _e, ...answer } = body as Record<string, unknown>;
+      body = answer;
+    }
+    const parts = person ? [readableTextPart(u)] : body !== undefined ? outputToParts(body) : typeof p.text === "string" ? outputToParts({ text: p.text }) : [];
+    const replyId = `${rec.task.id}-reply`;
+    rec.task = {
+      ...rec.task,
+      status: {
+        state: failed ? "failed" : "completed",
+        timestamp: new Date().toISOString(),
+        message: { role: "ROLE_AGENT", parts, messageId: replyId, metadata: { ...envelopeMetadata(u), ...(person ? { "agentmesh.audience": "person" } : {}) } },
+      },
+      metadata: { ...(rec.task.metadata ?? {}), ...envelopeMetadata(u) },
+      ...(failed ? {} : { artifacts: [...(rec.task.artifacts ?? []), { artifactId: replyId, name: "reply", parts }] }),
+    };
+  }
+
+  /**
+   * A person's reply (§5.7) to a message an A2A caller wrote to them (§8.4),
+   * arriving at the caller's hosted identity. It completes the gateway's
+   * record with the reply's readable text (Agent Messaging §5.8) and the
+   * agent's signed envelope beside it. Only the agent the message went to may
+   * answer it.
+   */
+  private personReply(msg: { from: string; inReplyTo?: string; envelope: Envelope }): void {
+    const rec = msg.inReplyTo ? this.tasks.get(msg.inReplyTo) : undefined;
+    if (!rec || rec.responder !== msg.from || rec.task.metadata?.["agentmesh.audience"] !== "person") return;
+    this.recordSignedReply(rec, msg.envelope);
+  }
+
+  putTask(record: { task: A2ATask; responder: string; callerKey: string; queued?: { inbox_id: string | null }; signer?: string }): void {
     if (this.tasks.size >= TASK_MAX) {
       const first = this.tasks.keys().next().value;
-      if (first) this.tasks.delete(first);
+      if (first) {
+        this.tasks.get(first)?.stopWatch?.();
+        this.tasks.delete(first);
+      }
     }
     this.tasks.set(record.task.id, { ...record, createdAt: Date.now() });
   }
@@ -913,7 +1137,10 @@ export class Bridge {
       }
     }
     for (const [id, rec] of this.tasks) {
-      if (now - rec.createdAt > (rec.queued ? QUEUED_TASK_TTL_MS : TASK_TTL_MS)) this.tasks.delete(id);
+      if (now - rec.createdAt > (rec.queued ? QUEUED_TASK_TTL_MS : TASK_TTL_MS)) {
+        rec.stopWatch?.();
+        this.tasks.delete(id);
+      }
     }
   }
 }

@@ -99,6 +99,9 @@ export interface A2AMessage {
   /** Prior tasks this message refers to; the first is what a mesh request
    *  names as `revises` (Common Agent spec §5.7). */
   referenceTaskIds?: string[];
+  /** The URIs of the extensions this message uses (A2A §4.1.4); their data
+   *  rides in `metadata` under each URI. */
+  extensions?: string[];
   metadata?: Record<string, unknown>;
 }
 
@@ -130,6 +133,8 @@ export interface A2ATask {
   contextId?: string;
   status: A2ATaskStatus;
   artifacts?: A2AArtifact[];
+  /** A2A Task metadata: where an extension's data rides (EXT-14). */
+  metadata?: Record<string, unknown>;
 }
 
 /** SendMessage request params (a2a.proto 1.0 `SendMessageRequest`, subset). */

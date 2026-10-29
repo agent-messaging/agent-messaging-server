@@ -22,7 +22,18 @@
  * the directory is a different capability.
  */
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
-import { isExposed, type Bridge, type CallerRefused } from "../bridge.js";
+import { isExposed, type Bridge, type CallerRefused, type RelayOutcome } from "../bridge.js";
+import type { Envelope } from "../../../sdk-typescript/src/types/envelope.js";
+import {
+  OVER_A2A_URI,
+  carriedEnvelope,
+  checkCarriedRequest,
+  envelopeMetadata,
+  markedForPerson,
+  overA2AActivated,
+  readableTextPart,
+} from "../core/over-a2a.js";
+import { AUDIENCE_URI } from "../core/card.js";
 import { AdminError, type AttachmentManager, type CreateAttachmentInput } from "../outbound/manager.js";
 import { redactKey } from "./keys.js";
 import type { AgentMesh } from "../../../sdk-typescript/src/mesh.js";
@@ -211,7 +222,7 @@ async function handle(
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, DPoP, A2A-Version, A2A-Extensions, X-A2A-User-Delegation, MCP-Protocol-Version, Mcp-Session-Id");
-  res.setHeader("Access-Control-Expose-Headers", "WWW-Authenticate, Retry-After");
+  res.setHeader("Access-Control-Expose-Headers", "WWW-Authenticate, Retry-After, A2A-Extensions");
   if (req.method === "OPTIONS") {
     res.writeHead(204);
     res.end();
@@ -745,6 +756,21 @@ async function handleRpc(
     }
   }
 
+  // Agent Messaging over A2A (EXT-14): a caller that signed its own request is
+  // passed through on its own signature. No hosted identity is minted for it.
+  const sendParams = rpc.method === "SendMessage" || rpc.method === "SendStreamingMessage" ? (rpc.params as SendMessageParams | undefined) : undefined;
+  const carried = carriedEnvelope(sendParams?.message);
+  if (carried !== undefined) {
+    if (rpc.method === "SendStreamingMessage") {
+      return json(res, 200, rpcError(id, RpcCode.UNSUPPORTED_OPERATION, "A signed request (Agent Messaging over A2A) is carried on SendMessage only in this version (EXT-14 (messaging/extensions/EXT-14-agent-messaging-over-a2a.md))"));
+    }
+    return sendSigned(bridge, res, id, sendParams!, manifest, callerKey, carried);
+  }
+  if (rpc.method === "CancelTask") {
+    const rec = (rpc.params as { id?: string } | undefined)?.id ? bridge.getTaskRecord((rpc.params as { id: string }).id) : undefined;
+    if (rec?.signer && rec.callerKey === callerKey) return cancelSigned(bridge, res, id, rpc.params as CancelParams, rec);
+  }
+
   // Mint (or revive) the hosted identity only now that there is real work to
   // vouch for. Awaited: on first sight this reads the caller's durable record
   // and registers the §2.1 rule 2 marker manifest, both once per caller.
@@ -752,7 +778,10 @@ async function handleRpc(
 
   switch (rpc.method) {
     case "SendMessage":
-      return sendMessage(bridge, res, id, rpc.params as SendMessageParams, manifest, requester, callerKey);
+      if (personMark(sendParams?.message) !== undefined) {
+        return sendToPerson(bridge, res, id, sendParams!, manifest, requester, callerKey, overA2AActivated(sendParams?.message, header(req, "a2a-extensions")));
+      }
+      return sendMessage(bridge, res, id, rpc.params as SendMessageParams, manifest, requester, callerKey, overA2AActivated(sendParams?.message, header(req, "a2a-extensions")));
     case "SendStreamingMessage":
       return sendStreamingMessage(bridge, res, id, rpc.params as SendMessageParams, manifest, requester, callerKey);
     case "GetTask":
@@ -920,7 +949,11 @@ async function sendMessage(
   manifest: Manifest,
   requester: AgentMesh,
   callerKey: string,
+  /** The caller activated Agent Messaging over A2A (EXT-14): its results carry
+   *  the agent's own signed envelope. */
+  activated = false,
 ): Promise<void> {
+  if (activated) res.setHeader("A2A-Extensions", OVER_A2A_URI);
   const prep = await validateAndPrepare(params, manifest, fileSink(requester));
   if ("errResp" in prep) return json(res, 200, prep.errResp(id));
 
@@ -948,12 +981,13 @@ async function sendMessage(
             // (AgentMesh technical debt 447: the run-file door needs a session).
             parts: outputToParts(await linkFiles(result.payload.output, meshLinker(requester))),
             messageId: result.envelope.id,
+            ...(activated ? { metadata: envelopeMetadata(result.envelope as Envelope) } : {}),
           },
         };
         return json(res, 200, rpcResult(id, out));
       }
       const code = result.payload.status === "rejected" ? RpcCode.UNSUPPORTED_OPERATION : RpcCode.INTERNAL_ERROR;
-      return json(res, 200, rpcError(id, code, result.payload.message ?? `Agent ${result.payload.status} the request`, { agentmesh_status: result.payload.status }));
+      return json(res, 200, rpcError(id, code, result.payload.message ?? `Agent ${result.payload.status} the request`, { agentmesh_status: result.payload.status, ...(activated ? envelopeMetadata(result.envelope as Envelope) : {}) }));
     }
 
     // Task mode (deferred) → A2A Task (§4.3).
@@ -962,6 +996,7 @@ async function sendMessage(
       id: result.task_id,
       ...(taskCtx ? { contextId: taskCtx } : {}),
       status: { state: meshStateToA2A(result.payload.status), timestamp: new Date().toISOString() },
+      ...(activated ? { metadata: envelopeMetadata(result.envelope as Envelope) } : {}),
     };
     bridge.putTask({ task, responder: manifest.id, callerKey });
     return json(res, 200, rpcResult(id, { task } satisfies SendMessageResult));
@@ -975,6 +1010,192 @@ async function sendMessage(
       return json(res, 200, rpcResult(id, { task: queued } satisfies SendMessageResult));
     }
     tap("error");
+    const mapped = meshErrorToRpc(err);
+    res.writeHead(mapped.httpStatus === 200 ? 200 : mapped.httpStatus, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ jsonrpc: "2.0", id, error: mapped.error }));
+  }
+}
+
+// ─── Agent Messaging over A2A: a signed request (EXT-14) ────────────────
+
+/** CancelTask params: the task id, and (for a signed task) the caller's own
+ *  signed `task.cancel` request in the extension's metadata. */
+interface CancelParams {
+  id?: string;
+  metadata?: Record<string, unknown>;
+}
+
+/** The typed refusal of a carried envelope (EXT-14 §4): nothing is relayed. */
+function refuseCarried(res: ServerResponse, id: JsonRpcRequest["id"], reason: string, message: string): void {
+  json(res, 200, rpcError(id, RpcCode.INVALID_PARAMS, message, { agentmesh_code: "INVALID_ENVELOPE", reason }));
+}
+
+/**
+ * A request the caller signed itself (EXT-14): checked, relayed unchanged, and
+ * answered with the agent's own signed envelope beside the A2A result.
+ */
+async function sendSigned(
+  bridge: Bridge,
+  res: ServerResponse,
+  id: JsonRpcRequest["id"],
+  params: SendMessageParams,
+  manifest: Manifest,
+  callerKey: string,
+  carried: unknown,
+): Promise<void> {
+  const checked = checkCarriedRequest(carried, { agentId: manifest.id, manifest, message: params.message });
+  if (!checked.ok) return refuseCarried(res, id, checked.reason, checked.message);
+  const env = checked.envelope;
+  res.setHeader("A2A-Extensions", OVER_A2A_URI);
+  const offering = typeof (env.payload as { offering?: unknown } | undefined)?.offering === "string" ? (env.payload as { offering: string }).offering : "person";
+  const startedAt = Date.now();
+  const tap = (outcome: "ok" | "error") => tapInbound(bridge, callerKey, { responder: manifest.id, offering, outcome, startedAt });
+
+  let outcome: RelayOutcome;
+  try {
+    outcome = await bridge.relaySigned(env, 60_000);
+  } catch (err) {
+    tap("error");
+    const mapped = meshErrorToRpc(err);
+    res.writeHead(mapped.httpStatus === 200 ? 200 : mapped.httpStatus, { "Content-Type": "application/json" });
+    return void res.end(JSON.stringify({ jsonrpc: "2.0", id, error: mapped.error }));
+  }
+  tap("ok");
+  const r = outcome.envelope;
+
+  if (outcome.kind === "queued") {
+    const det = (r.payload ?? {}) as { inbox_id?: unknown; output?: { inbox_id?: unknown } };
+    const inbox = typeof det.inbox_id === "string" ? det.inbox_id : typeof det.output?.inbox_id === "string" ? det.output.inbox_id : null;
+    const task: A2ATask = {
+      id: env.id,
+      ...(env.context_id ? { contextId: env.context_id } : {}),
+      status: { state: "submitted", timestamp: new Date().toISOString(), message: { role: "ROLE_AGENT", parts: [{ text: QUEUED_SENTENCE }], messageId: `${env.id}-queued` } },
+      metadata: envelopeMetadata(r),
+    };
+    bridge.putTask({ task, responder: manifest.id, callerKey, queued: { inbox_id: inbox }, signer: env.from });
+    bridge.watchSignedLateReply(env.id, env.from, manifest.id);
+    return json(res, 200, rpcResult(id, { task }));
+  }
+
+  if (r.error) {
+    const mapped = meshErrorToRpc(MeshError.fromErrorObject(r.error));
+    res.writeHead(mapped.httpStatus === 200 ? 200 : mapped.httpStatus, { "Content-Type": "application/json" });
+    return void res.end(JSON.stringify({ jsonrpc: "2.0", id, error: { ...mapped.error, data: { ...(mapped.error.data ?? {}), ...envelopeMetadata(r) } } }));
+  }
+  const p = (r.payload ?? {}) as { status?: string; output?: unknown; text?: unknown; message?: string };
+  const status = (p.status ?? "completed") as never;
+  if (!r.task_id) {
+    if (p.status === "completed" || p.status === undefined) {
+      // A message for the person (§8.4) opens with its readable text (Agent
+      // Messaging §5.8); the output follows. Files stay by reference: the
+      // caller holds its own key and reads them itself (Agent Messaging §7.5.4).
+      const parts = [
+        ...(markedForPerson(r) ? [readableTextPart(r)] : []),
+        ...(p.output !== undefined ? outputToParts(p.output) : !markedForPerson(r) && typeof p.text === "string" ? outputToParts({ text: p.text }) : []),
+      ];
+      return json(res, 200, rpcResult(id, { message: { role: "ROLE_AGENT", parts, messageId: r.id, metadata: { ...envelopeMetadata(r), ...(markedForPerson(r) ? { "agentmesh.audience": "person" } : {}) } } } satisfies SendMessageResult));
+    }
+    const code = p.status === "rejected" ? RpcCode.UNSUPPORTED_OPERATION : RpcCode.INTERNAL_ERROR;
+    return json(res, 200, rpcError(id, code, p.message ?? `Agent ${p.status} the request`, { agentmesh_status: p.status, ...envelopeMetadata(r) }));
+  }
+  const task: A2ATask = {
+    id: r.task_id,
+    ...(r.context_id ?? env.context_id ? { contextId: (r.context_id ?? env.context_id)! } : {}),
+    status: { state: meshStateToA2A(status), timestamp: new Date().toISOString() },
+    metadata: envelopeMetadata(r),
+  };
+  bridge.putTask({ task, responder: manifest.id, callerKey, signer: env.from });
+  bridge.watchSignedTask(r.task_id, manifest.id);
+  return json(res, 200, rpcResult(id, { task } satisfies SendMessageResult));
+}
+
+/**
+ * A cancel of a task the caller signed for (EXT-14 §7). The gateway holds no
+ * identity for that caller, so the cancel too must be the caller's own signed
+ * `task.cancel` request, carried in the extension's metadata.
+ */
+async function cancelSigned(
+  bridge: Bridge,
+  res: ServerResponse,
+  id: JsonRpcRequest["id"],
+  params: CancelParams,
+  rec: NonNullable<ReturnType<Bridge["getTaskRecord"]>>,
+): Promise<void> {
+  const carried = (params.metadata?.[OVER_A2A_URI] as { envelope?: unknown } | undefined)?.envelope;
+  if (carried === undefined) {
+    return json(res, 200, rpcError(id, RpcCode.TASK_NOT_CANCELABLE, "This task was requested with a signed envelope; cancel it with your own signed task.cancel request in metadata (EXT-14 §7)", { agentmesh_code: "SIGNED_CANCEL_REQUIRED" }));
+  }
+  const env = carried as Envelope;
+  const input = ((env?.payload as { input?: unknown } | undefined)?.input ?? {}) as { task_id?: unknown };
+  const fake = { id: rec.responder, offerings: [] } as unknown as Manifest;
+  const checked = checkCarriedRequest(carried, { agentId: rec.responder, manifest: fake });
+  if (!checked.ok) return refuseCarried(res, id, checked.reason, checked.message);
+  if (env.from !== rec.signer || (env.payload as { offering?: unknown }).offering !== "task.cancel" || input.task_id !== rec.task.id) {
+    return refuseCarried(res, id, "mismatch", "The carried cancel must be a task.cancel request for this task, signed by the key that requested it.");
+  }
+  res.setHeader("A2A-Extensions", OVER_A2A_URI);
+  try {
+    const outcome = await bridge.relaySigned(env, 15_000);
+    const r = outcome.envelope;
+    if (r.error) {
+      const mapped = meshErrorToRpc(MeshError.fromErrorObject(r.error));
+      return json(res, 200, { jsonrpc: "2.0", id, error: { ...mapped.error, data: { ...(mapped.error.data ?? {}), ...envelopeMetadata(r) } } });
+    }
+    const st = (r.payload as { status?: string } | undefined)?.status ?? "canceled";
+    const task: A2ATask = { ...rec.task, status: { state: meshStateToA2A(st as never), timestamp: new Date().toISOString() }, metadata: { ...(rec.task.metadata ?? {}), ...envelopeMetadata(r) } };
+    bridge.updateTask(rec.task.id, task);
+    json(res, 200, rpcResult(id, { task }));
+  } catch (err) {
+    const mapped = meshErrorToRpc(err);
+    json(res, 200, { jsonrpc: "2.0", id, error: mapped.error });
+  }
+}
+
+// ─── Messages for the person (§8.4) ──────────────────────────────────
+
+/** The §8.4 mark on an A2A message: `undefined` when the message does not
+ *  use the audience extension, otherwise the raw `agentmesh.audience` value. */
+function personMark(message: SendMessageParams["message"] | undefined): unknown {
+  if (!Array.isArray(message?.extensions) || !message!.extensions!.includes(AUDIENCE_URI)) return undefined;
+  return message!.metadata?.["agentmesh.audience"];
+}
+
+/**
+ * A message from an A2A caller for the person behind a mesh agent (§8.4):
+ * sent marked for the person, with the digest of its readable text signed
+ * (Agent Messaging §5.8), and answered with a task in `submitted` from the
+ * gateway's own record, since the person answers later if at all.
+ */
+async function sendToPerson(
+  bridge: Bridge,
+  res: ServerResponse,
+  id: JsonRpcRequest["id"],
+  params: SendMessageParams,
+  manifest: Manifest,
+  requester: AgentMesh,
+  callerKey: string,
+  activated: boolean,
+): Promise<void> {
+  const mark = personMark(params.message);
+  if (typeof mark !== "string") {
+    return json(res, 200, rpcError(id, RpcCode.INVALID_PARAMS, 'metadata["agentmesh.audience"] must be a string'));
+  }
+  if (mark === "agent") return sendMessage(bridge, res, id, params, manifest, requester, callerKey, activated);
+  if (activated) res.setHeader("A2A-Extensions", OVER_A2A_URI);
+  const text = (params.message.parts ?? []).filter((p) => typeof (p as { text?: unknown }).text === "string").map((p) => (p as { text: string }).text).join("\n");
+  if (!text) return json(res, 200, rpcError(id, RpcCode.INVALID_PARAMS, "A message for the person needs a text part"));
+  const contextId = typeof params.message.contextId === "string" && params.message.contextId ? params.message.contextId : undefined;
+  try {
+    const out = await requester.sendToPerson(manifest.id, text, { ...(contextId ? { context_id: contextId } : {}), timeout_ms: 30_000 });
+    const task: A2ATask = {
+      id: out.request_id,
+      ...(contextId ? { contextId } : {}),
+      status: { state: out.outcome === "answered" ? "completed" : "submitted", timestamp: new Date().toISOString() },
+      metadata: { "agentmesh.audience": "person" },
+    };
+    bridge.putTask({ task, responder: manifest.id, callerKey, queued: { inbox_id: out.inbox_id ?? null } });
+    return json(res, 200, rpcResult(id, { task } satisfies SendMessageResult));
+  } catch (err) {
     const mapped = meshErrorToRpc(err);
     res.writeHead(mapped.httpStatus === 200 ? 200 : mapped.httpStatus, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ jsonrpc: "2.0", id, error: mapped.error }));

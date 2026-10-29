@@ -28,6 +28,7 @@ import { budgetInsufficient } from "../../src/budget.js";
 import { Room, type RoomHost, type RoomMessage } from "../../src/rooms.js";
 import type { Envelope } from "../../src/types/envelope.js";
 import type { RespondPayload } from "../../src/types/primitives.js";
+import { checkReadableText, personReadableText } from "../../src/readable-text.js";
 import {
   AUDIENCE_DECLARATION,
   AUDIENCE_FRAME_LINE,
@@ -513,6 +514,8 @@ describe("sendToPerson and replyToPerson: refuse by default, mark the envelope",
     expect(r.meta?.audience).toBe("person");
     expect(r.task_id).toBeUndefined();
     expect(r.payload).toEqual({ status: "completed", text: "Thanks" });
+    // §5.8: the digest of the generated readable text rides under the signature.
+    expect((await checkReadableText(r, personReadableText({ sender: a.agent.agentId, text: "Thanks" }))).ok).toBe(true);
   });
 
   it("send-anyway skips the check and the envelope carries the mark, no budget and no task id", async () => {
@@ -537,6 +540,7 @@ describe("sendToPerson and replyToPerson: refuse by default, mark the envelope",
     expect(env.budget).toBeUndefined();
     expect(env.task_id).toBeUndefined();
     expect(env.payload).toEqual({ text: "For Rosa" });
+    expect((await checkReadableText(env, personReadableText({ sender: a.agent.agentId, text: "For Rosa" }))).ok).toBe(true);
     expect(b.handled).toHaveLength(0);
   });
 

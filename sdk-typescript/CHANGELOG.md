@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+Signed messages across A2A, and readable text a person can check.
+
+- **`MeshNode.relayEnvelope(env)`** publishes an envelope another key signed,
+  unchanged, to the inbox of the agent its `to` names, after checking its
+  signature. **`MeshNode.watchEnvelopes(subject, handler)`** reads envelopes on a
+  subject the node does not host, each checked on its own signature first. The
+  A2A gateway uses both to pass a caller's own signed request through to the
+  mesh (the A2A Bridge's Agent Messaging over A2A extension).
+- **Readable text (Agent Messaging §5.8).** A new module holds the
+  normalization, the digest, the text for a message written to a person, and
+  the check software runs before it shows such text: `normalizeReadableText`,
+  `readableTextDigest`, `readableTextMeta`, `personReadableText`,
+  `checkReadableText`. `sendToPerson` and `replyToPerson` now sign
+  `meta.readable_text`, the digest of the text a carrier shows the person.
+
 ## 0.63.0 (2026-10-20)
 
 The server never confirms "the requester did not ask for this cancel" until it
