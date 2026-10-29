@@ -1150,11 +1150,12 @@ export class Bridge {
     const live = (entry?.agent as { getTask?: (id: string) => { state?: string; history?: Envelope[] } | undefined } | undefined)?.getTask?.(rec.task.id);
     if (!live?.state) return;
     const state = meshStateToA2A(live.state as never);
-    if (state === rec.task.status.state && !stateMetadata(live.state)["agentmesh.state"]) return;
     const last = Array.isArray(live.history) ? live.history[live.history.length - 1] : undefined;
+    const words = last ? statusMessage(last) : {};
+    if (state === rec.task.status.state && !stateMetadata(live.state)["agentmesh.state"] && (rec.task.status.message || !words.message)) return;
     rec.task = {
       ...rec.task,
-      status: { state, timestamp: new Date().toISOString(), ...(last ? statusMessage(last) : {}) },
+      status: { state, timestamp: new Date().toISOString(), ...(words.message ? words : rec.task.status.message ? { message: rec.task.status.message } : {}) },
       metadata: { ...withoutState(rec.task.metadata), ...stateMetadata(live.state) },
     };
   }

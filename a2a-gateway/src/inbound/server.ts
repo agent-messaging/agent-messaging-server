@@ -1065,7 +1065,14 @@ async function sendMessage(
     const task: A2ATask = {
       id: result.task_id,
       ...(taskCtx ? { contextId: taskCtx } : {}),
-      status: { state: meshStateToA2A(result.payload.status), timestamp: new Date().toISOString() },
+      status: {
+        state: meshStateToA2A(result.payload.status),
+        timestamp: new Date().toISOString(),
+        // What a paused task asks for (EXT-14 §8): the agent's own words.
+        ...(typeof result.payload.message === "string" && result.payload.message
+          ? { message: { role: "ROLE_AGENT" as const, parts: [{ text: result.payload.message }], messageId: `${result.envelope.id}-status` } }
+          : {}),
+      },
       ...(activated || result.payload.status === "exhausted"
         ? { metadata: { ...(activated ? envelopeMetadata(result.envelope as Envelope) : {}), ...stateMetadata(result.payload.status) } }
         : {}),

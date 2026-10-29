@@ -81,6 +81,16 @@ describe("the conversation and the knock", () => {
     expect(answered.result.task.status.message.parts).toEqual([{ text: "40 chairs, delivered: 1,260 USD" }]);
   });
 
+  it("a first answer that already asks for input carries the agent's question, and GetTask keeps it", async () => {
+    const { mesh, port } = await boot();
+    mesh.answer = () => ({ task_id: "t-5", payload: { status: "input_required", message: "Which delivery date?" }, envelope: { id: "e-5", from: AGENT } });
+    const first = await rpc(port, "SendMessage", say("Quote for 40 chairs"));
+    expect(first.result.task.status).toMatchObject({ state: "input-required", message: { parts: [{ text: "Which delivery date?" }] } });
+    mesh.liveTasks.set("t-5", { state: "input_required", history: [] });
+    const got = await rpc(port, "GetTask", { id: "t-5" });
+    expect(got.result.task.status.message.parts[0].text).toBe("Which delivery date?");
+  });
+
   it("refuses an answer on a task that is not waiting, on another caller's task, or with a mismatched context", async () => {
     const { mesh, port } = await boot();
     mesh.answer = () => ({ task_id: "t-2", payload: { status: "working" }, envelope: { id: "e-1", from: AGENT, context_id: "ctx-2" } });
