@@ -53,7 +53,7 @@ spec:
         fsGroup: 1000
       containers:
         - name: first-run
-          image: ghcr.io/agent-messaging/agent-messaging-server:0.4.7
+          image: ghcr.io/agent-messaging/agent-messaging-server:0.4.8
           args: ["first-run"]
           envFrom:
             - configMapRef:
@@ -227,7 +227,7 @@ spec:
               mountPath: /config
       containers:
         - name: server
-          image: ghcr.io/agent-messaging/agent-messaging-server:0.4.7
+          image: ghcr.io/agent-messaging/agent-messaging-server:0.4.8
           env:
             - { name: MESH_AMQP_URL, value: "amqp://rabbitmq:5672/mesh" }
             - { name: MESH_RABBITMQ_MANAGEMENT_URL, value: "http://rabbitmq:15672" }
@@ -304,7 +304,7 @@ spec:
               mountPath: /config
       containers:
         - name: a2a-gateway
-          image: ghcr.io/agent-messaging/agent-messaging-a2a-gateway:0.4.7
+          image: ghcr.io/agent-messaging/agent-messaging-a2a-gateway:0.4.8
           env:
             - { name: MESH_URL, value: "amqp://rabbitmq:5672/mesh" }
             - { name: CREDS_FILE, value: /config/creds/a2a-gateway.creds }
