@@ -16,6 +16,9 @@ Signed messages across A2A, and readable text a person can check.
   `readableTextDigest`, `readableTextMeta`, `personReadableText`,
   `checkReadableText`. `sendToPerson` and `replyToPerson` now sign
   `meta.readable_text`, the digest of the text a carrier shows the person.
+- **`RequestConfig.task_id`** continues an existing Task: the follow-up
+  request that answers a responder waiting in `input_required` (§7.3). The A2A
+  gateway sends it when an A2A caller answers on the same task.
 
 ## 0.63.0 (2026-10-20)
 

@@ -32,7 +32,13 @@ import {
   markedForPerson,
   overA2AActivated,
   readableTextPart,
+  overA2AMetadata,
+  stateMetadata,
+  knockInput,
+  HELD_SENTENCE,
+  KNOCK_SENTENCE,
 } from "../core/over-a2a.js";
+import { randomUUID } from "node:crypto";
 import { AUDIENCE_URI } from "../core/card.js";
 import { AdminError, type AttachmentManager, type CreateAttachmentInput } from "../outbound/manager.js";
 import { redactKey } from "./keys.js";
@@ -778,6 +784,15 @@ async function handleRpc(
 
   switch (rpc.method) {
     case "SendMessage":
+      // A knock (EXT-14 §8): asks to be let in, and carries no words.
+      if (overA2AMetadata(sendParams?.message)?.knock !== undefined) {
+        return sendKnock(bridge, res, id, sendParams!, manifest, requester, callerKey);
+      }
+      // An answer on an existing task (EXT-14 §7): the caller's reply to an
+      // input-required task, sent to the mesh task it stands for.
+      if (typeof sendParams?.message?.taskId === "string" && sendParams.message.taskId) {
+        return continueTask(bridge, res, id, sendParams, manifest, requester, callerKey, overA2AActivated(sendParams.message, header(req, "a2a-extensions")));
+      }
       if (personMark(sendParams?.message) !== undefined) {
         return sendToPerson(bridge, res, id, sendParams!, manifest, requester, callerKey, overA2AActivated(sendParams?.message, header(req, "a2a-extensions")));
       }
@@ -917,9 +932,10 @@ function tapInbound(
  * `submitted`. The task's id is the mesh request's id, because that is what
  * the reply names when it comes (Bridge.lateReply completes it).
  */
-function queuedTask(err: MeshError): A2ATask | null {
+function queuedTask(err: MeshError, byDoor = false): A2ATask | null {
   const det = (err.details ?? {}) as { request_id?: unknown; inbox_id?: unknown };
   if (typeof det.request_id !== "string" || !det.request_id) return null;
+  if (byDoor) return heldTask(det.request_id);
   return {
     id: det.request_id,
     status: {
@@ -935,6 +951,26 @@ function queuedTask(err: MeshError): A2ATask | null {
 }
 const QUEUED_SENTENCE =
   "The agent's node has queued this message for its attended session, so a person or a live session answers it, and that can take hours. The reply, if any, lands on this task as an artifact: poll GetTask for it rather than holding the call. The gateway keeps this task for 24 hours.";
+
+/**
+ * A first contact the agent's door holds (EXT-14 §8): the mesh's admission
+ * service answered for the agent with its queued acknowledgement. On A2A that
+ * is a task in `auth-required`, whose message says how to be let in. The same
+ * answer whether the door holds the caller, blocks it, or the agent does not
+ * exist, as on the mesh; never `rejected`, which would tell a block apart.
+ */
+function heldTask(requestId: string, contextId?: string): A2ATask {
+  return {
+    id: requestId,
+    ...(contextId ? { contextId } : {}),
+    status: {
+      state: "auth-required",
+      timestamp: new Date().toISOString(),
+      message: { role: "ROLE_AGENT", parts: [{ text: HELD_SENTENCE }], messageId: `${requestId}-held` },
+    },
+    metadata: { "agentmesh.admission": "held" },
+  };
+}
 
 function queuedInboxId(err: MeshError): string | null {
   const det = (err.details ?? {}) as { inbox_id?: unknown };
@@ -961,13 +997,22 @@ async function sendMessage(
   const tap = (outcome: "ok" | "error") =>
     tapInbound(bridge, callerKey, { responder: manifest.id, offering: prep.skill, outcome, startedAt });
 
+  let queuedBy: string | undefined;
   try {
     const contextId = typeof params?.message?.contextId === "string" && params.message.contextId ? params.message.contextId : undefined;
     const result = await requester.request(
       manifest.id,
       prep.skill,
       prep.input,
-      withAttribution(bridge, callerKey, { timeout_ms: 60_000, ...(contextId ? { context_id: contextId } : {}) }),
+      withAttribution(bridge, callerKey, {
+        timeout_ms: 60_000,
+        ...(contextId ? { context_id: contextId } : {}),
+        // Who signed a queued acknowledgement: the agent's own node, or the
+        // mesh's door answering for an agent that has not let the caller in.
+        onQueued: (_ack, env) => {
+          queuedBy = env.from;
+        },
+      }),
     );
     tap("ok");
 
@@ -996,17 +1041,20 @@ async function sendMessage(
       id: result.task_id,
       ...(taskCtx ? { contextId: taskCtx } : {}),
       status: { state: meshStateToA2A(result.payload.status), timestamp: new Date().toISOString() },
-      ...(activated ? { metadata: envelopeMetadata(result.envelope as Envelope) } : {}),
+      ...(activated || result.payload.status === "exhausted"
+        ? { metadata: { ...(activated ? envelopeMetadata(result.envelope as Envelope) : {}), ...stateMetadata(result.payload.status) } }
+        : {}),
     };
-    bridge.putTask({ task, responder: manifest.id, callerKey });
+    bridge.putTask({ task, responder: manifest.id, callerKey, offering: prep.skill });
     return json(res, 200, rpcResult(id, { task } satisfies SendMessageResult));
   } catch (err) {
     // Queued at the responder's node for an attended session: delivered, not
-    // answered. That is a task in `submitted`, and the call succeeded.
-    const queued = err instanceof MeshError && err.code === ErrorCode.REQUEST_QUEUED ? queuedTask(err) : null;
+    // answered. That is a task in `submitted`, and the call succeeded. Queued
+    // by the mesh's door instead: a first contact held (EXT-14 §8).
+    const queued = err instanceof MeshError && err.code === ErrorCode.REQUEST_QUEUED ? queuedTask(err, queuedBy !== undefined && queuedBy !== manifest.id) : null;
     if (queued) {
       tap("ok");
-      bridge.putTask({ task: queued, responder: manifest.id, callerKey, queued: { inbox_id: queuedInboxId(err as MeshError) } });
+      bridge.putTask({ task: queued, responder: manifest.id, callerKey, queued: { inbox_id: queuedInboxId(err as MeshError) }, offering: prep.skill });
       return json(res, 200, rpcResult(id, { task: queued } satisfies SendMessageResult));
     }
     tap("error");
@@ -1063,6 +1111,16 @@ async function sendSigned(
   tap("ok");
   const r = outcome.envelope;
 
+  // A first contact the mesh's door holds (EXT-14 §8).
+  if (outcome.kind === "queued" && outcome.byDoor) {
+    const task: A2ATask = { ...heldTask(env.id, env.context_id), metadata: { "agentmesh.admission": "held", ...envelopeMetadata(r) } };
+    bridge.putTask({ task, responder: manifest.id, callerKey, queued: { inbox_id: null }, signer: env.from, offering });
+    bridge.watchSignedLateReply(env.id, env.from, manifest.id);
+    return json(res, 200, rpcResult(id, { task }));
+  }
+  // The caller's own signed knock (EXT-14 §8).
+  if (offering === "knock") return answerKnock(res, id, env.id, outcome.kind === "answer" ? r : undefined, callerKey, manifest.id, bridge, env.from);
+
   if (outcome.kind === "queued") {
     const det = (r.payload ?? {}) as { inbox_id?: unknown; output?: { inbox_id?: unknown } };
     const inbox = typeof det.inbox_id === "string" ? det.inbox_id : typeof det.output?.inbox_id === "string" ? det.output.inbox_id : null;
@@ -1102,9 +1160,9 @@ async function sendSigned(
     id: r.task_id,
     ...(r.context_id ?? env.context_id ? { contextId: (r.context_id ?? env.context_id)! } : {}),
     status: { state: meshStateToA2A(status), timestamp: new Date().toISOString() },
-    metadata: envelopeMetadata(r),
+    metadata: { ...envelopeMetadata(r), ...stateMetadata(p.status) },
   };
-  bridge.putTask({ task, responder: manifest.id, callerKey, signer: env.from });
+  bridge.putTask({ task, responder: manifest.id, callerKey, signer: env.from, offering });
   bridge.watchSignedTask(r.task_id, manifest.id);
   return json(res, 200, rpcResult(id, { task } satisfies SendMessageResult));
 }
@@ -1202,6 +1260,149 @@ async function sendToPerson(
   }
 }
 
+// ─── The conversation and the knock (EXT-14 §7, §8) ──────────────────
+
+/**
+ * The caller's answer on an existing task (EXT-14 §7, A2A §3.4.3): a message
+ * whose `taskId` names a task this caller started, which the agent paused in
+ * `input-required` or `auth-required`. The gateway sends it as the follow-up
+ * request Agent Messaging §7.3 names, on the same mesh task and context, so
+ * the agent resumes its own task.
+ */
+async function continueTask(
+  bridge: Bridge,
+  res: ServerResponse,
+  id: JsonRpcRequest["id"],
+  params: SendMessageParams,
+  manifest: Manifest,
+  requester: AgentMesh,
+  callerKey: string,
+  activated: boolean,
+): Promise<void> {
+  const taskId = params.message.taskId!;
+  const rec = bridge.getTaskRecord(taskId);
+  if (!rec || rec.callerKey !== callerKey || rec.responder !== manifest.id || rec.signer) {
+    return json(res, 200, rpcError(id, RpcCode.TASK_NOT_FOUND, "Task not found"));
+  }
+  if (params.message.contextId && rec.task.contextId && params.message.contextId !== rec.task.contextId) {
+    return json(res, 200, rpcError(id, RpcCode.INVALID_PARAMS, "message.contextId differs from the task's context"));
+  }
+  bridge.refreshFromHosted(rec);
+  const state = rec.task.status.state;
+  if (state !== "input-required" && state !== "auth-required") {
+    return json(res, 200, rpcError(id, RpcCode.INVALID_PARAMS, `The task is ${state}; only a task waiting for input takes an answer.`, { agentmesh_code: "TASK_INVALID_TRANSITION" }));
+  }
+  if (activated) res.setHeader("A2A-Extensions", OVER_A2A_URI);
+  let input: unknown;
+  try {
+    input = await partsToInput(params.message.parts ?? [], fileSink(requester));
+  } catch (err) {
+    if (err instanceof FilePartError) return json(res, 200, rpcError(id, RpcCode.CONTENT_TYPE_NOT_SUPPORTED, err.message));
+    if (err instanceof FileStoreError) return json(res, 200, rpcError(id, RpcCode.INTERNAL_ERROR, err.message));
+    throw err;
+  }
+  const startedAt = Date.now();
+  const offering = rec.offering ?? manifest.offerings[0]?.id ?? "chat";
+  try {
+    const result = await requester.request(
+      manifest.id,
+      offering,
+      input,
+      withAttribution(bridge, callerKey, { timeout_ms: 60_000, task_id: taskId, ...(rec.task.contextId ? { context_id: rec.task.contextId } : {}) }),
+    );
+    tapInbound(bridge, callerKey, { responder: manifest.id, offering, outcome: "ok", startedAt });
+    const st = result.payload.status;
+    const done = st === "completed";
+    const task: A2ATask = {
+      ...rec.task,
+      status: {
+        state: meshStateToA2A(st),
+        timestamp: new Date().toISOString(),
+        ...(done
+          ? { message: { role: "ROLE_AGENT" as const, parts: outputToParts(await linkFiles(result.payload.output, meshLinker(requester))), messageId: result.envelope.id } }
+          : typeof result.payload.message === "string" && result.payload.message
+            ? { message: { role: "ROLE_AGENT" as const, parts: [{ text: result.payload.message }], messageId: `${result.envelope.id}-status` } }
+            : {}),
+      },
+      metadata: { ...(activated ? envelopeMetadata(result.envelope as Envelope) : {}), ...stateMetadata(st) },
+    };
+    bridge.updateTask(taskId, task);
+    return json(res, 200, rpcResult(id, { task } satisfies SendMessageResult));
+  } catch (err) {
+    tapInbound(bridge, callerKey, { responder: manifest.id, offering, outcome: "error", startedAt });
+    const mapped = meshErrorToRpc(err);
+    res.writeHead(mapped.httpStatus === 200 ? 200 : mapped.httpStatus, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ jsonrpc: "2.0", id, error: mapped.error }));
+  }
+}
+
+/**
+ * A knock from a caller with no key (EXT-14 §8, EXT-6 §9.3): sent as the
+ * content-free `knock` request from the caller's hosted identity. The A2A
+ * message's parts are never sent: a knock carries no words.
+ */
+async function sendKnock(
+  bridge: Bridge,
+  res: ServerResponse,
+  id: JsonRpcRequest["id"],
+  params: SendMessageParams,
+  manifest: Manifest,
+  requester: AgentMesh,
+  callerKey: string,
+): Promise<void> {
+  const k = knockInput(overA2AMetadata(params.message)?.knock);
+  if (!k.ok) return json(res, 200, rpcError(id, RpcCode.INVALID_PARAMS, k.message, { agentmesh_code: "KNOCK_CARRIES_NO_MESSAGE" }));
+  const knockId = randomUUID();
+  try {
+    const result = await requester.request(manifest.id, "knock", k.input, withAttribution(bridge, callerKey, { timeout_ms: 30_000 }));
+    return answerKnock(res, id, knockId, { ...(result.envelope as Envelope), payload: result.payload } as Envelope, callerKey, manifest.id, bridge);
+  } catch (err) {
+    // A held or blocked knock, and no such agent, all look the same.
+    if (err instanceof MeshError && (err.code === ErrorCode.REQUEST_QUEUED || err.code === ErrorCode.TRANSPORT_TIMEOUT || err.code === ErrorCode.TRANSPORT_NO_RESPONDERS)) {
+      return answerKnock(res, id, knockId, undefined, callerKey, manifest.id, bridge);
+    }
+    if (err instanceof MeshError && (err.code as string) === "KNOCK_CARRIES_NO_MESSAGE") {
+      return json(res, 200, rpcError(id, RpcCode.INVALID_PARAMS, err.message, { agentmesh_code: "KNOCK_CARRIES_NO_MESSAGE" }));
+    }
+    const mapped = meshErrorToRpc(err);
+    json(res, 200, { jsonrpc: "2.0", id, error: mapped.error });
+  }
+}
+
+/**
+ * The A2A answer to a knock (EXT-14 §8): a caller the door lets in gets a
+ * Message saying so, with the extensions the agent declares; anyone else gets
+ * a task in `auth-required`, the same answer for every other outcome.
+ */
+function answerKnock(
+  res: ServerResponse,
+  id: JsonRpcRequest["id"],
+  knockId: string,
+  answer: Envelope | undefined,
+  callerKey: string,
+  responder: string,
+  bridge: Bridge,
+  signer?: string,
+): void {
+  const out = ((answer?.payload as { output?: unknown } | undefined)?.output ?? {}) as { admitted?: unknown; extensions?: unknown };
+  if (answer && !answer.error && answer.from === responder && out.admitted === true) {
+    const message = {
+      role: "ROLE_AGENT" as const,
+      parts: [{ data: { admitted: true, ...(Array.isArray(out.extensions) ? { extensions: out.extensions } : {}) } }],
+      messageId: answer.id,
+      metadata: envelopeMetadata(answer),
+    };
+    return json(res, 200, rpcResult(id, { message } as SendMessageResult));
+  }
+  const task: A2ATask = {
+    id: knockId,
+    status: { state: "auth-required", timestamp: new Date().toISOString(), message: { role: "ROLE_AGENT", parts: [{ text: KNOCK_SENTENCE }], messageId: `${knockId}-knock` } },
+    metadata: { "agentmesh.admission": "knocked" },
+  };
+  bridge.putTask({ task, responder, callerKey, ...(signer ? { signer } : {}) });
+  json(res, 200, rpcResult(id, { task } satisfies SendMessageResult));
+}
+
 // ─── SendStreamingMessage (§4.4) ─────────────────────────────────────
 
 async function sendStreamingMessage(
@@ -1227,20 +1428,27 @@ async function sendStreamingMessage(
 
   const askedContext = typeof params?.message?.contextId === "string" && params.message.contextId ? params.message.contextId : undefined;
   let stream;
+  let queuedBy: string | undefined;
   try {
     stream = await requester.requestStream(
       manifest.id,
       prep.skill,
       prep.input,
-      withAttribution(bridge, callerKey, { timeout_ms: 60_000, ...(askedContext ? { context_id: askedContext } : {}) }),
+      withAttribution(bridge, callerKey, {
+        timeout_ms: 60_000,
+        ...(askedContext ? { context_id: askedContext } : {}),
+        onQueued: (_ack, env) => {
+          queuedBy = env.from;
+        },
+      }),
     );
   } catch (err) {
     // Queued for an attended session: one event, the submitted task, and the
     // stream ends. The reply lands on the task; the client polls GetTask.
-    const queued = err instanceof MeshError && err.code === ErrorCode.REQUEST_QUEUED ? queuedTask(err) : null;
+    const queued = err instanceof MeshError && err.code === ErrorCode.REQUEST_QUEUED ? queuedTask(err, queuedBy !== undefined && queuedBy !== manifest.id) : null;
     if (queued) {
       tap("ok");
-      bridge.putTask({ task: queued, responder: manifest.id, callerKey, queued: { inbox_id: queuedInboxId(err as MeshError) } });
+      bridge.putTask({ task: queued, responder: manifest.id, callerKey, queued: { inbox_id: queuedInboxId(err as MeshError) }, offering: prep.skill });
       res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
       res.write(`data: ${JSON.stringify(rpcResult(id, { task: queued }))}\n\n`);
       res.end();
@@ -1310,6 +1518,7 @@ function getTask(
   if (!rec || rec.callerKey !== callerKey) {
     return json(res, 200, rpcError(id, RpcCode.TASK_NOT_FOUND, "Task not found"));
   }
+  bridge.refreshFromHosted(rec);
   json(res, 200, rpcResult(id, { task: rec.task }));
 }
 

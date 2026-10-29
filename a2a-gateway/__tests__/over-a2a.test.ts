@@ -139,13 +139,14 @@ describe("Agent Messaging over A2A", () => {
     expect(mesh.relayed).toHaveLength(0);
   });
 
-  it("a request held at the mesh's door is a submitted task", async () => {
+  it("a request held at the mesh's door is a task in auth-required that says how to be let in", async () => {
     const { mesh, port } = await boot();
     const req = signedRequest();
     answerWith(mesh, (r) => respondTo(r, { output: { queued: true, inbox_id: "i-1", text: "Sent; it reaches the recipient if the recipient admits you." } }, {}, door));
     const out = await rpc(port, carry(req));
     expect(out.body.result.task.id).toBe(req.id);
-    expect(out.body.result.task.status.state).toBe("submitted");
+    expect(out.body.result.task.status.state).toBe("auth-required");
+    expect(out.body.result.task.status.message.parts[0].text).toMatch(/knock/);
   });
 
   it("an answer signed by a third party is not taken as the agent's", async () => {

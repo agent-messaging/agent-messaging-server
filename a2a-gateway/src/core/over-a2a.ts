@@ -26,6 +26,8 @@ export interface OverA2AMetadata {
   /** On a text part: this part is the readable text generated from the
    *  envelope beside it (Agent Messaging §5.8). */
   readable_text?: boolean;
+  /** A knock (EXT-14 §8): asks to be let in, with only `via` and `grants`. */
+  knock?: unknown;
 }
 
 /** The extension's entry in a generated card's `capabilities.extensions[]`. */
@@ -146,3 +148,37 @@ export function readableTextPart(env: Envelope, senderLabel?: string): A2APart {
 export async function readableTextFor(sender: string, text: string): Promise<{ v: number; text: string }> {
   return readableTextMeta(personReadableText({ sender, text }));
 }
+
+// ─── The conversation and the knock (EXT-14 §7, §8) ────────────────────
+
+/**
+ * A2A task-status fields for a mesh state. A2A has no `exhausted`; the
+ * gateway maps it to `canceled` (MAPPING.md §5) and says so in the task's
+ * metadata, `agentmesh.state`, so a caller can tell work that stopped at its
+ * cap from work somebody canceled.
+ */
+export function stateMetadata(meshState: string | undefined): Record<string, unknown> {
+  return meshState === "exhausted" ? { "agentmesh.state": "exhausted" } : {};
+}
+
+/** What an A2A caller may put in a knock (EXT-6 §9.3): `via` and `grants`,
+ *  nothing else, and never words. */
+export function knockInput(raw: unknown): { ok: true; input: { via?: string; grants: string[] } } | { ok: false; message: string } {
+  if (raw === true || raw === undefined || raw === null) return { ok: true, input: { grants: [] } };
+  if (typeof raw !== "object" || Array.isArray(raw)) return { ok: false, message: "A knock is an object with only via and grants." };
+  const { via, grants, ...rest } = raw as { via?: unknown; grants?: unknown };
+  if (Object.keys(rest).length) return { ok: false, message: `A knock carries no message: ${Object.keys(rest).join(", ")} cannot ride on one. Say it after you are let in.` };
+  if (via !== undefined && (typeof via !== "string" || via.length > 80)) return { ok: false, message: "A knock's via is a label of at most 80 characters." };
+  if (grants !== undefined && (!Array.isArray(grants) || grants.some((g) => typeof g !== "string"))) return { ok: false, message: "A knock's grants is a list of grant names." };
+  return { ok: true, input: { ...(typeof via === "string" ? { via } : {}), grants: (grants as string[] | undefined) ?? [] } };
+}
+
+/** The status message of a first contact the agent's door holds. The same
+ *  words whether the door holds it, blocks it, or the agent does not exist,
+ *  as on the mesh (EXT-6 §9.3). */
+export const HELD_SENTENCE =
+  "This agent's owner has not let you in. What you sent is with the owner, who decides whether to admit you, and nothing reaches the agent until they do. If they let you in, it is delivered, and a reply that names this request lands on this task, so poll GetTask. To ask to be let in without sending anything, send a knock: a message that lists mesh://extensions/agent-messaging-over-a2a/v1 in extensions, with { \"knock\": {} } under that URI in metadata.";
+
+/** The answer to a knock from a caller the door has not let in. */
+export const KNOCK_SENTENCE =
+  "Your knock is with this agent's owner. You are not let in yet, or there is no such agent; the answer is the same either way. Nothing more is needed from you: send your message again once you are let in.";

@@ -60,6 +60,8 @@ export interface FakeMesh {
   personSends: Array<{ from: string; to: string; text: string; opts?: unknown }>;
   /** Set to decide what sendToPerson returns; unset, `queued`. */
   personAnswer?: (send: { from: string; to: string; text: string }) => unknown;
+  /** What each hosted identity's task tracker says, by task id (SDK getTask). */
+  liveTasks: Map<string, { state: string; history?: unknown[] }>;
 }
 
 /** Put a Bridge into the "connected" state with a stub node and courier, so the
@@ -93,6 +95,7 @@ export function fakeConnect(
     },
     personHandlers: new Map(),
     personSends: [],
+    liveTasks: new Map(),
   };
   let n = 0;
   const internals = bridge as unknown as { node: unknown; courier: unknown };
@@ -120,6 +123,7 @@ export function fakeConnect(
         onDefault: (handler: (input: unknown, ctx: unknown) => unknown) => {
           mesh.defaultHandlers.set(id, handler);
         },
+        getTask: (taskId: string) => mesh.liveTasks.get(taskId),
         onPersonMessage: (handler: (m: unknown) => void) => {
           mesh.personHandlers.set(id, handler);
         },
