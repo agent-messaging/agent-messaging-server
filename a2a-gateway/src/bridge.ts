@@ -223,7 +223,7 @@ export class Bridge {
   private proxies: ProxySet | null;
   private tasks = new Map<string, TaskRecord>();
   private manifestCache = new Map<string, { manifest: Manifest; at: number }>();
-  private descriptorCache = new Map<string, { descriptor: Record<string, unknown> | null; at: number }>();
+  private descriptorCache = new Map<string, { descriptor: Record<string, unknown> | null; bytes?: Uint8Array; at: number }>();
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(config: BridgeConfig) {
@@ -376,22 +376,36 @@ export class Bridge {
    *  the JSON its adapter submitted; null when it submitted none. Cached a
    *  minute, the same as manifests. */
   async agentDescriptor(agentId: string): Promise<Record<string, unknown> | null> {
+    return (await this.agentDescriptorBytes(agentId))?.descriptor ?? null;
+  }
+
+  /** The agent's Descriptor as the registry holds it: the exact bytes its
+   *  digest covers (EXT-14 §10), and the parsed document. Null when the agent
+   *  submitted none. Cached a minute, the same as manifests. */
+  async agentDescriptorBytes(agentId: string): Promise<{ descriptor: Record<string, unknown>; bytes: Uint8Array } | null> {
     const cached = this.descriptorCache.get(agentId);
-    if (cached && Date.now() - cached.at < MANIFEST_CACHE_MS) return cached.descriptor;
+    if (cached && Date.now() - cached.at < MANIFEST_CACHE_MS) {
+      return cached.descriptor && cached.bytes ? { descriptor: cached.descriptor, bytes: cached.bytes } : null;
+    }
     if (!this.courier || !/^[A-Z0-9]{56}$/.test(agentId)) return null;
     let descriptor: Record<string, unknown> | null = null;
+    let bytes: Uint8Array | undefined;
     try {
       const p = (await this.courier.serviceRequest(`mesh.registry.descriptor.get.${agentId}`, {}, 5000)) as { descriptor?: unknown };
       if (typeof p?.descriptor === "string") {
-        const doc = JSON.parse(Buffer.from(p.descriptor, "base64").toString("utf8")) as unknown;
-        if (doc && typeof doc === "object" && !Array.isArray(doc)) descriptor = doc as Record<string, unknown>;
+        const raw = Buffer.from(p.descriptor, "base64");
+        const doc = JSON.parse(raw.toString("utf8")) as unknown;
+        if (doc && typeof doc === "object" && !Array.isArray(doc)) {
+          descriptor = doc as Record<string, unknown>;
+          bytes = new Uint8Array(raw);
+        }
       }
     } catch {
       descriptor = null;
     }
     if (this.descriptorCache.size > 5000) this.descriptorCache.clear();
-    this.descriptorCache.set(agentId, { descriptor, at: Date.now() });
-    return descriptor;
+    this.descriptorCache.set(agentId, { descriptor, ...(bytes ? { bytes } : {}), at: Date.now() });
+    return descriptor && bytes ? { descriptor, bytes } : null;
   }
 
   /**
@@ -1136,11 +1150,12 @@ export class Bridge {
     const live = (entry?.agent as { getTask?: (id: string) => { state?: string; history?: Envelope[] } | undefined } | undefined)?.getTask?.(rec.task.id);
     if (!live?.state) return;
     const state = meshStateToA2A(live.state as never);
-    if (state === rec.task.status.state && !stateMetadata(live.state)["agentmesh.state"]) return;
     const last = Array.isArray(live.history) ? live.history[live.history.length - 1] : undefined;
+    const words = last ? statusMessage(last) : {};
+    if (state === rec.task.status.state && !stateMetadata(live.state)["agentmesh.state"] && (rec.task.status.message || !words.message)) return;
     rec.task = {
       ...rec.task,
-      status: { state, timestamp: new Date().toISOString(), ...(last ? statusMessage(last) : {}) },
+      status: { state, timestamp: new Date().toISOString(), ...(words.message ? words : rec.task.status.message ? { message: rec.task.status.message } : {}) },
       metadata: { ...withoutState(rec.task.metadata), ...stateMetadata(live.state) },
     };
   }

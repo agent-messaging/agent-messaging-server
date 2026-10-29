@@ -90,6 +90,10 @@ import { fromTraceparent, toTraceparent } from "../../../sdk-typescript/src/inte
 import { runWithTrace } from "../../../sdk-typescript/src/internal/trace-ambient.js";
 import type { RequestConfig } from "../../../sdk-typescript/src/types/options.js";
 import { amEnvOptional } from "../am-env.js";
+import { cardFromDescriptor } from "../core/descriptor-card.js";
+import { createHash } from "node:crypto";
+import { validateBudget } from "../../../sdk-typescript/src/budget.js";
+import type { Budget } from "../../../sdk-typescript/src/types/envelope.js";
 import { handleHttpsFront, handleMcp, protectedResourceMetadata } from "./fronts.js";
 import { presentedCredential, ProofRefused } from "./proofs.js";
 
@@ -332,14 +336,30 @@ async function handle(
     const manifest = await bridge.exposableManifest(cardMatch[1]);
     if (!manifest) return json(res, 404, { error: "agent not found" });
     if (!isExposed(manifest)) return json(res, 403, meshOnly(cardMatch[1]));
-    return json(
-      res,
-      200,
-      manifestToCard(manifest, bridge.config.publicBaseUrl, {
-        apiKey: bridge.apiKeyRequired,
-        anonymous: bridge.anonymousAllowed,
-      }),
-    );
+    const card = manifestToCard(manifest, bridge.config.publicBaseUrl, {
+      apiKey: bridge.apiKeyRequired,
+      anonymous: bridge.anonymousAllowed,
+    });
+    // Generated from the agent's Descriptor where it published one (EXT-14
+    // §10): the Descriptor is the one description, the card a projection.
+    const described = await bridge.agentDescriptorBytes(manifest.id);
+    return json(res, 200, described ? cardFromDescriptor(card, manifest, described.descriptor, described.bytes, bridge.config.publicBaseUrl) : card);
+  }
+
+  // The agent's Descriptor, byte for byte, as the registry holds it: what the
+  // card's link names and its digest covers (EXT-14 §10).
+  const descMatch = path.match(/^\/agents\/([^/]+)\/descriptor\.json$/);
+  if (req.method === "GET" && descMatch) {
+    const caller = await admit(bridge, req);
+    if ("refused" in caller) return refuse(res, caller.refused);
+    if ("limited" in caller) return throttle(res, caller.retryAfter);
+    const manifest = await bridge.exposableManifest(descMatch[1]);
+    if (!manifest) return json(res, 404, { error: "agent not found" });
+    if (!isExposed(manifest)) return json(res, 403, meshOnly(descMatch[1]));
+    const described = await bridge.agentDescriptorBytes(manifest.id);
+    if (!described) return json(res, 404, { error: "this agent has published no Descriptor" });
+    res.writeHead(200, { "Content-Type": "application/json", Digest: `sha-256=${Buffer.from(createHash("sha256").update(described.bytes).digest()).toString("base64")}` });
+    return void res.end(Buffer.from(described.bytes));
   }
 
   const rpcMatch = path.match(/^\/agents\/([^/]+)\/rpc$/);
@@ -994,6 +1014,8 @@ async function sendMessage(
   if (activated) res.setHeader("A2A-Extensions", OVER_A2A_URI);
   const prep = await validateAndPrepare(params, manifest, fileSink(requester));
   if ("errResp" in prep) return json(res, 200, prep.errResp(id));
+  const budgeted = callerBudget(params);
+  if ("error" in budgeted) return json(res, 200, rpcError(id, RpcCode.INVALID_PARAMS, budgeted.error, { agentmesh_code: "INVALID_BUDGET" }));
 
   const startedAt = Date.now();
   const tap = (outcome: "ok" | "error") =>
@@ -1009,6 +1031,7 @@ async function sendMessage(
       withAttribution(bridge, callerKey, {
         timeout_ms: 60_000,
         ...(contextId ? { context_id: contextId } : {}),
+        ...(budgeted.budget ? { budget: budgeted.budget } : {}),
         // What a queued acknowledgement says: delivered to the inbox, or not
         // let in yet (EXT-14 §9).
         onQueued: (_ack, env) => {
@@ -1042,7 +1065,14 @@ async function sendMessage(
     const task: A2ATask = {
       id: result.task_id,
       ...(taskCtx ? { contextId: taskCtx } : {}),
-      status: { state: meshStateToA2A(result.payload.status), timestamp: new Date().toISOString() },
+      status: {
+        state: meshStateToA2A(result.payload.status),
+        timestamp: new Date().toISOString(),
+        // What a paused task asks for (EXT-14 §8): the agent's own words.
+        ...(typeof result.payload.message === "string" && result.payload.message
+          ? { message: { role: "ROLE_AGENT" as const, parts: [{ text: result.payload.message }], messageId: `${result.envelope.id}-status` } }
+          : {}),
+      },
       ...(activated || result.payload.status === "exhausted"
         ? { metadata: { ...(activated ? envelopeMetadata(result.envelope as Envelope) : {}), ...stateMetadata(result.payload.status) } }
         : {}),
@@ -1262,6 +1292,28 @@ async function sendToPerson(
   }
 }
 
+// ─── The budget (EXT-14 §11) ─────────────────────────────────────────
+
+/**
+ * The budget a caller with no key carries in the extension's metadata (Agent
+ * Messaging §7.7): the most the work may cost, the latest it may finish, or
+ * both. Checked here, so a malformed one is refused before anything is sent,
+ * and then carried on the request the gateway signs, where the agent applies
+ * it to the task as it applies any budget. A signed caller puts its budget in
+ * its own envelope instead.
+ */
+function callerBudget(params: SendMessageParams | undefined): { budget?: Budget } | { error: string } {
+  const raw = overA2AMetadata(params?.message)?.budget;
+  if (raw === undefined) return {};
+  try {
+    validateBudget(raw);
+  } catch (err) {
+    return { error: `The budget is not a valid Agent Messaging budget: ${(err as Error).message}` };
+  }
+  if ((raw as Budget).revision !== 0) return { error: "A new request carries its budget at revision 0 (Agent Messaging §7.7)." };
+  return { budget: raw as Budget };
+}
+
 // ─── The conversation and the knock (EXT-14 §8, §9) ──────────────────
 
 /**
@@ -1418,6 +1470,8 @@ async function sendStreamingMessage(
 ): Promise<void> {
   const prep = await validateAndPrepare(params, manifest, fileSink(requester));
   if ("errResp" in prep) return json(res, 200, prep.errResp(id));
+  const budgeted = callerBudget(params);
+  if ("error" in budgeted) return json(res, 200, rpcError(id, RpcCode.INVALID_PARAMS, budgeted.error, { agentmesh_code: "INVALID_BUDGET" }));
 
   const streamingSkill = manifest.offerings.find((s) => s.id === prep.skill)?.streaming === true;
   if (!streamingSkill) {
@@ -1439,6 +1493,7 @@ async function sendStreamingMessage(
       withAttribution(bridge, callerKey, {
         timeout_ms: 60_000,
         ...(askedContext ? { context_id: askedContext } : {}),
+        ...(budgeted.budget ? { budget: budgeted.budget } : {}),
         onQueued: (_ack, env) => {
           queuedAck = env;
         },
