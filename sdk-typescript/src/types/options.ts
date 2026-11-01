@@ -397,6 +397,12 @@ export interface RequestConfig {
   stream?: boolean;
   accepted_output?: string[];
   context_id?: string;
+  /** Ask the platform for a signed receipt of this call (EXT-15,
+   *  `mesh://extensions/receipts/v1`): `"summary"`, `"full"` or `"none"`.
+   *  Carried as `payload.config.receipt`. Absent, the caller's standing
+   *  default applies. The answer is never delayed for it: the receipt follows
+   *  as its own signed message to this agent's inbox, linked by request id. */
+  receipt?: "none" | "summary" | "full";
   /** Continue an existing Task (§6.4, §7.3): the follow-up `request` that
    *  answers a responder waiting in `input_required`. Carried as the
    *  envelope's `task_id`; the responder resumes the Task only for its own
