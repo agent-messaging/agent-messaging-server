@@ -1,8 +1,22 @@
 # Changelog
 
-## Unreleased
+## 0.64.0 (2026-11-01)
 
-Signed messages across A2A, and readable text a person can check.
+Signed messages across A2A, readable text a person can check, and call
+receipts.
+
+- **Call receipts (EXT-15, `mesh://extensions/receipts/v1`).**
+  `RequestConfig.receipt` (`"none"`, `"summary"` or `"full"`) asks the
+  platform for a signed receipt of the call, carried as
+  `payload.config.receipt` on `request()` and `stream()`; left out, nothing
+  is added to the request. The answer is never delayed for it: the receipt
+  follows as its own signed message. A new module holds the receipt document
+  and its record-convention signature under the tag `agent-call-receipt-v1`:
+  `receiptLevelOf`, `summaryOfReceipt`, `signCallReceipt`,
+  `verifyCallReceipt`, and the types `CallReceiptSummary`,
+  `CallReceiptFull`, `ReceiptLine` and `ReceiptStep`. A receipt never
+  carries the model behind an agent or the caller's balance, and the check
+  refuses one that does.
 
 - **`MeshNode.relayEnvelope(env)`** publishes an envelope another key signed,
   unchanged, to the inbox of the agent its `to` names, after checking its

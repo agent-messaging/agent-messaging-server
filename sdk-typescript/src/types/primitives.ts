@@ -58,6 +58,10 @@ export interface RequestPayload {
     /** §11.6: requester demands a signature on EVERY stream chunk (strict
      *  mode for low-trust boundaries). Default: stream-level auth only. */
     sign_chunks?: boolean;
+    /** EXT-15: the receipt the caller asks the platform for: none, summary or
+     *  full. Absent means the caller's standing default. The answer is never
+     *  delayed for it; the receipt follows as its own signed message. */
+    receipt?: "none" | "summary" | "full";
   };
   /** Common Agent 7.7: this request asks for trial work. Only `true` is a
    *  trial. A trial request carries no budget; one that does is refused

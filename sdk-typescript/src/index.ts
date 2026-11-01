@@ -470,6 +470,30 @@ export type {
   TrialNodeOptions,
 } from "./trial.js";
 export { preflightTrial } from "./preflight.js";
+
+// EXT-15 call receipts: the request field's levels, the receipt document and
+// its record-convention signature (agent-call-receipt-v1).
+export {
+  RECEIPTS_EXTENSION_URI,
+  CALL_RECEIPT_TAG,
+  CALL_RECEIPT_FORMAT,
+  RECEIPT_LEVELS,
+  receiptLevelOf,
+  summaryOfReceipt,
+  canonicalCallReceiptJSON,
+  signCallReceipt,
+  verifyCallReceipt,
+  type ReceiptLevel,
+  type ReceiptSettlement,
+  type RecordSignature,
+  type CallReceiptSummary,
+  type CallReceiptFull,
+  type CallReceiptDocument,
+  type SignedCallReceipt,
+  type ReceiptLine,
+  type ReceiptStep,
+  type CallReceiptVerdict,
+} from "./receipt.js";
 export type { TrialRequesterVouch } from "./types/primitives.js";
 
 // What a statement rested on (§5.6). The verdict is the reason this exists:

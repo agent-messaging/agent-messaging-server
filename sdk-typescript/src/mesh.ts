@@ -2524,6 +2524,7 @@ export class AgentMesh {
             timeout_ms: config.timeout_ms,
             stream: config.stream,
             accepted_output: config.accepted_output,
+            ...(config.receipt ? { receipt: config.receipt } : {}),
           }
         : undefined,
       ...(config?.trial === true ? { trial: true } : {}),
@@ -2770,6 +2771,7 @@ export class AgentMesh {
         stream: true,
         accepted_output: config?.accepted_output,
         sign_chunks: config?.sign_chunks,
+        ...(config?.receipt ? { receipt: config.receipt } : {}),
       },
       ...(config?.trial === true ? { trial: true } : {}),
       ...(config?.trial === true && config.trial_requester ? { trial_requester: config.trial_requester } : {}),
