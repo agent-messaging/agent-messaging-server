@@ -2259,6 +2259,8 @@ export interface JobsShowResult {
   };
   /** The job's page, where the person downloads the pieces. */
   page: string;
+  /** AgentMesh's signed receipt of the call that made the latest version, full tier: who did it, when, how long it took, what it cost line by line, whether the charge has settled, and what ran. Kept for every call AgentMesh sent, whether or not one was sent to the inbox. */
+  receipt?: Record<string, unknown>;
   /** How the person gets the pieces. */
   note?: string;
 }
