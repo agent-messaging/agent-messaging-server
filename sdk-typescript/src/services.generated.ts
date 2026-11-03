@@ -2259,8 +2259,6 @@ export interface JobsShowResult {
   };
   /** The job's page, where the person downloads the pieces. */
   page: string;
-  /** AgentMesh's signed receipt of the call that made the latest version, full tier: who did it, when, how long it took, what it cost line by line, whether the charge has settled, and what ran. Kept for every call AgentMesh sent, whether or not one was sent to the inbox. */
-  receipt?: Record<string, unknown>;
   /** How the person gets the pieces. */
   note?: string;
 }
@@ -4813,6 +4811,8 @@ export class SchedulesService implements SchedulesRequests {
   }
 }
 
+// ── states: Agent states ──────────────────────────────────────────
+
 // ── transform: Transform ──────────────────────────────────────────
 
 /** What transform.projects() sends. */
@@ -6078,6 +6078,14 @@ export const REQUEST_TIERS: Readonly<Record<string, "core" | "platform">> = {
   "schedules.list": "platform",
   "schedules.run_now": "platform",
   "schedules.pause": "platform",
+  "states.list": "platform",
+  "states.read": "platform",
+  "states.propose": "platform",
+  "states.move": "platform",
+  "states.confirm": "platform",
+  "states.decline": "platform",
+  "states.check": "platform",
+  "states.last_check": "platform",
   "transform.projects": "platform",
   "transform.summary": "platform",
   "transform.processes": "platform",
