@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.65.0 (2026-11-03)
+
+Three new AgentMesh platform services in the generated services list.
+
+- **`states`**: an organization's agent states (Intake, Managed, Triage,
+  Quarantined): list, read, propose a move, move, confirm, decline, and the
+  agent check with its latest result.
+- **`traffic`**: an organization's traffic edges between agents and the
+  metadata of past messages (never their content).
+- **`inventory`**: agents found in an organization's own environments:
+  report, list, bring one in, ignore one.
+
 ## 0.64.0 (2026-11-01)
 
 Signed messages across A2A, readable text a person can check, and call
