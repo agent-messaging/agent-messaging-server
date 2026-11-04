@@ -88,7 +88,7 @@ export default {
       // through the adapter's own signed-roster CLI (the roster is signature
       // verified, so it cannot be hand-written).
       await new Promise((resolve) => {
-        const cli = spawn(process.execPath, [ADAPTER, "contacts", "allow", kpS.getPublicKey(), "c12 test sender"], {
+        const cli = spawn(process.execPath, [ADAPTER, "contacts", "admit", kpS.getPublicKey(), "c12 test sender"], {
           env: { ...process.env, MESH_ADAPTER_STATE: state, MESH_CREDS_FILE: credsFile, MESH_URL: env.meshWsUrl, PAN_REGISTRAR: env.registrar, ...adapterMeshApiEnv(env) },
           stdio: ["ignore", "pipe", "pipe"],
         });

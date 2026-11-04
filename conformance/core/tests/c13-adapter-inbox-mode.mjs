@@ -79,7 +79,7 @@ export default {
       nc = await connect({ servers: env.meshWsUrl, authenticator: jwtAuthenticator(env.creds.jwt, te.encode(env.creds.seed)), timeout: 15_000, maxReconnectAttempts: 0 });
       const kpS = nkeys.createUser();
       const senderId = kpS.getPublicKey();
-      await cli(["contacts", "allow", senderId, "c13 test sender"]);
+      await cli(["contacts", "admit", senderId, "c13 test sender"]);
 
       // The sender's own inbox, to catch the session's reply.
       const replies = [];
@@ -100,7 +100,7 @@ export default {
       if (!inboxId) fails.push("queued acknowledgement carried no inbox_id");
 
       // 2. The message is visible to the live session.
-      const listed = await cli(["inbox", "--json"]);
+      const listed = await cli(["messages", "inbox", "--json"]);
       let queued = [];
       try { queued = JSON.parse(listed.slice(listed.indexOf("["), listed.lastIndexOf("]") + 1)); } catch { /* handled below */ }
       const mine = queued.find((e) => /c13-queued-message/.test(String(e.text ?? "")));
@@ -115,7 +115,7 @@ export default {
       //    fast-moving conversation silently vanished.
       if (inboxId) {
         const replyStarted = Date.now();
-        const replying = cli(["reply", inboxId, "c13-session-answer"]);
+        const replying = cli(["messages", "reply", inboxId, "c13-session-answer"]);
         await sleep(2000); // let the route load its snapshot and start delivery
         const req2 = signEnvelope(createEnvelope({
           type: "request", from: senderId, to: agentId,
@@ -137,7 +137,7 @@ export default {
         // timeout expires; don't declare survival before that moment has passed.
         const remaining = 32_000 - (Date.now() - replyStarted);
         if (remaining > 0) await sleep(remaining);
-        const after2 = await cli(["inbox", "--json"]);
+        const after2 = await cli(["messages", "inbox", "--json"]);
         if (!/c13-second-turn/.test(after2)) {
           fails.push("a message that arrived while a reply was in flight vanished from the inbox (lost-update race)");
         }
@@ -145,8 +145,8 @@ export default {
 
       // 4. Acking clears it from the queue.
       if (inboxId) {
-        await cli(["ack", inboxId]);
-        const after = await cli(["inbox", "--json"]);
+        await cli(["messages", "dismiss", inboxId]);
+        const after = await cli(["messages", "inbox", "--json"]);
         if (new RegExp("c13-queued-message").test(after) && !/"status":\s*"acked"/.test(after)) {
           fails.push("acked message still shows as pending in the inbox");
         }
