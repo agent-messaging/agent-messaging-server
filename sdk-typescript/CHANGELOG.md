@@ -2,7 +2,7 @@
 
 ## 0.65.0 (2026-11-03)
 
-Three new AgentMesh platform services in the generated services list.
+Four new AgentMesh platform services in the generated services list.
 
 - **`states`**: an organization's agent states (Intake, Managed, Triage,
   Quarantined): list, read, propose a move, move, confirm, decline, and the
@@ -11,6 +11,8 @@ Three new AgentMesh platform services in the generated services list.
   metadata of past messages (never their content).
 - **`inventory`**: agents found in an organization's own environments:
   report, list, bring one in, ignore one.
+- **`org_keys`**: keys an organization owns itself, which its admins create
+  and revoke, and its audit trail.
 
 ## 0.64.0 (2026-11-01)
 

@@ -3112,6 +3112,8 @@ export interface NamesRequests {
 
 // ── nda: Agent NDA ────────────────────────────────────────────────
 
+// ── org_keys: Organization keys ───────────────────────────────────
+
 // ── owner: Owner ──────────────────────────────────────────────────
 
 /** What owner.ask() sends. */
@@ -6464,6 +6466,10 @@ export const REQUEST_TIERS: Readonly<Record<string, "core" | "platform">> = {
   "nda.get": "platform",
   "nda.list": "platform",
   "nda.bound": "platform",
+  "org_keys.list": "platform",
+  "org_keys.create": "platform",
+  "org_keys.revoke": "platform",
+  "org_keys.audit": "platform",
   "owner.ask": "platform",
   "pact.send": "platform",
   "pact.connect": "platform",
