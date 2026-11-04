@@ -95,6 +95,8 @@ import {
   type SamplesRequests,
   type SchedulesRequests,
   type MandateRequests,
+  type InventoryRequests,
+  type TrafficRequests,
 } from "./services.generated.js";
 import { platformCaller } from "./service-caller.js";
 import type {
@@ -3951,6 +3953,20 @@ export class AgentMesh {
    *  whether a person may commit the organization to an act. */
   get mandate(): MandateRequests {
     return this.platformServices().mandate;
+  }
+
+  /** Agent inventory (platform-services/inventory.json): the agents found in
+   *  an organization's own environments, reported by a finder, listed, and
+   *  brought in or ignored. */
+  get inventory(): InventoryRequests {
+    return this.platformServices().inventory;
+  }
+
+  /** Traffic (platform-services/traffic.json): an organization's traffic
+   *  between agents, as edges with counts, and the metadata of past messages
+   *  (never their content). */
+  get traffic(): TrafficRequests {
+    return this.platformServices().traffic;
   }
 
   /** PACT (platform-services/pact.json): have this agent talk to a

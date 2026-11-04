@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.65.1 (2026-11-03)
+
+- **`mesh.inventory` and `mesh.traffic`**: the getters for 0.65.0's two new
+  platform services, so they are reached the same way as the others.
+
 ## 0.65.0 (2026-11-03)
 
 Four new AgentMesh platform services in the generated services list.
