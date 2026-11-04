@@ -2163,6 +2163,262 @@ export interface IdentityRequests {
   me(input?: IdentityMeInput): Promise<IdentityMeResult>;
 }
 
+// ── inventory: Agent inventory ────────────────────────────────────
+
+/** What inventory.report() sends. */
+export interface InventoryReportInput {
+  /** The organization's id. Left out, your home organization. */
+  org?: string;
+  /** Who found them: the finding agent's handle, or manual. */
+  source: string;
+  /** The finds. */
+  found: Array<{
+    /** What the agent is called where it runs. */
+    name: string;
+    /** The place it runs: a repository, a cloud project, Vertex, Bedrock, Copilot Studio, Agentforce. */
+    where: string;
+    /** What it is built with, when known. */
+    framework?: string;
+    /** Whose product it is, when known. */
+    vendor?: string;
+    /** What was seen that says it is an agent. */
+    evidence?: string;
+    /** The finder's own reference for it, such as a path or a resource name, which names it across reports. */
+    ref?: string;
+  }>;
+  /** Whose the finds are inside the organization. Left out, the organization's. */
+  owner?: {
+    /** The organization, one of its teams, or one of its members. */
+    kind: "org" | "team" | "person";
+    /** The team's id or the member's account id. */
+    id?: string;
+  };
+}
+
+/** What inventory.report() answers. */
+export interface InventoryReportResult {
+  /** Finds new to the inventory. */
+  added: number;
+  /** Finds already in it, updated. */
+  updated: number;
+}
+
+/** The refusals inventory.report() can answer with. */
+export type InventoryReportRefusal = "INPUT_INVALID" | "NO_ACCOUNT" | "NOT_OWNER" | "NOT_MEMBER" | "FULL" | "UNAVAILABLE";
+
+/** What inventory.list() sends. */
+export interface InventoryListInput {
+  /** The organization's id. Left out, your home organization. */
+  org?: string;
+}
+
+/** What inventory.list() answers. */
+export interface InventoryListResult {
+  /** Every find. */
+  items: Array<{
+    /** The find's id. */
+    id: string;
+    /** What the agent is called where it runs. */
+    name: string;
+    /** The place it runs. */
+    where: string;
+    /** What it is built with. */
+    framework?: string;
+    /** Whose product it is. */
+    vendor?: string;
+    /** Whose it is: the organization, one of its teams, or one of its members. */
+    owner: {
+      /** The organization, one of its teams, or one of its members. */
+      kind: "org" | "team" | "person";
+      /** Its id. */
+      id: string;
+      /** Its name. */
+      name: string;
+      /** For a person: their team in the organization, when they have one. */
+      team?: {
+        /** The team's id. */
+        id: string;
+        /** Its name. */
+        name: string;
+      };
+    };
+    /** What became of it. */
+    status: "found" | "onboarding" | "joined" | "ignored";
+    /** Who reported it first. */
+    found_by: string;
+    /** When it was first reported. */
+    found_at: string;
+    /** When a report last named it. */
+    seen_at: string;
+    /** What was seen that says it is an agent. */
+    evidence?: string;
+    /** The finder's own reference for it. */
+    ref?: string;
+    /** The agent it became, once joined. */
+    agent_key?: string;
+    /** Who moved it last. */
+    decided_by?: string;
+    /** When it was moved last. */
+    decided_at?: string;
+  }>;
+}
+
+/** The refusals inventory.list() can answer with. */
+export type InventoryListRefusal = "INPUT_INVALID" | "NO_ACCOUNT" | "NOT_OWNER" | "NOT_MEMBER" | "UNAVAILABLE";
+
+/** What inventory.intake() sends. */
+export interface InventoryIntakeInput {
+  /** The organization's id. Left out, your home organization. */
+  org?: string;
+  /** The find's id, from inventory.list. */
+  item: string;
+}
+
+/** What inventory.intake() answers. */
+export interface InventoryIntakeResult {
+  /** The find, as it is now. */
+  item: {
+    /** The find's id. */
+    id: string;
+    /** What the agent is called where it runs. */
+    name: string;
+    /** The place it runs. */
+    where: string;
+    /** What it is built with. */
+    framework?: string;
+    /** Whose product it is. */
+    vendor?: string;
+    /** Whose it is: the organization, one of its teams, or one of its members. */
+    owner: {
+      /** The organization, one of its teams, or one of its members. */
+      kind: "org" | "team" | "person";
+      /** Its id. */
+      id: string;
+      /** Its name. */
+      name: string;
+      /** For a person: their team in the organization, when they have one. */
+      team?: {
+        /** The team's id. */
+        id: string;
+        /** Its name. */
+        name: string;
+      };
+    };
+    /** What became of it. */
+    status: "found" | "onboarding" | "joined" | "ignored";
+    /** Who reported it first. */
+    found_by: string;
+    /** When it was first reported. */
+    found_at: string;
+    /** When a report last named it. */
+    seen_at: string;
+    /** What was seen that says it is an agent. */
+    evidence?: string;
+    /** The finder's own reference for it. */
+    ref?: string;
+    /** The agent it became, once joined. */
+    agent_key?: string;
+    /** Who moved it last. */
+    decided_by?: string;
+    /** When it was moved last. */
+    decided_at?: string;
+  };
+}
+
+/** The refusals inventory.intake() can answer with. */
+export type InventoryIntakeRefusal = "INPUT_INVALID" | "NO_ACCOUNT" | "NOT_OWNER" | "NOT_MEMBER" | "NOT_FOUND" | "NOT_ALLOWED" | "UNAVAILABLE";
+
+/** What inventory.ignore() sends. */
+export interface InventoryIgnoreInput {
+  /** The organization's id. Left out, your home organization. */
+  org?: string;
+  /** The find's id, from inventory.list. */
+  item: string;
+}
+
+/** What inventory.ignore() answers. */
+export interface InventoryIgnoreResult {
+  /** The find, as it is now. */
+  item: {
+    /** The find's id. */
+    id: string;
+    /** What the agent is called where it runs. */
+    name: string;
+    /** The place it runs. */
+    where: string;
+    /** What it is built with. */
+    framework?: string;
+    /** Whose product it is. */
+    vendor?: string;
+    /** Whose it is: the organization, one of its teams, or one of its members. */
+    owner: {
+      /** The organization, one of its teams, or one of its members. */
+      kind: "org" | "team" | "person";
+      /** Its id. */
+      id: string;
+      /** Its name. */
+      name: string;
+      /** For a person: their team in the organization, when they have one. */
+      team?: {
+        /** The team's id. */
+        id: string;
+        /** Its name. */
+        name: string;
+      };
+    };
+    /** What became of it. */
+    status: "found" | "onboarding" | "joined" | "ignored";
+    /** Who reported it first. */
+    found_by: string;
+    /** When it was first reported. */
+    found_at: string;
+    /** When a report last named it. */
+    seen_at: string;
+    /** What was seen that says it is an agent. */
+    evidence?: string;
+    /** The finder's own reference for it. */
+    ref?: string;
+    /** The agent it became, once joined. */
+    agent_key?: string;
+    /** Who moved it last. */
+    decided_by?: string;
+    /** When it was moved last. */
+    decided_at?: string;
+  };
+}
+
+/** The refusals inventory.ignore() can answer with. */
+export type InventoryIgnoreRefusal = "INPUT_INVALID" | "NO_ACCOUNT" | "NOT_OWNER" | "NOT_MEMBER" | "NOT_ADMIN" | "NOT_FOUND" | "NOT_ALLOWED" | "UNAVAILABLE";
+
+/** The agents found running in your organization's own environments, and what became of each. Finder, or a person, reports what it found: a name, the place it runs (a repository, a cloud project, Vertex, Bedrock, Copilot Studio, Agentforce), what it is built on where known, and whose it is in the organization. The platform never looks itself; it keeps what it was told. Each find is found until a member brings it in (onboarding) or an admin ignores it, and it is joined when its agent registers under the organization under the same name. Who can call it: Members of the organization report, list and bring finds in; only an admin ignores one. A member acts as the person signed in to the app or on the hosted connector, or with their account API token with the agents scope, which is the key Finder reports with. Cost: No model is called. A request reads or writes the account's inventory record. */
+export interface InventoryRequests {
+  /** Report the agents found in one of your environments. A find already in the inventory (the same ref, or the same name in the same place) is updated and keeps its status, so one you ignored stays ignored; a new one is added as found. At most 500 finds a report. Refusals: INPUT_INVALID: A find has no name or place, a field is too long, the owner is not the organization, one of its teams or one of its members, or the report holds no finds or more than 500. NO_ACCOUNT: There is no account to act for: send a member's account API token. NOT_OWNER: The inventory needs a member's account API token with the agents scope, or the person signed in. NOT_MEMBER: You are not a member of that organization, or there is none with that id. FULL: The inventory holds 5000 finds, the most it keeps, and nothing from this report was kept. UNAVAILABLE: The inventory could not be written just now. Try again in a minute. */
+  report(input: InventoryReportInput): Promise<InventoryReportResult>;
+  /** List every find in your organization's inventory, newest first, with its status: found, onboarding (brought in), joined (its agent registered under the organization), or ignored, and whose it is. Refusals: INPUT_INVALID: The organization is not given as an id. NO_ACCOUNT: There is no account to act for: send a member's account API token. NOT_OWNER: The inventory needs a member's account API token with the agents scope, or the person signed in. NOT_MEMBER: You are not a member of that organization, or there is none with that id. UNAVAILABLE: The inventory could not be read just now. Try again in a minute. */
+  list(input?: InventoryListInput): Promise<InventoryListResult>;
+  /** Bring one find in: it becomes onboarding, and it is joined when its agent registers under the organization under the same name. A find an admin ignored can be brought in too. Refusals: INPUT_INVALID: Name the find by its id. NO_ACCOUNT: There is no account to act for: send a member's account API token. NOT_OWNER: The inventory needs a member's account API token with the agents scope, or the person signed in. NOT_MEMBER: You are not a member of that organization, or there is none with that id. NOT_FOUND: There is no find with that id in the organization's inventory. NOT_ALLOWED: A find that joined is an agent now and cannot be brought in again. UNAVAILABLE: The inventory could not be written just now. Try again in a minute. */
+  intake(input: InventoryIntakeInput): Promise<InventoryIntakeResult>;
+  /** Ignore one find: it stays in the inventory as ignored, and later reports of it keep it ignored. Only an admin of the organization may. Refusals: INPUT_INVALID: Name the find by its id. NO_ACCOUNT: There is no account to act for: send a member's account API token. NOT_OWNER: The inventory needs a member's account API token with the agents scope, or the person signed in. NOT_MEMBER: You are not a member of that organization, or there is none with that id. NOT_ADMIN: Only an admin of the organization may ignore a find. NOT_FOUND: There is no find with that id in the organization's inventory. NOT_ALLOWED: A find that joined is an agent now and cannot be ignored here. UNAVAILABLE: The inventory could not be written just now. Try again in a minute. */
+  ignore(input: InventoryIgnoreInput): Promise<InventoryIgnoreResult>;
+}
+
+/** Agent inventory, through the platform's service door. */
+export class InventoryService implements InventoryRequests {
+  constructor(private readonly caller: ServiceCaller) {}
+  report(input: InventoryReportInput): Promise<InventoryReportResult> {
+    return this.caller.call("inventory.report", (input ?? {}) as unknown as Record<string, unknown>, "owner") as Promise<InventoryReportResult>;
+  }
+  list(input?: InventoryListInput): Promise<InventoryListResult> {
+    return this.caller.call("inventory.list", (input ?? {}) as unknown as Record<string, unknown>, "owner") as Promise<InventoryListResult>;
+  }
+  intake(input: InventoryIntakeInput): Promise<InventoryIntakeResult> {
+    return this.caller.call("inventory.intake", (input ?? {}) as unknown as Record<string, unknown>, "owner") as Promise<InventoryIntakeResult>;
+  }
+  ignore(input: InventoryIgnoreInput): Promise<InventoryIgnoreResult> {
+    return this.caller.call("inventory.ignore", (input ?? {}) as unknown as Record<string, unknown>, "owner") as Promise<InventoryIgnoreResult>;
+  }
+}
+
 // ── jobs: Jobs ────────────────────────────────────────────────────
 
 /** What jobs.list() sends. */
@@ -2259,8 +2515,6 @@ export interface JobsShowResult {
   };
   /** The job's page, where the person downloads the pieces. */
   page: string;
-  /** AgentMesh's signed receipt of the call that made the latest version, full tier: who did it, when, how long it took, what it cost line by line, whether the charge has settled, and what ran. Kept for every call AgentMesh sent, whether or not one was sent to the inbox. */
-  receipt?: Record<string, unknown>;
   /** How the person gets the pieces. */
   note?: string;
 }
@@ -2857,6 +3111,8 @@ export interface NamesRequests {
 }
 
 // ── nda: Agent NDA ────────────────────────────────────────────────
+
+// ── org_keys: Organization keys ───────────────────────────────────
 
 // ── owner: Owner ──────────────────────────────────────────────────
 
@@ -4813,6 +5069,141 @@ export class SchedulesService implements SchedulesRequests {
   }
 }
 
+// ── states: Agent states ──────────────────────────────────────────
+
+// ── traffic: Traffic ──────────────────────────────────────────────
+
+/** What traffic.edges() sends. */
+export interface TrafficEdgesInput {
+  /** The organization's id. Left out, your home organization. */
+  org?: string;
+  /** The start of the window. Left out, seven days before until. */
+  since?: string;
+  /** The end of the window. Left out, now. */
+  until?: string;
+}
+
+/** What traffic.edges() answers. */
+export interface TrafficEdgesResult {
+  /** The start of the window read, moved up to where the counts begin when an earlier one was asked. */
+  since: string;
+  /** The end of the window read. */
+  until: string;
+  /** Every agent on an edge, and every agent of your organization. */
+  nodes: Array<{
+    /** The agent's key; ~other stands for the senders past the 200 a receiver's hour names. */
+    key: string;
+    /** Its handle, when it has one. */
+    handle?: string;
+    /** Whether it is one of your organization's agents. */
+    mine: boolean;
+    /** For your organization's agents: whose it is, the member who added it or the organization. */
+    owner?: {
+      /** The organization, one of its teams, or one of its members. */
+      kind: "org" | "team" | "person";
+      /** Its id. */
+      id: string;
+      /** Its name. */
+      name: string;
+      /** For a person: their team in the organization, when they have one. */
+      team?: {
+        /** The team's id. */
+        id: string;
+        /** Its name. */
+        name: string;
+      };
+    };
+    /** For another company's agent: that organization, by id and public name. */
+    org?: {
+      /** The organization's id. */
+      id: string;
+      /** Its public name. */
+      name: string;
+    };
+  }>;
+  /** One line per sender and receiver, busiest first. */
+  edges: Array<{
+    /** The sending agent's key. */
+    from: string;
+    /** The receiving agent's key. */
+    to: string;
+    /** Messages sent in the window. */
+    count: number;
+    /** Messages delivered. */
+    delivered: number;
+    /** Messages held at the door of one of your organization's agents. */
+    held: number;
+    /** Messages not yet counted any other way: still on their way. */
+    queued: number;
+    /** Messages that failed, including those nobody answered within five minutes. */
+    failed: number;
+    /** Messages the receiver's door turned away. */
+    refused: number;
+    /** The start of the newest hour with a message on this edge. */
+    last_at: string;
+  }>;
+}
+
+/** The refusals traffic.edges() can answer with. */
+export type TrafficEdgesRefusal = "INPUT_INVALID" | "NO_ACCOUNT" | "NOT_OWNER" | "NOT_MEMBER" | "UNAVAILABLE";
+
+/** What traffic.messages() sends. */
+export interface TrafficMessagesInput {
+  /** The organization's id. Left out, your home organization. */
+  org?: string;
+  /** The key of one of your organization's agents, to list only its messages. */
+  of_agent?: string;
+  /** Only messages from this time on. */
+  since?: string;
+  /** How many to list. */
+  limit?: number;
+}
+
+/** What traffic.messages() answers. */
+export interface TrafficMessagesResult {
+  /** The messages, newest first. */
+  messages: Array<{
+    /** The message's id. */
+    id: string;
+    /** When it was recorded. */
+    at: string;
+    /** The sending agent's key. */
+    from: string;
+    /** The receiving agent's key. */
+    to: string;
+    /** How it came out. */
+    status: "delivered" | "held" | "queued" | "failed";
+    /** What was asked of the receiver, when the record names it. */
+    offering?: string;
+  }>;
+  /** Whether there are more than this answer lists; ask again with an earlier since or a larger limit. */
+  more: boolean;
+  /** What could not be read this time, when something could not. */
+  partial?: string;
+}
+
+/** The refusals traffic.messages() can answer with. */
+export type TrafficMessagesRefusal = "INPUT_INVALID" | "NO_ACCOUNT" | "NOT_OWNER" | "NOT_MEMBER" | "NOT_YOURS" | "UNAVAILABLE";
+
+/** Who your organization's agents talk to and what became of each message, read from the platform's own records and never from what a message said. Edges count the messages between each pair of agents in a window, from the hourly counts the mesh keeps for 30 days: how many were delivered, held at your agent's door, still on their way, failed or refused. An agent of another company is named with its organization and nothing more. The message list reads the audit log, one line per message with who sent it, who received it, when, what was asked and how it came out. Who can call it: Any member of the organization (admin, publisher or member): the person signed in to the app or on the hosted connector, or a member's account API token with the audit scope. Only edges and messages touching one of the organization's own agents are answered, and what a guard did at another company's agent stays that company's. Cost: No model is called. A request reads the mesh's hourly counts, the audit log and the account's agents. */
+export interface TrafficRequests {
+  /** Count the messages between each pair of agents in a window, for every pair with one of your organization's agents on it. The window defaults to the last seven days and reaches back at most 30. Counts are to the hour. Refusals: INPUT_INVALID: since or until is not a time, or since is not before until. NO_ACCOUNT: There is no account to read for: send the account's API token. NOT_OWNER: Reading the organization's traffic needs a member's account API token with the audit scope, or the person signed in. NOT_MEMBER: You are not a member of that organization, or there is none with that id. UNAVAILABLE: The counts could not be read just now. Try again in a minute. */
+  edges(input?: TrafficEdgesInput): Promise<TrafficEdgesResult>;
+  /** List past messages to and from your organization's agents, newest first: who sent each, who received it, when, what was asked and how it came out. It never shows what a message said. Give one of the organization's agents to see only its messages. Refusals: INPUT_INVALID: since is not a time, or limit is not from 1 to 200. NO_ACCOUNT: There is no account to read for: send the account's API token. NOT_OWNER: Reading the organization's traffic needs a member's account API token with the audit scope, or the person signed in. NOT_MEMBER: You are not a member of that organization, or there is none with that id. NOT_YOURS: That agent is not one of the organization's agents. UNAVAILABLE: The audit log could not be read just now. Try again in a minute. */
+  messages(input?: TrafficMessagesInput): Promise<TrafficMessagesResult>;
+}
+
+/** Traffic, through the platform's service door. */
+export class TrafficService implements TrafficRequests {
+  constructor(private readonly caller: ServiceCaller) {}
+  edges(input?: TrafficEdgesInput): Promise<TrafficEdgesResult> {
+    return this.caller.call("traffic.edges", (input ?? {}) as unknown as Record<string, unknown>, "owner") as Promise<TrafficEdgesResult>;
+  }
+  messages(input?: TrafficMessagesInput): Promise<TrafficMessagesResult> {
+    return this.caller.call("traffic.messages", (input ?? {}) as unknown as Record<string, unknown>, "owner") as Promise<TrafficMessagesResult>;
+  }
+}
+
 // ── transform: Transform ──────────────────────────────────────────
 
 /** What transform.projects() sends. */
@@ -5064,6 +5455,7 @@ export class PlatformServices {
   readonly debt: DebtService;
   readonly dependents: DependentsService;
   readonly errors: ErrorsService;
+  readonly inventory: InventoryService;
   readonly jobs: JobsService;
   readonly mandate: MandateService;
   readonly memory: MemoryService;
@@ -5072,6 +5464,7 @@ export class PlatformServices {
   readonly runs: RunsService;
   readonly samples: SamplesService;
   readonly schedules: SchedulesService;
+  readonly traffic: TrafficService;
   readonly transform: TransformService;
   constructor(caller: ServiceCaller) {
     this.account = new AccountService(caller);
@@ -5083,6 +5476,7 @@ export class PlatformServices {
     this.debt = new DebtService(caller);
     this.dependents = new DependentsService(caller);
     this.errors = new ErrorsService(caller);
+    this.inventory = new InventoryService(caller);
     this.jobs = new JobsService(caller);
     this.mandate = new MandateService(caller);
     this.memory = new MemoryService(caller);
@@ -5091,6 +5485,7 @@ export class PlatformServices {
     this.runs = new RunsService(caller);
     this.samples = new SamplesService(caller);
     this.schedules = new SchedulesService(caller);
+    this.traffic = new TrafficService(caller);
     this.transform = new TransformService(caller);
   }
 }
@@ -5441,6 +5836,34 @@ export const SDK_REQUESTS: ReadonlyArray<{ id: string; service: string; request:
     "request": "me",
     "transport": "mesh",
     "tier": "core"
+  },
+  {
+    "id": "inventory.report",
+    "service": "inventory",
+    "request": "report",
+    "transport": "platform",
+    "tier": "platform"
+  },
+  {
+    "id": "inventory.list",
+    "service": "inventory",
+    "request": "list",
+    "transport": "platform",
+    "tier": "platform"
+  },
+  {
+    "id": "inventory.intake",
+    "service": "inventory",
+    "request": "intake",
+    "transport": "platform",
+    "tier": "platform"
+  },
+  {
+    "id": "inventory.ignore",
+    "service": "inventory",
+    "request": "ignore",
+    "transport": "platform",
+    "tier": "platform"
   },
   {
     "id": "jobs.list",
@@ -5891,6 +6314,20 @@ export const SDK_REQUESTS: ReadonlyArray<{ id: string; service: string; request:
     "tier": "platform"
   },
   {
+    "id": "traffic.edges",
+    "service": "traffic",
+    "request": "edges",
+    "transport": "platform",
+    "tier": "platform"
+  },
+  {
+    "id": "traffic.messages",
+    "service": "traffic",
+    "request": "messages",
+    "transport": "platform",
+    "tier": "platform"
+  },
+  {
     "id": "transform.projects",
     "service": "transform",
     "request": "projects",
@@ -5995,6 +6432,10 @@ export const REQUEST_TIERS: Readonly<Record<string, "core" | "platform">> = {
   "feeds.list": "core",
   "feeds.retire": "core",
   "identity.me": "core",
+  "inventory.report": "platform",
+  "inventory.list": "platform",
+  "inventory.intake": "platform",
+  "inventory.ignore": "platform",
   "jobs.list": "platform",
   "jobs.show": "platform",
   "jobs.quote_change": "platform",
@@ -6025,6 +6466,10 @@ export const REQUEST_TIERS: Readonly<Record<string, "core" | "platform">> = {
   "nda.get": "platform",
   "nda.list": "platform",
   "nda.bound": "platform",
+  "org_keys.list": "platform",
+  "org_keys.create": "platform",
+  "org_keys.revoke": "platform",
+  "org_keys.audit": "platform",
   "owner.ask": "platform",
   "pact.send": "platform",
   "pact.connect": "platform",
@@ -6078,6 +6523,16 @@ export const REQUEST_TIERS: Readonly<Record<string, "core" | "platform">> = {
   "schedules.list": "platform",
   "schedules.run_now": "platform",
   "schedules.pause": "platform",
+  "states.list": "platform",
+  "states.read": "platform",
+  "states.propose": "platform",
+  "states.move": "platform",
+  "states.confirm": "platform",
+  "states.decline": "platform",
+  "states.check": "platform",
+  "states.last_check": "platform",
+  "traffic.edges": "platform",
+  "traffic.messages": "platform",
   "transform.projects": "platform",
   "transform.summary": "platform",
   "transform.processes": "platform",
