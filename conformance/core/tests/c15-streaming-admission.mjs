@@ -102,7 +102,7 @@ export default {
       const kpBlocked = nkeys.createUser();
       const kpAllowed = nkeys.createUser();
       await cli(["contacts", "block", kpBlocked.getPublicKey(), "c15 blocked sender"]);
-      await cli(["contacts", "allow", kpAllowed.getPublicKey(), "c15 allowed sender"]);
+      await cli(["contacts", "admit", kpAllowed.getPublicKey(), "c15 allowed sender"]);
 
       /** Send a STREAMING request (the sender sets config.stream) and collect
        *  whatever comes back on the task stream, plus the §11.3 opening
