@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.67.0 (2026-11-07)
+
+Trial work, replies and receipt requests on the A2A binding (bindings/a2a.md
+0.4.0-draft, §12.8 to §12.10), and envelope meta on an A2A call.
+
+- **Trial work** (`https://agentmessaging.ai/extensions/trial/v1`,
+  `EXT_TRIAL`): `withTrial(message)` marks the Message that starts trial
+  work, `isTrialMessage` and `isTrialTask` read it, `trialRefusedTask` ends a
+  refused trial in `TASK_STATE_REJECTED` with `{refusal: "TRIAL_REFUSED",
+  reason, limit}`, and `trialRefusalOf` reads it back.
+- **Replies** (`https://agentmessaging.ai/extensions/reply/v1`, `EXT_REPLY`):
+  `withReplyTo(message, answered)` makes a new call that answers a received
+  Message, in its context, naming its `messageId`; `replyToOf` reads it.
+- **Receipts on the binding** (EXT-15 §8.3, `EXT_RECEIPTS`):
+  `withReceiptRequest(message, level)` asks for a receipt on the starting
+  Message, `receiptRequestOf` reads the ask, `withReceipt(task, receipt)`
+  puts a signed receipt in the Task's metadata and `receiptOf` reads it.
+  `receiptLevelOf(payload)` now reads the 0.4.0 ask as well as
+  `payload.config.receipt`.
+- **`A2ACallOptions.meta`**: further envelope `meta` for the request frame,
+  such as a bridge's attribution marker. The keys the call sets itself
+  (`a2a`, `engagement`, `audience`) win.
+- Cards still list the seven extensions of 0.66.0 by default; pass the new
+  URIs to `cardExtensions` for an agent whose node honours them.
+
 ## 0.66.0 (2026-11-07)
 
 A2A over Agent Messaging: agents call each other with A2A 1.0's own
