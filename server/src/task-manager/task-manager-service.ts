@@ -10,6 +10,8 @@ import { OverdueSweep } from "./overdue-sweep.js";
 import { declaredNeedRefs, type DeclaredNeedsFn } from "./cancel.js";
 import { OriginLedger, CANCEL_SWEEP_INTERVAL_MS } from "./origin.js";
 import { OriginTap } from "./origin-tap.js";
+import { A2ATaskStore } from "./a2a-store.js";
+import { A2A_STORE_SUBJECTS } from "../../../sdk-typescript/src/a2a/server.js";
 
 /** TASK_CANCEL_SETTLE_GRACE_MS: the grace period G before a cancel may be
  *  settled as "the requester did not ask" (origin.ts); a positive integer of
@@ -43,14 +45,20 @@ export class TaskManagerService {
    *  which Task id each is bound to. Null when its store is not wired, which
    *  leaves records without `origin`. */
   private origins: OriginLedger | null;
+  /** A2A Tasks under the A2A binding (a2a-store.ts). Null when its store is
+   *  not wired, which leaves 0.4.0 Tasks unrecorded and their reads answered
+   *  by the server agents' nodes alone. */
+  private a2a: A2ATaskStore | null;
 
   constructor(
     private nc: Messaging,
     private js: StorageLike,
     kv: KeyedLike,
     origins?: KeyedLike,
+    a2aTasks?: KeyedLike,
   ) {
     this.kv = keyedOf(kv, js);
+    this.a2a = a2aTasks ? new A2ATaskStore(keyedOf(a2aTasks, js)) : null;
     this.origins = origins
       ? new OriginLedger(keyedOf(origins, js), this.kv, {
           onCanceledBySettled: (record) => publishCanceledBySettled(this.nc, this.kp, record),
@@ -90,10 +98,12 @@ export class TaskManagerService {
     const kv = await storageOf(js).keyed("mesh_tasks");
     // Seven days, the Task horizon (storage/catalog.ts).
     const origins = await storageOf(js).keyed("mesh_task_origins");
+    // A2A Tasks, the Task horizon (storage/catalog.ts).
+    const a2aTasks = await storageOf(js).keyed("mesh_a2a_tasks");
     // EXT-8 §3's reported-spend rollup is not this service's: whoever
     // operates the mesh folds it from the §19.2 receipts this service
     // publishes (on AgentMesh, platform-shared/spend-rollup.ts).
-    return new TaskManagerService(messagingOf(nc), js, kv, origins);
+    return new TaskManagerService(messagingOf(nc), js, kv, origins, a2aTasks);
   }
 
   async start(): Promise<void> {
@@ -146,6 +156,7 @@ export class TaskManagerService {
       const sub = this.nc.subscribe(subject, { queue: serviceQueue(subject) });
       this.subs.push(sub);
       const tap = new OriginTap(this.origins);
+      const a2a = this.a2a;
       (async () => {
         for await (const msg of sub) {
           try {
@@ -153,8 +164,39 @@ export class TaskManagerService {
           } catch (err) {
             console.error("[task-manager] origin tap:", err);
           }
+          // The same delivery, for the A2A binding: a 0.4.0 answer whose
+          // result is a Task creates its record.
+          if (a2a) await a2a.observe(msg.subject, msg.data).catch((err) => console.error("[task-manager] a2a tap:", err));
         }
       })();
+    } else if (this.a2a) {
+      const subject = "mesh.agent.*.inbox";
+      const sub = this.nc.subscribe(subject, { queue: serviceQueue(subject) });
+      this.subs.push(sub);
+      const a2a = this.a2a;
+      (async () => {
+        for await (const msg of sub) await a2a.observe(msg.subject, msg.data).catch((err) => console.error("[task-manager] a2a tap:", err));
+      })();
+    }
+
+    // A2A binding (a2a-store.ts): every later event of a Task, on its stream
+    // subject, and the two reads a server agent's node relays for its clients.
+    if (this.a2a) {
+      const a2a = this.a2a;
+      const streamSubject = "mesh.task.*.stream";
+      const streamSub = this.nc.subscribe(streamSubject, { queue: serviceQueue(streamSubject) });
+      this.subs.push(streamSub);
+      (async () => {
+        for await (const msg of streamSub) await a2a.observe(msg.subject, msg.data).catch((err) => console.error("[task-manager] a2a stream:", err));
+      })();
+      for (const [subject, read] of [
+        [A2A_STORE_SUBJECTS.GET, a2a.handleGet.bind(a2a)],
+        [A2A_STORE_SUBJECTS.LIST, a2a.handleList.bind(a2a)],
+      ] as const) {
+        this.subs.push(
+          subscribeWithHandler(this.nc, subject, this.kp, (env, msg) => read(env, msg, this.SERVICE_ID), undefined, undefined, serviceQueue(subject)),
+        );
+      }
     }
 
     // Request-reply for task lookup: mesh.task.get.*

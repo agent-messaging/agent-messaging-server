@@ -66,6 +66,9 @@ export const KEYED_STORES = {
   // the request that created it as the server saw it. No content; the Task
   // horizon.
   mesh_task_origins: { history: 1, ttlMs: 7 * DAY_MS },
+  // A2A Tasks (task-manager/a2a-store.ts, the A2A binding): one record per
+  // A2A Task id, the Task beside its parties and engagement. The Task horizon.
+  mesh_a2a_tasks: { history: 5, ttlMs: 7 * DAY_MS },
   // Rooms: records, the work board and notes.
   mesh_rooms: { history: 1 },
   mesh_board_items: { history: 1 },

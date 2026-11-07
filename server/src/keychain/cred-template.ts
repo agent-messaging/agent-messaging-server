@@ -932,6 +932,10 @@ export function sandboxPermissions(agentKey: string): SandboxPermissions {
         // Task progress and streaming for tasks it participates in (§7, §11).
         "mesh.task.*.stream",
         "mesh.task.*.update",
+        // The A2A binding's reads (task-manager/a2a-store.ts): a node relays
+        // its clients' GetTask, ListTasks and SubscribeToTask here.
+        "mesh.task.a2a.get",
+        "mesh.task.a2a.list",
         "mesh.task.get.*",
         // Its own usage, answered about the caller alone.
         "mesh.usage.list",
