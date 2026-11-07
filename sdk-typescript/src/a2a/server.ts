@@ -30,6 +30,9 @@ import { MeshError, ErrorCode } from "../types/errors.js";
 import { childSpan } from "../internal/trace.js";
 import { uuid7 } from "../internal/uuid.js";
 import { isSubjectToken } from "../internal/subjects.js";
+import type { RequestContext } from "../internal/offering-router.js";
+import type { TrialContext } from "../trial.js";
+import type { InboundCall } from "../inbound-call.js";
 import {
   STREAMING_METHODS,
   activatedExtensions,
@@ -162,6 +165,16 @@ export interface TaskHandle {
   settled(): Promise<Task>;
 }
 
+/** What the node's gates admitted a call as, before its handler runs
+ *  (AgentMesh: the trial gate, the allowance, the agreement and funds hold,
+ *  the admit hook, then the accept signal). `request` is the context the
+ *  admit hook saw: the dispatch key the gates used as `taskId`, the budget,
+ *  the trial, and the call's wire-neutral view. */
+export interface A2AAdmission {
+  taskId: string;
+  request: RequestContext;
+}
+
 export interface A2AContext {
   /** The client's agent key, from the frame's verified signature (§10). */
   readonly caller: string;
@@ -186,6 +199,11 @@ export interface A2AContext {
   readonly existingTask?: Task;
   /** Aborted when the Task is canceled. */
   readonly signal: AbortSignal;
+  /** The call as the node's gates read it (inbound-call.ts). */
+  readonly call?: InboundCall;
+  /** Present when the node admitted this call as trial work (Common Agent
+   *  §7.7, the trial extension §12.8): the work keeps inside its caps. */
+  readonly trial?: TrialContext;
   /** Create this call's Task (or, for a message that continues one, take its
    *  handle). The Task starts in `TASK_STATE_SUBMITTED` unless told otherwise,
    *  with the client's message in its history. */
@@ -216,6 +234,16 @@ export interface A2AServeOptions {
   /** The offerings to resolve the offering extension against (§12.1).
    *  Default: the offerings the agent declares in its manifest. */
   offerings?: string[];
+  /**
+   * The admission decision for a message that asks for work, run after the
+   * node's own gates (the trial gate, the EXT-8 allowance, the agreement and
+   * funds hold) and before the accept signal and the handler, as
+   * `HandlerOptions.admit` is for a 0.3.0 request. Throw an A2AError or a
+   * MeshError (`budgetInsufficient`, `deadlineUnmeetable`, ...) to refuse:
+   * the refusal is then the call's first and only answer. `ctx.call` is the
+   * call's wire-neutral view.
+   */
+  admit?: (ctx: RequestContext) => void | Promise<void>;
 }
 
 /** One open stream of a Task (§8): the request frame that opened it names
@@ -296,7 +324,7 @@ export class A2AServerAgent {
   private readonly live = new Map<string, LiveTask>();
   /** Answers 0.4.0 SendMessage for an agent with no A2A handler: its 0.3.0
    *  handlers (§14), wired by AgentMesh. */
-  legacy: ((offering: string | undefined, message: Message, env: Envelope) => Promise<Message>) | null = null;
+  legacy: ((offering: string | undefined, message: Message, env: Envelope, admitted?: A2AAdmission) => Promise<Message>) | null = null;
 
   constructor(private readonly host: A2AServerHost) {}
 
@@ -332,7 +360,7 @@ export class A2AServerAgent {
    * already passed every check the inbox makes (signature, `to`, freshness,
    * revoked or paused sender, admission) and the §4 field check.
    */
-  async dispatch(env: Envelope, reply: (resp: Envelope) => void, opts: { sealTo?: string } = {}): Promise<void> {
+  async dispatch(env: Envelope, reply: (resp: Envelope) => void, opts: { sealTo?: string; admitted?: A2AAdmission } = {}): Promise<void> {
     const req = readRequestPayload(env);
     const sealTo = opts.sealTo;
     const answerError = (err: A2AError | MeshError): void =>
@@ -353,7 +381,7 @@ export class A2AServerAgent {
       switch (req.method) {
         case "SendMessage":
         case "SendStreamingMessage":
-          await this.sendMessage(env, params as unknown as SendMessageRequest, STREAMING_METHODS.has(req.method), reply, sealTo);
+          await this.sendMessage(env, params as unknown as SendMessageRequest, STREAMING_METHODS.has(req.method), reply, sealTo, opts.admitted);
           return;
         case "GetTask": {
           const p = params as unknown as GetTaskRequest;
@@ -437,6 +465,7 @@ export class A2AServerAgent {
     streaming: boolean,
     reply: (resp: Envelope) => void,
     sealTo?: string,
+    admitted?: A2AAdmission,
   ): Promise<void> {
     const message = request?.message;
     if (!isMessage(message) || typeof message.messageId !== "string") {
@@ -477,7 +506,7 @@ export class A2AServerAgent {
 
     if (!this.handler) {
       if (this.legacy && !existing) {
-        const out = await this.legacy(offering, message, env);
+        const out = await this.legacy(offering, message, env, admitted);
         this.answerFirst(env, reply, { message: out }, streaming ? { streamId: env.id, seq: 0, final: true } : undefined, sealTo);
         return;
       }
@@ -527,6 +556,8 @@ export class A2AServerAgent {
       streaming,
       ...(existing ? { existingTask: cloneTask(existing.task) } : {}),
       signal: abort.signal,
+      ...(admitted?.request.call ? { call: admitted.request.call } : {}),
+      ...(admitted?.request.trial ? { trial: admitted.request.trial } : {}),
       startTask: (init = {}) => {
         if (!live) {
           // A Task id becomes a subject token (§5): a UUID always is one.

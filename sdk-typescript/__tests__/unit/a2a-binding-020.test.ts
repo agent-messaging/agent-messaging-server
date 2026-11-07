@@ -20,6 +20,7 @@ import {
   artifactRefPart,
   budgetOutcomeOf,
   cancelReasonOf,
+  isAcceptSignal,
   isCeilingReached,
   stateOfFrame,
   withBudget,
@@ -229,7 +230,8 @@ describe("§8a sealed frames", () => {
 
     const req = bus.log.find((l) => l.env.type === "request" && l.env.to === server.id)!.env;
     expect(isSealedPayload(req.payload)).toBe(true);
-    const resp = bus.log.find((l) => l.env.type === "respond" && l.env.in_reply_to === req.id && l.subject === Subjects.agentInbox(client.id))!.env;
+    // The accept signal is a channel frame (§4), in clear; the answer is sealed.
+    const resp = bus.log.find((l) => l.env.type === "respond" && l.env.in_reply_to === req.id && l.subject === Subjects.agentInbox(client.id) && !isAcceptSignal(l.env))!.env;
     expect(isSealedPayload(resp.payload)).toBe(true);
     expect((resp.meta as Record<string, string>)[A2A_STATE_META]).toBe("TASK_STATE_COMPLETED");
     // A carrier that cannot open it reads the clear state as a hint only.

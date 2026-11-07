@@ -67,6 +67,7 @@ export {
   type A2AHandler,
   type A2AHandlerResult,
   type A2AContext,
+  type A2AAdmission,
   type A2AServeOptions,
   type TaskHandle,
 } from "./server.js";
