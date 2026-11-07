@@ -233,6 +233,18 @@ What moving AgentMesh to wire 0.4.0 found missing.
 - **The responder's own read.** `mesh.task.a2a.get` with only `{id}` (no
   client frame) answers the Task's recorded responder, so a node that
   restarted can take up a Task it handed back (SDK `mesh.a2a.taskHandle`).
+- **SDK 0.68.0.** `callWithFrames` and `sendMessageWithFrames` (the request
+  frame's id and trace and both frames) and `onRequestFrame`;
+  `A2AServeOptions.claimUnhandledOfferings` (default true); `ctx.reportMeter`
+  on the A2A context, the receipt as `payload.usage` beside `payload.a2a` on
+  the answering Message or the frames that finish the Task;
+  `A2AServeOptions.taskState` and `mesh.a2a.taskHandle(id)`, with finished
+  Tasks let go of past `keepFinished` (256). The CHANGELOG has the detail.
+- **The fixture.** `conformance/a2a-binding.json`'s top-level `extensions`
+  block names five of binding §12's nine URIs (not cancel, failure, trial or
+  reply). The copy matches the standards repository; the SDK suite now reads
+  the block against the SDK's URIs. Completing it is a change to the
+  standards repository.
 
 ### Left open
 
@@ -267,4 +279,5 @@ What moving AgentMesh to wire 0.4.0 found missing.
 
 SDK 0.65.1 to 0.66.0, server and gateway 0.4.10 to 0.5.0, with the SDK's
 CHANGELOG entry; then SDK 0.67.0 and server and gateway 0.5.1, as the
-section above says. Nothing is published, tagged or released here.
+section above says; then SDK 0.68.0 and server and gateway 0.5.3 (additive:
+nothing a deployment acts on). Nothing is published, tagged or released here.

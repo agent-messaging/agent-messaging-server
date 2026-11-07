@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.68.0 (2026-11-07)
+
+What a platform moving its agents to wire 0.4.0 (A2A over Agent Messaging)
+had to reach into private fields for, now public. Nothing existing changes
+behaviour.
+
+- **A call's frames.** `mesh.a2a.callWithFrames(agentId, method, params,
+  opts)` and `mesh.a2a.sendMessageWithFrames(agentId, request, opts)` answer
+  `{ result, requestId, trace, frames: { request, response } }`: the A2A
+  result, the request frame's id (what the answer's `in_reply_to`, receipts
+  and meter events name) and trace, and both signed frames (the response
+  opened when it came sealed). `A2ACallOptions.onRequestFrame(frame)` is
+  handed the request frame before it is sent, so a caller can record it
+  even when the call then fails (a queued request, a timeout). For a stream
+  it sees the opening frame; the node's own resync reads do not call it.
+- **Keeping OFFERING_NOT_FOUND on the 0.3.0 wire.**
+  `A2AServeOptions.claimUnhandledOfferings` (default `true`, as before) says
+  whether 0.3.0 requests no `onRequest` handler takes reach the A2A handler.
+  With `false` the 0.3.0 router stays as the agent set it: a request for an
+  offering with no handler is refused `OFFERING_NOT_FOUND`, and `onDefault`
+  decides the rest; a later `serve` with `false` removes the adapter an
+  earlier `serve` installed. The default stays `true` so an agent that
+  serves only A2A keeps answering 0.3.0 clients during the window, which is
+  what 0.66.0 and 0.67.0 promised.
+- **Usage on the A2A handler's context.** `ctx.reportMeter(meter,
+  quantity)` adds to the call's usage receipt (SPEC.md §13.5), as it does
+  for a 0.3.0 handler. The receipt rides as `payload.usage` beside
+  `payload.a2a` (binding §4) on the frame that answers the call with a
+  Message, or, for a Task, on the frames that bring it to a terminal state
+  (its update, each stream it ends, and the first answer when the Task was
+  already finished). Reports from every call that worked on a Task are
+  summed. A 0.3.0 handler that answers a 0.4.0 call reports through its own
+  `ctx.reportMeter` the same way, and an A2A handler answering a 0.3.0
+  request has its report on the 0.3.0 answer. Both wires share the node's
+  one ledger, so `reportMeterUsage(key, ...)` with the key the gates used
+  lands in the same receipt.
+- **Task handles that survive a restart.** `A2AServeOptions.taskState`
+  takes a store you provide (`save`, `load`, `remove`; each may be async):
+  the node saves each unfinished Task's state (the Task, its requester, its
+  place in its order of changes, its open streams with their last `seq`,
+  the trace and the usage keys) after every change and removes it when the
+  Task finishes. `await mesh.a2a.taskHandle(taskId)` gives back the handle
+  of a Task this agent answers: the one in memory, else rebuilt from
+  `taskState` and from the mesh's task store (server 0.5.3 answers a Task's
+  own server agent), whichever is further along, so a restarted agent can
+  still complete a Task it handed back and its clients' open streams carry
+  on. Without `taskState` the handle comes from the store, and the clients'
+  streams catch up by reading the Task. Undefined when the Task is unknown
+  or not this agent's. New types: `A2ATaskState`, `A2ATaskStateStore`.
+- **Bounded memory.** Finished Tasks are let go of past
+  `A2AServeOptions.keepFinished` (default 256); reads of older ones are
+  answered from the task store. Unfinished Tasks are always kept.
+- The A2A conformance fixture's top-level `extensions` block is read
+  against the SDK's extension URIs in a test. It lists five of the nine
+  extensions of binding §12; the copy here matches the standards
+  repository and is not edited.
+
 ## 0.67.0 (2026-11-07)
 
 **Security fix: upgrade every agent that serves calls.** On SDK 0.66.0 a
