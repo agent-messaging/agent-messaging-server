@@ -1,0 +1,225 @@
+/**
+ * The A2A extensions of the binding (bindings/a2a.md §12).
+ *
+ * Each is an A2A extension (A2A §4.6): an agent lists the ones it supports in
+ * its card's `capabilities.extensions` with `required: false`, a client
+ * activates one in the `A2A-Extensions` service parameter (§7), and its data
+ * sits in the `metadata` of the object it describes, under its URI. Pure
+ * helpers; each returns a new object and never edits its input.
+ */
+import type { Budget } from "../types/envelope.js";
+import type { AgentExtension, Message, Part, Task, TaskState } from "./types.js";
+
+export const EXT_OFFERING = "https://agentmessaging.ai/extensions/offering/v1";
+export const EXT_BUDGET = "https://agentmessaging.ai/extensions/budget/v1";
+export const EXT_AUDIENCE = "https://agentmessaging.ai/extensions/audience/v1";
+export const EXT_ECONOMICS = "https://agentmessaging.ai/extensions/economics/v1";
+export const EXT_ARTIFACT_REFS = "https://agentmessaging.ai/extensions/artifact-refs/v1";
+
+export const BINDING_EXTENSIONS = [EXT_OFFERING, EXT_BUDGET, EXT_AUDIENCE, EXT_ECONOMICS, EXT_ARTIFACT_REFS] as const;
+
+const DESCRIPTIONS: Record<string, string> = {
+  [EXT_OFFERING]: "Which declared offering a message calls (Agent Messaging §8.5).",
+  [EXT_BUDGET]: "A budget, and why a Task ended at its cap (Agent Messaging §7.7).",
+  [EXT_AUDIENCE]: "A message meant for the person behind the agent (Agent Messaging §5.7).",
+  [EXT_ECONOMICS]: "Payment required, with the price and how to pay (Agent Messaging §19).",
+  [EXT_ARTIFACT_REFS]: "A large Part's size and digest (Agent Messaging §7.5.1).",
+};
+
+/** The card's `capabilities.extensions` entries for the extensions given
+ *  (all five by default), each `required: false` (§12). */
+export function cardExtensions(uris: readonly string[] = BINDING_EXTENSIONS): AgentExtension[] {
+  return uris.map((uri) => ({ uri, ...(DESCRIPTIONS[uri] ? { description: DESCRIPTIONS[uri] } : {}), required: false }));
+}
+
+type WithMetadata = { metadata?: Record<string, unknown> };
+
+/** An extension's data on an object, or undefined. */
+export function extensionData<T = Record<string, unknown>>(obj: WithMetadata | undefined, uri: string): T | undefined {
+  const v = obj?.metadata?.[uri];
+  return v && typeof v === "object" && !Array.isArray(v) ? (v as T) : undefined;
+}
+
+/** A copy of the object with an extension's data set under its URI. */
+export function withExtensionData<O extends WithMetadata>(obj: O, uri: string, data: Record<string, unknown>): O {
+  return { ...obj, metadata: { ...(obj.metadata ?? {}), [uri]: data } };
+}
+
+/** A copy of a Message that lists the extension in its `extensions`. */
+function usesExtension(m: Message, uri: string): Message {
+  const list = m.extensions ?? [];
+  return list.includes(uri) ? m : { ...m, extensions: [...list, uri] };
+}
+
+// ─── §12.1 Offering ─────────────────────────────────────────────────
+
+export function withOffering(message: Message, offering: string): Message {
+  return usesExtension(withExtensionData(message, EXT_OFFERING, { offering }), EXT_OFFERING);
+}
+
+export function offeringOf(message: Message | undefined): string | undefined {
+  const o = extensionData<{ offering?: unknown }>(message, EXT_OFFERING)?.offering;
+  return typeof o === "string" && o ? o : undefined;
+}
+
+// ─── §12.2 Budget ───────────────────────────────────────────────────
+
+/** The budget extension's data (camelCase on the A2A side). */
+export interface A2ABudget {
+  deadline?: string;
+  revision: number;
+  costCeiling?: { amountMicro: number; currency: string };
+}
+
+export function budgetToA2A(b: Budget): A2ABudget {
+  return {
+    ...(b.deadline !== undefined ? { deadline: b.deadline } : {}),
+    revision: b.revision,
+    ...(b.cost_ceiling ? { costCeiling: { amountMicro: b.cost_ceiling.amount_micro, currency: b.cost_ceiling.currency } } : {}),
+  };
+}
+
+export function budgetFromA2A(b: A2ABudget): Budget {
+  return {
+    ...(b.deadline !== undefined ? { deadline: b.deadline } : {}),
+    revision: b.revision,
+    ...(b.costCeiling ? { cost_ceiling: { amount_micro: b.costCeiling.amountMicro, currency: b.costCeiling.currency } } : {}),
+  };
+}
+
+/** A Message that starts or revises work under a budget. */
+export function withBudget(message: Message, budget: Budget | A2ABudget): Message {
+  const data = "cost_ceiling" in budget || !("costCeiling" in budget) ? budgetToA2A(budget as Budget) : (budget as A2ABudget);
+  return usesExtension(withExtensionData(message, EXT_BUDGET, data as unknown as Record<string, unknown>), EXT_BUDGET);
+}
+
+/** The budget a Message carries, in the SDK's own shape, or undefined when it
+ *  carries none or one that is not well formed (revision a non-negative
+ *  integer, at least one of the two axes). */
+export function budgetOf(message: Message | undefined): Budget | undefined {
+  const d = extensionData<Partial<A2ABudget>>(message, EXT_BUDGET);
+  if (!d || typeof d.revision !== "number" || !Number.isInteger(d.revision) || d.revision < 0) return undefined;
+  if (d.deadline === undefined && d.costCeiling === undefined) return undefined;
+  return budgetFromA2A(d as A2ABudget);
+}
+
+function statusMessage(text: string, task: Task): Message {
+  return {
+    messageId: `status-${task.id}-${Date.now().toString(36)}`,
+    role: "ROLE_AGENT",
+    parts: [{ text }],
+    taskId: task.id,
+    ...(task.contextId ? { contextId: task.contextId } : {}),
+  };
+}
+
+function ended(task: Task, state: TaskState, text: string, data: Record<string, unknown>, uri: string): Task {
+  const next = withExtensionData(task, uri, data);
+  return {
+    ...next,
+    status: { state, message: statusMessage(text, task), timestamp: new Date().toISOString() },
+  };
+}
+
+/**
+ * §12.2: the engagement's not-to-exceed cap ended the work. The Task ends in
+ * `TASK_STATE_CANCELED` with `{"outcome": "exhausted"}` under the budget URI
+ * and a status message saying so. Artifacts already attached stay. A client
+ * that knows the extension never records it as failed and never retries it.
+ */
+export function exhaustedTask(task: Task, text = "The engagement's not-to-exceed cap was reached; the work stopped there."): Task {
+  return ended(task, "TASK_STATE_CANCELED", text, { outcome: "exhausted" }, EXT_BUDGET);
+}
+
+/** Did this Task end at its budget's cap (§12.2)? */
+export function isExhausted(task: Task | undefined): boolean {
+  return task?.status?.state === "TASK_STATE_CANCELED" && extensionData<{ outcome?: unknown }>(task, EXT_BUDGET)?.outcome === "exhausted";
+}
+
+/** §12.2: the work does not fit the budget. `TASK_STATE_REJECTED` with
+ *  `{"outcome": "insufficient", "estimate": {...}}` under the budget URI. */
+export function insufficientBudgetTask(task: Task, estimate: Record<string, unknown>, text = "The work does not fit the budget."): Task {
+  return ended(task, "TASK_STATE_REJECTED", text, { outcome: "insufficient", estimate }, EXT_BUDGET);
+}
+
+export function budgetOutcomeOf(task: Task | undefined): { outcome: string; estimate?: Record<string, unknown> } | undefined {
+  const d = extensionData<{ outcome?: unknown; estimate?: unknown }>(task, EXT_BUDGET);
+  if (!d || typeof d.outcome !== "string") return undefined;
+  return {
+    outcome: d.outcome,
+    ...(d.estimate && typeof d.estimate === "object" ? { estimate: d.estimate as Record<string, unknown> } : {}),
+  };
+}
+
+// ─── §12.3 Audience ─────────────────────────────────────────────────
+
+/** A Message meant for the person behind the receiving agent. */
+export function forPerson(message: Message): Message {
+  return usesExtension(withExtensionData(message, EXT_AUDIENCE, { audience: "person" }), EXT_AUDIENCE);
+}
+
+export function isForPerson(message: Message | undefined): boolean {
+  return extensionData<{ audience?: unknown }>(message, EXT_AUDIENCE)?.audience === "person";
+}
+
+// ─── §12.4 Economics ────────────────────────────────────────────────
+
+export interface PaymentRequired {
+  price: Record<string, unknown>;
+  accepted: unknown[];
+}
+
+/** §12.4: payment is required before the work. `TASK_STATE_REJECTED` with
+ *  `{"paymentRequired": {price, accepted}}` under the economics URI. */
+export function paymentRequiredTask(task: Task, payment: PaymentRequired, text = "Payment is required before this work."): Task {
+  return ended(task, "TASK_STATE_REJECTED", text, { paymentRequired: payment }, EXT_ECONOMICS);
+}
+
+export function paymentRequiredOf(task: Task | undefined): PaymentRequired | undefined {
+  const p = extensionData<{ paymentRequired?: unknown }>(task, EXT_ECONOMICS)?.paymentRequired;
+  if (!p || typeof p !== "object") return undefined;
+  const o = p as Record<string, unknown>;
+  return {
+    price: (o.price && typeof o.price === "object" ? o.price : {}) as Record<string, unknown>,
+    accepted: Array.isArray(o.accepted) ? o.accepted : [],
+  };
+}
+
+// ─── §12.5 Artifact references ──────────────────────────────────────
+
+/** A `url` Part whose value is an Agent Messaging artifact reference, with
+ *  its size and digest under the artifact-refs URI. Takes the SDK's
+ *  `putArtifact` result directly. */
+export function artifactRefPart(ref: {
+  ref: string;
+  size: number;
+  digest?: string;
+  media_type?: string;
+  mediaType?: string;
+  name?: string;
+  filename?: string;
+}): Part {
+  const mediaType = ref.mediaType ?? ref.media_type;
+  const filename = ref.filename ?? ref.name;
+  return {
+    url: ref.ref,
+    ...(mediaType ? { mediaType } : {}),
+    ...(filename ? { filename } : {}),
+    metadata: { [EXT_ARTIFACT_REFS]: { size: ref.size, ...(ref.digest ? { digest: ref.digest } : {}) } },
+  };
+}
+
+/** The artifact reference a Part carries: its URI, size and digest, or
+ *  undefined when the Part is not one. */
+export function artifactRefOf(part: Part): { ref: string; size: number; digest?: string; mediaType?: string; filename?: string } | undefined {
+  if (typeof part.url !== "string") return undefined;
+  const d = extensionData<{ size?: unknown; digest?: unknown }>(part, EXT_ARTIFACT_REFS);
+  if (!d || typeof d.size !== "number") return undefined;
+  return {
+    ref: part.url,
+    size: d.size,
+    ...(typeof d.digest === "string" ? { digest: d.digest } : {}),
+    ...(part.mediaType ? { mediaType: part.mediaType } : {}),
+    ...(part.filename ? { filename: part.filename } : {}),
+  };
+}

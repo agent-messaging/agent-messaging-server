@@ -1,0 +1,784 @@
+/**
+ * The server agent's side of the A2A binding (bindings/a2a.md §5, §8, §10).
+ *
+ * An agent installs one handler with `mesh.a2a.serve(handler)`. The handler
+ * receives each A2A Message a client sends and returns a Message (the work
+ * finished in one round) or a Task (the work continues), and while it runs it
+ * can emit status and artifact updates through the Task's handle. This module
+ * turns that into frames:
+ *
+ *   - The SDK keeps one event sequence per Task. The first event a request
+ *     gets goes to the client's inbox in a respond frame, so the client learns
+ *     the Task id; every later event is a respond frame on
+ *     `mesh.task.{taskId}.stream`. Each carries `payload.a2a.seq`, and the
+ *     event that ends a stream carries `final: true` (§8).
+ *   - `GetTask`, `ListTasks` and the snapshot `SubscribeToTask` starts from are
+ *     answered from the mesh's durable task store: the node relays the
+ *     client's own signed frame to the task manager, which applies the access
+ *     rule of §10 (only the agent that created the Task). When no task manager
+ *     answers, the node answers from what it holds itself, under the same rule.
+ *   - `CancelTask` reaches the handler's cancel hook; a Task in a terminal
+ *     state answers `TaskNotCancelableError`.
+ *   - Push notifications are not supported: the four operations answer
+ *     `PushNotificationNotSupportedError`, and the card says so.
+ *
+ * The node never adds a state, renames a field or changes what an operation
+ * means (§1).
+ */
+import type { Envelope, ErrorObject, TraceContext } from "../types/envelope.js";
+import { MeshError, ErrorCode } from "../types/errors.js";
+import { childSpan } from "../internal/trace.js";
+import { uuid7 } from "../internal/uuid.js";
+import {
+  STREAMING_METHODS,
+  activatedExtensions,
+  applyEvent,
+  cloneTask,
+  endsStream,
+  eventEndsStream,
+  isA2AMethod,
+  isTerminalState,
+  readRequestPayload,
+  readServiceParams,
+  respondPayload,
+  shapeTask,
+} from "./binding.js";
+import { A2AError, A2AErrors } from "./errors.js";
+import { budgetOf, exhaustedTask, isForPerson, offeringOf } from "./extensions.js";
+import type { Budget } from "../types/envelope.js";
+import type {
+  AgentCard,
+  Artifact,
+  CancelTaskRequest,
+  GetTaskRequest,
+  ListTasksRequest,
+  ListTasksResponse,
+  Message,
+  Part,
+  SendMessageRequest,
+  StreamResponse,
+  Task,
+  TaskState,
+} from "./types.js";
+
+/** The task manager's subjects for the node's reads (server/src/task-manager). */
+export const A2A_STORE_SUBJECTS = {
+  GET: "mesh.task.a2a.get",
+  LIST: "mesh.task.a2a.list",
+} as const;
+
+/** ListTasks page size: A2A's default and its bounds. */
+export const LIST_PAGE_DEFAULT = 50;
+export const LIST_PAGE_MAX = 100;
+
+/** What the node needs from the agent that hosts it. `AgentMesh` provides it. */
+export interface A2AServerHost {
+  readonly agentId: string;
+  /** A signed 0.4.0 respond frame. */
+  frame(p: { to: string; in_reply_to?: string; trace: TraceContext; payload?: unknown; error?: ErrorObject }): Envelope;
+  /** Publish a frame on a subject. */
+  publish(subject: string, env: Envelope): void;
+  /** The subject of a Task's stream (`mesh.task.{taskId}.stream`). */
+  streamSubject(taskId: string): string;
+  /** A signed request to a mesh service; resolves with the answer's payload. */
+  serviceRequest(subject: string, payload: unknown, timeoutMs: number): Promise<unknown>;
+  /** The offerings this agent declares (§12.1), in its manifest. */
+  offerings(): string[];
+}
+
+/** One Task this agent runs, as its handle shows it to the handler. */
+export interface TaskHandle {
+  readonly id: string;
+  readonly contextId: string;
+  /** The Task as it stands (a copy). */
+  readonly task: Task;
+  /** Set the status, with an optional status message, and emit a
+   *  TaskStatusUpdateEvent. */
+  status(state: TaskState, message?: string | Message, metadata?: Record<string, unknown>): void;
+  /** Add an artifact (or append parts to one) and emit a
+   *  TaskArtifactUpdateEvent. */
+  artifact(artifact: Artifact, opts?: { append?: boolean; lastChunk?: boolean }): void;
+  complete(message?: string | Message): void;
+  fail(message?: string | Message): void;
+  reject(message?: string | Message, metadata?: Record<string, unknown>): void;
+  requireInput(message: string | Message): void;
+  requireAuth(message: string | Message): void;
+  /** §12.2: the engagement's cap ended the work: canceled, with the
+   *  `exhausted` outcome under the budget extension. */
+  exhausted(text?: string): void;
+  /** Replace the whole Task at once (emits a Task event). */
+  replace(task: Task): void;
+  /** Resolves when the Task reaches a terminal or interrupted state. */
+  settled(): Promise<Task>;
+}
+
+export interface A2AContext {
+  /** The client's agent key, from the frame's verified signature (§10). */
+  readonly caller: string;
+  /** The A2A request object as it arrived. */
+  readonly request: SendMessageRequest;
+  /** The whole request frame. */
+  readonly envelope: Envelope;
+  /** Service parameters from `meta.a2a` (§7). */
+  readonly serviceParams: Record<string, string>;
+  /** The extensions the client activated (`A2A-Extensions`). */
+  readonly extensions: string[];
+  /** The offering this message calls (§12.1), resolved against what the
+   *  agent declares. */
+  readonly offering?: string;
+  /** The budget the message carries (§12.2), if any. */
+  readonly budget?: Budget;
+  /** The message is meant for the person behind this agent (§12.3). */
+  readonly forPerson: boolean;
+  /** SendStreamingMessage rather than SendMessage. */
+  readonly streaming: boolean;
+  /** The Task the message continues, when it names one. */
+  readonly existingTask?: Task;
+  /** Aborted when the Task is canceled. */
+  readonly signal: AbortSignal;
+  /** Create this call's Task (or, for a message that continues one, take its
+   *  handle). The Task starts in `TASK_STATE_SUBMITTED` unless told otherwise,
+   *  with the client's message in its history. */
+  startTask(init?: { state?: TaskState; contextId?: string; metadata?: Record<string, unknown> }): TaskHandle;
+}
+
+export type A2AHandlerResult = Message | Task | TaskHandle | void | undefined;
+export type A2AHandler = (message: Message, ctx: A2AContext) => A2AHandlerResult | Promise<A2AHandlerResult>;
+
+export interface A2AServeOptions {
+  /** Called on CancelTask for a Task this node runs. Throw an A2AError to
+   *  refuse; return to let the cancel stand. */
+  onCancel?: (task: Task, caller: string) => void | Promise<void>;
+  /** The extended card (GetExtendedAgentCard), or a function of the caller
+   *  that returns one. Absent: ExtendedAgentCardNotConfiguredError. */
+  extendedCard?: AgentCard | ((caller: string) => AgentCard | Promise<AgentCard>);
+  /** How long a SendMessage waits for the handler before answering with the
+   *  Task as it stands, so a long Task does not outlive the client's reply
+   *  window. Default 10 seconds. */
+  replyWindowMs?: number;
+  /** How long the node waits for the task store before answering from what
+   *  it holds itself. Default 5 seconds. */
+  storeTimeoutMs?: number;
+  /** The offerings to resolve the offering extension against (§12.1).
+   *  Default: the offerings the agent declares in its manifest. */
+  offerings?: string[];
+}
+
+interface LiveTask {
+  task: Task;
+  requester: string;
+  seq: number;
+  /** The first event has gone to a client's inbox. */
+  announced: boolean;
+  /** The current stream has had its final event. */
+  ended: boolean;
+  trace: TraceContext;
+  abort: AbortController;
+  waiters: Array<(t: Task) => void>;
+  handle?: TaskHandle;
+}
+
+const agentMessage = (content: string | Message, task: Task): Message =>
+  typeof content === "string"
+    ? {
+        messageId: uuid7(),
+        role: "ROLE_AGENT",
+        parts: [{ text: content }],
+        taskId: task.id,
+        ...(task.contextId ? { contextId: task.contextId } : {}),
+      }
+    : content;
+
+const now = () => new Date().toISOString();
+
+function isTask(v: unknown): v is Task {
+  return !!v && typeof v === "object" && typeof (v as Task).id === "string" && !!(v as Task).status && typeof (v as Task).status === "object";
+}
+
+function isMessage(v: unknown): v is Message {
+  return !!v && typeof v === "object" && Array.isArray((v as Message).parts) && typeof (v as Message).role === "string";
+}
+
+function isHandle(v: unknown): v is TaskHandle {
+  return !!v && typeof v === "object" && typeof (v as TaskHandle).status === "function" && typeof (v as TaskHandle).id === "string";
+}
+
+/** A store or transport failure the node answers around (it falls back to
+ *  what it holds), as against an answer from the store. */
+function storeUnreachable(err: unknown): boolean {
+  return (
+    err instanceof MeshError &&
+    (err.code === ErrorCode.TRANSPORT_TIMEOUT ||
+      err.code === ErrorCode.TRANSPORT_NO_RESPONDERS ||
+      err.code === ErrorCode.TRANSPORT_PERMISSION_DENIED)
+  );
+}
+
+/** The A2A error a store answer carries, if it is one. */
+function a2aErrorOf(err: unknown): A2AError | null {
+  if (err instanceof A2AError) return err;
+  if (err instanceof MeshError) return A2AError.fromErrorObject(err.toErrorObject());
+  return null;
+}
+
+export class A2AServerAgent {
+  private handler: A2AHandler | null = null;
+  private opts: A2AServeOptions = {};
+  private readonly live = new Map<string, LiveTask>();
+  /** Answers 0.4.0 SendMessage for an agent with no A2A handler: its 0.3.0
+   *  handlers (§14), wired by AgentMesh. */
+  legacy: ((offering: string | undefined, message: Message, env: Envelope) => Promise<Message>) | null = null;
+
+  constructor(private readonly host: A2AServerHost) {}
+
+  /** Install the handler (replacing any earlier one). */
+  serve(handler: A2AHandler, opts: A2AServeOptions = {}): void {
+    this.handler = handler;
+    this.opts = opts;
+  }
+
+  get serving(): boolean {
+    return this.handler !== null;
+  }
+
+  get options(): A2AServeOptions {
+    return this.opts;
+  }
+
+  /** The Tasks this node holds in memory (a copy of each). */
+  tasks(): Task[] {
+    return [...this.live.values()].map((l) => cloneTask(l.task));
+  }
+
+  /** The handle of a Task this node runs, for work that continues after its
+   *  handler returned. */
+  handleFor(taskId: string): TaskHandle | undefined {
+    const l = this.live.get(taskId);
+    return l ? this.makeHandle(l) : undefined;
+  }
+
+  /**
+   * Answer one 0.4.0 request frame. `reply` sends a respond frame to the
+   * client (its inbox, or the guarded relay's reply subject). The frame has
+   * already passed every check the inbox makes (signature, `to`, freshness,
+   * revoked or paused sender, admission) and the §4 field check.
+   */
+  async dispatch(env: Envelope, reply: (resp: Envelope) => void): Promise<void> {
+    const req = readRequestPayload(env);
+    const answerError = (err: A2AError | MeshError): void =>
+      reply(this.host.frame({ to: env.from, in_reply_to: env.id, trace: childSpan(env.trace), error: err.toErrorObject() }));
+    const answer = (result: unknown, stream?: { seq: number; final: boolean }): void =>
+      reply(this.host.frame({ to: env.from, in_reply_to: env.id, trace: childSpan(env.trace), payload: respondPayload(result, stream) }));
+
+    if (!req) {
+      answerError(new A2AError("InvalidRequestError", "A 0.4.0 request frame carries payload.a2a with method and params (A2A binding §4)."));
+      return;
+    }
+    if (!isA2AMethod(req.method)) {
+      answerError(A2AErrors.methodNotFound(req.method));
+      return;
+    }
+    const params = (req.params && typeof req.params === "object" ? req.params : {}) as Record<string, unknown>;
+    try {
+      switch (req.method) {
+        case "SendMessage":
+        case "SendStreamingMessage":
+          await this.sendMessage(env, params as unknown as SendMessageRequest, STREAMING_METHODS.has(req.method), reply);
+          return;
+        case "GetTask": {
+          const p = params as unknown as GetTaskRequest;
+          if (typeof p.id !== "string" || !p.id) throw A2AErrors.invalidParams("GetTask needs the Task's id.");
+          const { task } = await this.readTask(env, p.id);
+          answer(shapeTask(task, { historyLength: p.historyLength }));
+          return;
+        }
+        case "ListTasks":
+          answer(await this.listTasks(env, params as ListTasksRequest));
+          return;
+        case "CancelTask":
+          answer(await this.cancelTask(env, params as unknown as CancelTaskRequest));
+          return;
+        case "SubscribeToTask": {
+          const id = (params as { id?: unknown }).id;
+          if (typeof id !== "string" || !id) throw A2AErrors.invalidParams("SubscribeToTask needs the Task's id.");
+          const { task, seq } = await this.readTask(env, id);
+          // §8: it starts from the Task's current state. The snapshot carries
+          // the seq of the last event folded into it, so the client takes the
+          // events after it from the stream subject.
+          answer({ task }, { seq, final: endsStream(task.status.state) });
+          return;
+        }
+        case "CreateTaskPushNotificationConfig":
+        case "GetTaskPushNotificationConfig":
+        case "ListTaskPushNotificationConfigs":
+        case "DeleteTaskPushNotificationConfig":
+          throw A2AErrors.pushNotSupported();
+        case "GetExtendedAgentCard": {
+          const card = this.opts.extendedCard;
+          if (!card) throw A2AErrors.extendedCardNotConfigured();
+          answer(typeof card === "function" ? await card(env.from) : card);
+          return;
+        }
+      }
+    } catch (err) {
+      if (err instanceof A2AError || err instanceof MeshError) answerError(err);
+      else answerError(A2AErrors.internal(err instanceof Error ? err.message : String(err)));
+    }
+  }
+
+  // ─── SendMessage / SendStreamingMessage ───────────────────────────
+
+  private resolveOffering(message: Message): string | undefined {
+    const declared = this.opts.offerings ?? this.host.offerings();
+    const named = offeringOf(message);
+    // §12.1: one declared offering is served when a message names none;
+    // several, and a message naming none or one not declared, is refused
+    // with the invalid-parameters error listing them.
+    if (declared.length === 0) return named;
+    if (named === undefined && declared.length === 1) return declared[0];
+    if (named !== undefined && declared.includes(named)) return named;
+    throw A2AErrors.invalidParams(
+      named === undefined
+        ? "This agent declares several offerings; name one with the offering extension."
+        : `This agent does not declare the offering ${JSON.stringify(named)}.`,
+      { offerings: declared },
+    );
+  }
+
+  private async sendMessage(
+    env: Envelope,
+    request: SendMessageRequest,
+    streaming: boolean,
+    reply: (resp: Envelope) => void,
+  ): Promise<void> {
+    const message = request?.message;
+    if (!isMessage(message) || typeof message.messageId !== "string") {
+      throw A2AErrors.invalidParams("SendMessage needs a message with messageId, role and parts.");
+    }
+    const offering = this.resolveOffering(message);
+
+    // A message that names a Task continues it, when it is the caller's own
+    // and not finished (A2A §3.1.1).
+    let existing: LiveTask | undefined;
+    if (typeof message.taskId === "string" && message.taskId) {
+      existing = this.live.get(message.taskId);
+      if (!existing) {
+        const { task, seq, requester } = await this.readTask(env, message.taskId);
+        existing = this.adopt(task, seq, requester ?? env.from, env.trace);
+      } else if (existing.requester !== env.from) {
+        throw A2AErrors.taskNotFound(message.taskId);
+      }
+      if (isTerminalState(existing.task.status.state)) {
+        throw new A2AError("UnsupportedOperationError", "The task is in a terminal state and takes no more messages.", {
+          taskId: existing.task.id,
+          state: existing.task.status.state,
+        });
+      }
+    }
+
+    if (!this.handler) {
+      if (this.legacy && !existing) {
+        const out = await this.legacy(offering, message, env);
+        this.answerFirst(env, reply, { message: out }, streaming ? { final: true } : undefined);
+        return;
+      }
+      throw A2AErrors.unsupported("A2A messages");
+    }
+
+    let live: LiveTask | undefined = existing;
+    let answered = false;
+    const abort = existing?.abort ?? new AbortController();
+    const firstAnswer = (): void => {
+      if (answered || !live) return;
+      answered = true;
+      live.announced = true;
+      live.ended = false;
+      // The answer takes the next number in the Task's sequence: 0 for a new
+      // Task, the next for a message that continues one.
+      if (existing) live.seq += 1;
+      const snapshot = cloneTask(live.task);
+      this.answerFirst(env, reply, { task: snapshot }, { seq: live.seq, final: streaming ? endsStream(snapshot.status.state) : false });
+      if (endsStream(snapshot.status.state)) live.ended = true;
+    };
+
+    if (existing) {
+      // The client's message joins the history and the Task works again.
+      existing.task.history = [...(existing.task.history ?? []), message];
+      existing.trace = env.trace;
+      existing.announced = false;
+    }
+
+    const ctx: A2AContext = {
+      caller: env.from,
+      request,
+      envelope: env,
+      serviceParams: readServiceParams(env),
+      extensions: activatedExtensions(readServiceParams(env)),
+      ...(offering !== undefined ? { offering } : {}),
+      ...(budgetOf(message) ? { budget: budgetOf(message) } : {}),
+      forPerson: isForPerson(message),
+      streaming,
+      ...(existing ? { existingTask: cloneTask(existing.task) } : {}),
+      signal: abort.signal,
+      startTask: (init = {}) => {
+        if (!live) {
+          const id = uuid7();
+          const contextId = init.contextId ?? message.contextId ?? uuid7();
+          const task: Task = {
+            id,
+            contextId,
+            status: { state: init.state ?? "TASK_STATE_SUBMITTED", timestamp: now() },
+            history: [{ ...message, taskId: id, contextId }],
+            ...(init.metadata ? { metadata: init.metadata } : {}),
+          };
+          live = { task, requester: env.from, seq: 0, announced: false, ended: false, trace: env.trace, abort, waiters: [] };
+          this.live.set(id, live);
+        }
+        const handle = this.makeHandle(live, () => {
+          // Before the first answer has gone, a status that ends the stream
+          // (terminal or interrupted) answers a blocking SendMessage now.
+          if (!answered && endsStream(live!.task.status.state)) firstAnswer();
+        });
+        live.handle = handle;
+        // A streaming call answers with the Task the moment it exists, so the
+        // client learns its id (§8); a non-blocking call does too.
+        if (streaming || request.configuration?.returnImmediately) firstAnswer();
+        return handle;
+      },
+    };
+
+    // A long Task answers with the Task as it stands when the reply window
+    // closes, and goes on after (§15: longer than the mesh's reply window).
+    const windowMs = this.opts.replyWindowMs ?? 10_000;
+    const windowTimer = setTimeout(() => firstAnswer(), windowMs);
+    (windowTimer as { unref?: () => void }).unref?.();
+
+    let result: A2AHandlerResult;
+    try {
+      result = await this.handler(message, ctx);
+    } catch (err) {
+      clearTimeout(windowTimer);
+      if (live && answered) {
+        // The Task exists and the client knows it: the error ends it.
+        this.makeHandle(live).fail(err instanceof Error ? err.message : String(err));
+        return;
+      }
+      if (live) this.live.delete(live.task.id);
+      throw err;
+    }
+    clearTimeout(windowTimer);
+
+    if (isHandle(result)) {
+      // The handle of the call's own Task: answered below with its Task.
+    } else if (isTask(result)) {
+      if (!live) {
+        live = { task: cloneTask(result), requester: env.from, seq: 0, announced: false, ended: false, trace: env.trace, abort, waiters: [] };
+        this.live.set(result.id, live);
+      } else if (answered && JSON.stringify(result) !== JSON.stringify(live.task)) {
+        this.emit(live, { task: cloneTask(result) });
+      } else if (!answered) {
+        live.task = cloneTask(result);
+      }
+    } else if (isMessage(result)) {
+      if (!live) {
+        this.answerFirst(env, reply, { message: result }, streaming ? { final: true } : undefined);
+        return;
+      }
+      // A Message from a handler that also started a Task is the Task's
+      // status message.
+      if (!answered) live.task.status = { ...live.task.status, message: result };
+    } else if (!live) {
+      throw A2AErrors.invalidAgentResponse("The agent's handler returned neither a Message nor a Task.");
+    }
+
+    if (!answered) firstAnswer();
+  }
+
+  private answerFirst(
+    env: Envelope,
+    reply: (resp: Envelope) => void,
+    result: { task?: Task; message?: Message },
+    stream?: { seq?: number; final: boolean },
+  ): void {
+    reply(
+      this.host.frame({
+        to: env.from,
+        in_reply_to: env.id,
+        trace: childSpan(env.trace),
+        payload: respondPayload(result, stream ? { seq: stream.seq ?? 0, final: stream.final } : undefined),
+      }),
+    );
+  }
+
+  /** Emit one event for a Task: fold it in, and once the client knows the
+   *  Task, publish it on the stream subject with the next seq (§8). */
+  private emit(live: LiveTask, ev: StreamResponse, after?: () => void): void {
+    const before = live.task;
+    const next = applyEvent(live.task, ev);
+    if (!next || next === before) return; // a terminal Task does not move
+    live.task = next;
+    if (live.announced && !live.ended) {
+      live.seq += 1;
+      const final = eventEndsStream(ev);
+      this.host.publish(
+        this.host.streamSubject(live.task.id),
+        this.host.frame({
+          to: live.requester,
+          trace: childSpan(live.trace),
+          payload: respondPayload(ev, { seq: live.seq, final }),
+        }),
+      );
+      if (final) live.ended = true;
+    }
+    after?.();
+    if (endsStream(live.task.status.state)) {
+      const waiters = live.waiters.splice(0);
+      for (const w of waiters) w(cloneTask(live.task));
+    }
+  }
+
+  private makeHandle(live: LiveTask, after?: () => void): TaskHandle {
+    const self = this;
+    const status = (state: TaskState, message?: string | Message, metadata?: Record<string, unknown>): void => {
+      const t = live.task;
+      self.emit(
+        live,
+        {
+          statusUpdate: {
+            taskId: t.id,
+            contextId: t.contextId ?? "",
+            status: { state, ...(message !== undefined ? { message: agentMessage(message, t) } : {}), timestamp: now() },
+            ...(metadata ? { metadata } : {}),
+          },
+        },
+        after,
+      );
+    };
+    return {
+      get id() {
+        return live.task.id;
+      },
+      get contextId() {
+        return live.task.contextId ?? "";
+      },
+      get task() {
+        return cloneTask(live.task);
+      },
+      status,
+      artifact(artifact, opts = {}) {
+        const t = live.task;
+        self.emit(
+          live,
+          {
+            artifactUpdate: {
+              taskId: t.id,
+              contextId: t.contextId ?? "",
+              artifact,
+              ...(opts.append ? { append: true } : {}),
+              ...(opts.lastChunk ? { lastChunk: true } : {}),
+            },
+          },
+          after,
+        );
+      },
+      complete: (m) => status("TASK_STATE_COMPLETED", m),
+      fail: (m) => status("TASK_STATE_FAILED", m),
+      reject: (m, md) => status("TASK_STATE_REJECTED", m, md),
+      requireInput: (m) => status("TASK_STATE_INPUT_REQUIRED", m),
+      requireAuth: (m) => status("TASK_STATE_AUTH_REQUIRED", m),
+      exhausted(text) {
+        const ended = exhaustedTask(live.task, text);
+        status("TASK_STATE_CANCELED", ended.status.message, ended.metadata);
+      },
+      replace(task) {
+        self.emit(live, { task: cloneTask(task) }, after);
+      },
+      settled() {
+        if (endsStream(live.task.status.state)) return Promise.resolve(cloneTask(live.task));
+        return new Promise<Task>((resolve) => live.waiters.push(resolve));
+      },
+    };
+  }
+
+  /** A Task read back from the store, held in memory so a message continuing
+   *  it, or a cancel, has a sequence to continue. */
+  private adopt(task: Task, seq: number, requester: string, trace: TraceContext): LiveTask {
+    const l: LiveTask = {
+      task: cloneTask(task),
+      requester,
+      seq,
+      announced: true,
+      ended: endsStream(task.status.state),
+      trace,
+      abort: new AbortController(),
+      waiters: [],
+    };
+    this.live.set(task.id, l);
+    return l;
+  }
+
+  // ─── Reads from the task store (§5, §10) ──────────────────────────
+
+  /**
+   * One Task for the client that sent `env`, from the durable store, with the
+   * node's own copy when it is newer. The store applies §10's rule; when it
+   * cannot be reached, the node applies the same rule to its own copy.
+   * Anyone but the Task's creator gets TaskNotFoundError.
+   */
+  private async readTask(env: Envelope, taskId: string): Promise<{ task: Task; seq: number; requester?: string }> {
+    const mine = this.live.get(taskId);
+    let stored: { task: Task; seq: number; requester?: string } | null = null;
+    try {
+      const out = (await this.host.serviceRequest(A2A_STORE_SUBJECTS.GET, { frame: env, id: taskId }, this.opts.storeTimeoutMs ?? 5_000)) as {
+        task?: Task;
+        seq?: number;
+        requester?: string;
+      };
+      if (out && isTask(out.task)) stored = { task: out.task, seq: typeof out.seq === "number" ? out.seq : 0, requester: out.requester };
+    } catch (err) {
+      const a2a = a2aErrorOf(err);
+      if (a2a) {
+        // The store does not know it yet (its fold runs behind the node), or
+        // says the caller may not read it. The node's own copy decides the
+        // first case, under the same rule.
+        if (a2a.code === "TaskNotFoundError" && mine && mine.requester === env.from) {
+          return { task: cloneTask(mine.task), seq: mine.seq, requester: mine.requester };
+        }
+        throw a2a;
+      }
+      if (!storeUnreachable(err)) throw err;
+    }
+    if (stored) {
+      if (mine && mine.seq >= stored.seq && mine.requester === env.from) {
+        return { task: cloneTask(mine.task), seq: mine.seq, requester: mine.requester };
+      }
+      return stored;
+    }
+    if (mine && mine.requester === env.from) return { task: cloneTask(mine.task), seq: mine.seq, requester: mine.requester };
+    throw A2AErrors.taskNotFound(taskId);
+  }
+
+  private async listTasks(env: Envelope, p: ListTasksRequest): Promise<ListTasksResponse> {
+    if (p.pageSize !== undefined && (!Number.isInteger(p.pageSize) || p.pageSize < 1 || p.pageSize > LIST_PAGE_MAX)) {
+      throw A2AErrors.invalidParams(`pageSize must be an integer from 1 to ${LIST_PAGE_MAX}.`);
+    }
+    try {
+      const out = (await this.host.serviceRequest(A2A_STORE_SUBJECTS.LIST, { frame: env }, this.opts.storeTimeoutMs ?? 5_000)) as {
+        result?: ListTasksResponse;
+        seqs?: Record<string, number>;
+      };
+      if (out?.result && Array.isArray(out.result.tasks)) {
+        // The node's newer copies of Tasks the store listed.
+        const tasks = out.result.tasks.map((t) => {
+          const mine = this.live.get(t.id);
+          return mine && mine.requester === env.from && mine.seq >= (out.seqs?.[t.id] ?? 0)
+            ? shapeTask(mine.task, { historyLength: p.historyLength, includeArtifacts: p.includeArtifacts })
+            : t;
+        });
+        return { ...out.result, tasks };
+      }
+    } catch (err) {
+      const a2a = a2aErrorOf(err);
+      if (a2a) throw a2a;
+      if (!storeUnreachable(err)) throw err;
+    }
+    return listFrom(
+      [...this.live.values()].filter((l) => l.requester === env.from).map((l) => l.task),
+      p,
+    );
+  }
+
+  private async cancelTask(env: Envelope, p: CancelTaskRequest): Promise<Task> {
+    if (typeof p?.id !== "string" || !p.id) throw A2AErrors.invalidParams("CancelTask needs the Task's id.");
+    let live = this.live.get(p.id);
+    if (live && live.requester !== env.from) throw A2AErrors.taskNotFound(p.id);
+    if (!live) {
+      const { task, seq, requester } = await this.readTask(env, p.id);
+      live = this.adopt(task, seq, requester ?? env.from, env.trace);
+    }
+    const state = live.task.status.state;
+    if (isTerminalState(state)) throw A2AErrors.taskNotCancelable(p.id, state);
+    if (this.opts.onCancel) await this.opts.onCancel(cloneTask(live.task), env.from);
+    live.abort.abort();
+    // The cancel ends the stream that is open, and starts one for a Task
+    // whose stream had ended at an interrupted state.
+    if (live.ended) live.ended = false;
+    live.announced = true;
+    this.makeHandle(live).status("TASK_STATE_CANCELED", "Canceled at the client's request.", p.metadata);
+    return cloneTask(live.task);
+  }
+}
+
+/** ListTasks over a set of Tasks the caller may read: filtered, newest status
+ *  first, paged by offset (A2A §3.1.4). Shared with the task manager. */
+export function listFrom(all: Task[], p: ListTasksRequest): ListTasksResponse {
+  const after = p.statusTimestampAfter ? Date.parse(p.statusTimestampAfter) : NaN;
+  const matching = all
+    .filter((t) => (p.contextId ? t.contextId === p.contextId : true))
+    .filter((t) => (p.status && p.status !== "TASK_STATE_UNSPECIFIED" ? t.status.state === p.status : true))
+    .filter((t) => (Number.isNaN(after) ? true : Date.parse(t.status.timestamp ?? "") > after))
+    .sort((a, b) => (b.status.timestamp ?? "").localeCompare(a.status.timestamp ?? "") || a.id.localeCompare(b.id));
+  const size = Math.min(Math.max(p.pageSize ?? LIST_PAGE_DEFAULT, 1), LIST_PAGE_MAX);
+  const start = p.pageToken && /^\d+$/.test(p.pageToken) ? Number(p.pageToken) : 0;
+  const page = matching.slice(start, start + size);
+  const next = start + size < matching.length ? String(start + size) : "";
+  return {
+    tasks: page.map((t) => shapeTask(t, { historyLength: p.historyLength ?? 0, includeArtifacts: p.includeArtifacts ?? false })),
+    nextPageToken: next,
+    pageSize: size,
+    totalSize: matching.length,
+  };
+}
+
+/** A Message's content as a 0.3.0 handler's input (§14): the data of a lone
+ *  data part, else the text of its text parts as `{text}`, with any files as
+ *  `files` beside it. */
+export function legacyInputOf(message: Message): unknown {
+  const parts = message.parts ?? [];
+  const data = parts.filter((p) => p.data !== undefined);
+  if (data.length === 1 && parts.length === 1) return data[0].data;
+  const text = parts
+    .filter((p) => typeof p.text === "string")
+    .map((p) => p.text)
+    .join("\n");
+  const files = parts.filter((p) => typeof p.url === "string" || typeof p.raw === "string");
+  return {
+    ...(text ? { text } : {}),
+    ...(data.length ? { data: data.map((p) => p.data) } : {}),
+    ...(files.length ? { files } : {}),
+  };
+}
+
+/** A 0.3.0 handler's output as A2A parts (§14). */
+export function partsOfOutput(output: unknown): Part[] {
+  if (output === undefined || output === null) return [];
+  if (typeof output === "string") return [{ text: output }];
+  return [{ data: output }];
+}
+
+/** A 0.3.0 request's input as an A2A Message (§14). */
+export function messageOfLegacyInput(input: unknown, offering: string | undefined): Message {
+  const parts: Part[] =
+    typeof input === "string"
+      ? [{ text: input }]
+      : input && typeof input === "object" && typeof (input as { text?: unknown }).text === "string" && Object.keys(input).length === 1
+        ? [{ text: (input as { text: string }).text }]
+        : input === undefined
+          ? []
+          : [{ data: input }];
+  return {
+    messageId: uuid7(),
+    role: "ROLE_USER",
+    parts,
+    ...(offering ? { metadata: { "https://agentmessaging.ai/extensions/offering/v1": { offering } } } : {}),
+  };
+}
+
+/** An A2A answer as a 0.3.0 handler's output (§14): a lone data part's data,
+ *  else the text. */
+export function outputOfParts(parts: Part[]): unknown {
+  if (parts.length === 1 && parts[0].data !== undefined) return parts[0].data;
+  const text = parts.filter((p) => typeof p.text === "string").map((p) => p.text).join("\n");
+  if (parts.every((p) => typeof p.text === "string")) return text;
+  return { ...(text ? { text } : {}), parts };
+}
