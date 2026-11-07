@@ -30,7 +30,66 @@
 
 import { decode, type Envelope } from "../sdk.js";
 import { metrics } from "../shared/ops-events.js";
+import { a2aAnswerTaskId, a2aRequestFacts, CANCEL_OFFERING, isAccept } from "../shared/a2a-frames.js";
+import { isA2AFrame } from "../../../sdk-typescript/src/a2a/binding.js";
 import { cancelIdentity, type Observation, type OriginLedger } from "./origin.js";
+
+/** How many A2A requests that never create a Task are remembered, so their
+ *  answers are not judged as answers that could have (see `ledgerView`). */
+const NON_TASK_REQUESTS_MAX = 10_000;
+
+/**
+ * The envelope as the ledger reads it. The ledger reads a request's offering
+ * and Task id, and an answer's Task id, from the 0.3.0 envelope fields; a
+ * 0.4.0 frame (the A2A binding) carries them inside its A2A object instead
+ * (bindings/a2a.md §4). So a 0.4.0 frame is shown to the ledger with those
+ * fields filled in from its A2A object (shared/a2a-frames.ts), its id,
+ * parties, `ts` and `in_reply_to` untouched. The frame was verified before
+ * this; the view is never sent anywhere or verified again.
+ *
+ *  - SendMessage, SendStreamingMessage: the offering the Message names (or
+ *    "", as SPEC.md §7.1 records a call naming none), and the Task id the
+ *    Message names, which binds `bound_by: "request"` as §7.1 says.
+ *  - CancelTask: a cancel request (§10.8) for the Task it names.
+ *  - Every other operation (the reads, the push notification configs, the
+ *    extended card) creates no Task and binds nothing: it is not shown, and
+ *    neither are its answers, which carry a Task without having created one.
+ *  - An answer: the Task id its Task, status update or artifact update
+ *    carries; the 0.4.0 accept signal reads as the 0.3.0 one.
+ *
+ * Returns null for a frame the ledger does not see. A 0.3.0 envelope is
+ * returned as it is.
+ */
+export function ledgerView(env: Envelope, nonTask: Set<string>): Envelope | null {
+  if (!isA2AFrame(env)) return env;
+  if (env.type === "request") {
+    const facts = a2aRequestFacts(env);
+    if (!facts) return env; // a channel frame (describe, knock, the probe) or a sealed payload
+    if (facts.method === "SendMessage" || facts.method === "SendStreamingMessage") {
+      return { ...env, payload: { offering: facts.offering ?? "" }, ...(facts.taskId ? { task_id: facts.taskId } : {}) } as Envelope;
+    }
+    remember(nonTask, env.id);
+    if (facts.method === "CancelTask" && facts.taskId) {
+      return { ...env, payload: { offering: CANCEL_OFFERING, input: { task_id: facts.taskId } } } as Envelope;
+    }
+    return null;
+  }
+  if (env.type === "respond") {
+    if (typeof env.in_reply_to === "string" && nonTask.has(env.in_reply_to)) return null;
+    if (isAccept(env)) return { ...env, payload: { status: "accepted" } } as Envelope;
+    const taskId = a2aAnswerTaskId(env);
+    return taskId ? ({ ...env, task_id: taskId } as Envelope) : env;
+  }
+  return env;
+}
+
+function remember(set: Set<string>, id: string): void {
+  set.add(id);
+  if (set.size > NON_TASK_REQUESTS_MAX) {
+    const oldest = set.values().next().value;
+    if (oldest !== undefined) set.delete(oldest);
+  }
+}
 
 /** The ways an origin can go missing, as counted and reported. */
 export type OriginMiss =
@@ -120,6 +179,8 @@ function orderKey(env: Envelope): string {
 export class OriginTap {
   private readonly chains = new Map<string, Promise<void>>();
   private readonly inFlight = new Set<Promise<void>>();
+  /** A2A requests that create no Task, by id (`ledgerView`). */
+  private readonly nonTask = new Set<string>();
 
   constructor(
     private readonly ledger: OriginLedger,
@@ -145,7 +206,9 @@ export class OriginTap {
     if (!agent) return;
     let env: Envelope;
     try {
-      env = decode(data);
+      const seen = ledgerView(decode(data), this.nonTask);
+      if (!seen) return;
+      env = seen;
     } catch {
       return; // unsigned, unverifiable or not an envelope: not observed
     }

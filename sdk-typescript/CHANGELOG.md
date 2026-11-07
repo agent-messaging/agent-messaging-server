@@ -1,5 +1,98 @@
 # Changelog
 
+## 0.67.0 (2026-11-07)
+
+**Security fix: upgrade every agent that serves calls.** On SDK 0.66.0 a
+0.4.0 call (A2A over Agent Messaging) that asked for work skipped the node's
+own admission gates. A SendMessage naming an offering reached the agent's
+0.3.0 `onRequest` handler (the legacy path), and any SendMessage reached an
+`a2a.serve` handler, without the trial gate, the EXT-8 allowance, the §19.5
+agreement and funds hold, the offering's `admit` hook, or the accept signal.
+So a caller could run paid work with no agreement and no hold, run trial
+work past its limits, spend past an exhausted allowance, and pass an
+application's own admission decision, by sending 0.4.0 instead of 0.3.0. The
+sender checks (signature, freshness, revoked or paused sender), EXT-6
+admission and the person surface did apply. Hosts whose own admission code
+read the trial mark, the budget or the person mark from their 0.3.0 places
+saw none of them on a 0.4.0 call.
+
+From 0.67.0:
+
+- A 0.4.0 SendMessage or SendStreamingMessage passes the same gates as a
+  0.3.0 request, in the same order, before anything runs, whether it reaches
+  an `onRequest` handler or `a2a.serve`: a malformed budget is refused, then
+  the trial gate, the allowance, the agreement and the funds hold, the admit
+  hook, then the accept signal (`{accepted: {}}`, live and not for an
+  attended inbox). The 0.4.0 facts are read from the A2A object: the
+  offering from the offering extension (or the agent's one offering), the
+  budget from the budget extension, trial work from the trial extension, the
+  person mark from `meta.audience` or the audience extension, the receipt
+  level from the receipts extension. A refusal is the call's first and only
+  answer, a 0.4.0 respond frame carrying the same error code a 0.3.0 request
+  gets. A funds hold is given back when the work fails, is refused or is
+  canceled, and left standing when it is delivered.
+- The legacy path fences inbound text as a 0.3.0 request's is, and refuses
+  to run a call that did not pass the gates.
+- **`ctx.call`** (`InboundCall`, `inboundCallOf(envelope)`): one view of the
+  call for the admit hook, the handler and a host's own admission code,
+  whatever wire it arrived on: wire, method, offering, input, Message,
+  budget, trial, audience, receipt level, Task and context. Read it instead
+  of the envelope's 0.3.0 fields.
+- **`A2AServeOptions.admit`**: the admission hook for `a2a.serve`, the
+  counterpart of `HandlerOptions.admit`. `A2AContext` gains `call` and
+  `trial`.
+- `a2a.serve` now sends the accept signal before its first answer, as the
+  binding says (§4, §11). Clients on this SDK already read past it.
+
+Also in this release: trial work, replies and receipt requests on the A2A
+binding (bindings/a2a.md 0.4.0-draft, §12.8 to §12.10), and envelope meta on
+an A2A call.
+
+From binding 0.4.2-draft:
+
+- **A default offering** (§12.1). An agent with several offerings may name
+  one as its default: `register({ default_offering })` (the manifest's
+  `default_offering`) or `a2a.serve(handler, { defaultOffering })`. A 0.4.0
+  Message naming no offering goes there, on the legacy path and through
+  `serve`; a named offering wins, and an undeclared one is still
+  `InvalidParamsError`. The card shows it in the offering extension's
+  `params` as `{"default": "<offering id>"}` (`cardExtensions(uris,
+  { defaultOffering })`, `cardDefaultOffering(card)`), and
+  `routeOffering(declared, metadata, { default })` routes by it.
+- **Whom a trial is for** (§12.8). `withTrial(message, requester)` puts
+  `{id, kind: "visitor"}` or `{id, kind: "account", signedIn, verified}` in
+  the trial extension. The trial gate honours it only from a trusted host
+  (`setTrials({ trustedHosts })`, as the 0.3.0 `trial_requester` vouch is)
+  and counts the trial against that requester; from anyone else it is
+  ignored and the sending agent is counted. A visitor is never signed in or
+  verified, and a malformed requester is no vouch (`isValidTrialRequester`,
+  `trialVouchOf`). `ctx.call.trialRequester` carries the claim on either
+  wire.
+- `trialReplyReceiptReading(message)` reads the trial, reply and receipt
+  extensions as `conformance/a2a-binding.json` pins them, and
+  `trialRefusalOf` reads a refusal only when its reason is one of Common
+  Agent §7.7's.
+
+- **Trial work** (`https://agentmessaging.ai/extensions/trial/v1`,
+  `EXT_TRIAL`): `withTrial(message)` marks the Message that starts trial
+  work, `isTrialMessage` and `isTrialTask` read it, `trialRefusedTask` ends a
+  refused trial in `TASK_STATE_REJECTED` with `{refusal: "TRIAL_REFUSED",
+  reason, limit}`, and `trialRefusalOf` reads it back.
+- **Replies** (`https://agentmessaging.ai/extensions/reply/v1`, `EXT_REPLY`):
+  `withReplyTo(message, answered)` makes a new call that answers a received
+  Message, in its context, naming its `messageId`; `replyToOf` reads it.
+- **Receipts on the binding** (EXT-15 §8.3, `EXT_RECEIPTS`):
+  `withReceiptRequest(message, level)` asks for a receipt on the starting
+  Message, `receiptRequestOf` reads the ask, `withReceipt(task, receipt)`
+  puts a signed receipt in the Task's metadata and `receiptOf` reads it.
+  `receiptLevelOf(payload)` now reads the 0.4.0 ask as well as
+  `payload.config.receipt`.
+- **`A2ACallOptions.meta`**: further envelope `meta` for the request frame,
+  such as a bridge's attribution marker. The keys the call sets itself
+  (`a2a`, `engagement`, `audience`) win.
+- Cards still list the seven extensions of 0.66.0 by default; pass the new
+  URIs to `cardExtensions` for an agent whose node honours them.
+
 ## 0.66.0 (2026-11-07)
 
 A2A over Agent Messaging: agents call each other with A2A 1.0's own

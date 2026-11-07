@@ -690,6 +690,30 @@ What the server keeps for it:
   same handle. Route the `/agents/` path from your edge to the mesh API if you
   want the cards served publicly.
 
+From server 0.5.1 an A2A Task gives you everything a 0.3.0 Task gives you,
+with the same names and shapes, so a consumer of them needs no change when
+agents move to 0.4.0:
+
+- **Events and receipts.** The task manager signs and publishes
+  `mesh.event.task.<state>` for each state an A2A Task takes, in the 0.3.0
+  spelling (`working`, `completed`, `failed`, `canceled`, `rejected`, and
+  `exhausted` for a Task the engagement's cap ended), the receipts
+  `mesh.event.metering.task_completed`, `task_canceled` and `task_trial`, the
+  terminal meter events, `task.stranded` and `task.canceled_by_settled`.
+  Cancel and failure reasons come from the Task's extensions, and the failure
+  attribution is computed by the task manager, never read from the agent.
+- **The record beside each Task**: the offering, whether it was trial work,
+  the budget, the reported spend, the origin (the request the server saw
+  create it), who canceled it, the reasons and the attribution.
+- **The admin API** lists A2A Tasks at `GET /admin/v1/a2a-tasks` (and one at
+  `GET /admin/v1/a2a-tasks/<id>`), each with `wire: "0.4.0"` and the record
+  beside the Task. `GET /admin/v1/tasks` still lists only 0.3.0 Tasks, as
+  before.
+- **Activity and metering** record a 0.4.0 call under the offering its
+  Message names, or the agent's one declared offering when it names none,
+  with the Task id it concerns. A trial call's meter events say
+  `trial: true`.
+
 ### Ending the 0.3.0 window
 
 Agents on older SDKs still make 0.3.0 calls (`request`, `onRequest`, task

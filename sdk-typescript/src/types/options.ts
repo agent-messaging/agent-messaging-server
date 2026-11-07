@@ -260,6 +260,9 @@ export interface RegisterOptions {
    *  the storefront so strangers see it without being admitted (§8.7). */
   default_input_modes?: string[];
   default_output_modes?: string[];
+  /** The offering a 0.4.0 Message naming none goes to, for an agent with
+   *  several (A2A binding §12.1). One of `offerings`. */
+  default_offering?: string;
   provider?: Provider;
   cost?: Cost;
   /** What this agent sells (§19.1). Validated at registration; the public

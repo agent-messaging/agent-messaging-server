@@ -23,6 +23,7 @@ import {
   EXT_BUDGET,
   EXT_OFFERING,
   activatedExtensions,
+  isAcceptSignal,
   artifactRefOf,
   artifactRefPart,
   budgetOf,
@@ -214,7 +215,8 @@ describe("SendStreamingMessage (§8)", () => {
     expect(s.lastSeq).toBe(4);
 
     const id = s.taskId!;
-    const first = bus.log.find((l) => l.env.type === "respond" && l.subject === Subjects.agentInbox(client.id))!;
+    // The accept signal (a channel frame, §4) precedes the first A2A answer.
+    const first = bus.log.find((l) => l.env.type === "respond" && l.subject === Subjects.agentInbox(client.id) && !isAcceptSignal(l.env))!;
     expect((first.env.payload as { a2a: { seq: number } }).a2a.seq).toBe(0);
     const later = bus.log.filter((l) => l.subject === Subjects.taskStream(id)).map((l) => l.env.payload as { a2a: { seq: number; final?: boolean } });
     expect(later.map((p) => p.a2a.seq)).toEqual([1, 2, 3, 4]);
@@ -227,7 +229,7 @@ describe("SendStreamingMessage (§8)", () => {
     const events = await collect(client.a2a.sendStreamingMessage(server.id, userMsg("q")));
     expect(events).toHaveLength(1);
     expect(events[0].message?.parts[0].text).toBe("quick");
-    const resp = bus.log.find((l) => l.env.type === "respond")!;
+    const resp = bus.log.find((l) => l.env.type === "respond" && !isAcceptSignal(l.env))!;
     expect((resp.env.payload as { a2a: { final?: boolean; seq?: number } }).a2a).toMatchObject({ final: true, seq: 0 });
   });
 

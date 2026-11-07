@@ -1,6 +1,7 @@
 import type { Envelope, TraceContext, Budget } from "../types/envelope.js";
 import type { AllowanceUsage } from "../allowance.js";
 import type { TrialContext } from "../trial.js";
+import type { InboundCall } from "../inbound-call.js";
 
 export interface RequestContext {
   /** The full inbound envelope — use `envelope.payload` for offering/config. */
@@ -39,6 +40,11 @@ export interface RequestContext {
    *  measure (pages, seconds, items). The work keeps inside them; the
    *  requester owes nothing, and the spend is the publisher's. */
   trial?: TrialContext;
+  /** The call as the node's gates read it, whatever wire it arrived on
+   *  (inbound-call.ts): offering, input, budget, trial, audience, receipt
+   *  level, Task and context. Read this rather than the envelope's 0.3.0
+   *  fields, which a 0.4.0 frame does not carry. */
+  call?: InboundCall;
 }
 
 /**

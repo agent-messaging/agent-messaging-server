@@ -125,14 +125,17 @@ export async function passThroughBinding(
   write: (res: ServerResponse, status: number, body: unknown) => void,
   /** The offerings the agent declares, for the older offering keys (§4.5). */
   declared: readonly string[] = [],
-  /** The caller, and the Tasks the bridge holds (§4.3). */
-  ctx: { callerKey: string; held?: HeldTasks } = { callerKey: "" },
+  /** The caller, the Tasks the bridge holds (§4.3), and the attribution
+   *  marker every request the bridge sends for a caller carries
+   *  (`meta.a2a_bridge`, BRIDGE-A2A.md §8.3). */
+  ctx: { callerKey: string; held?: HeldTasks; meta?: Record<string, unknown> } = { callerKey: "" },
 ): Promise<"ok" | "error"> {
   const held = ctx.held ?? heldTasks;
   const sending = method === "SendMessage" || method === "SendStreamingMessage";
   const opts = {
     serviceParams,
     timeoutMs: 60_000,
+    ...(ctx.meta ? { meta: ctx.meta } : {}),
     ...(sending ? { onLateAnswer: (answer: Parameters<HeldTasks["settle"]>[1], requestId: string) => held.settle(requestId, answer) } : {}),
   };
   if (sending) {

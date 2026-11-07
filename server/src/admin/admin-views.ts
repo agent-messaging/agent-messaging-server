@@ -13,6 +13,9 @@
  *   GET    /admin/v1/tasks[?updated_after=]         every stored task record, with when it was written
  *   GET    /admin/v1/tasks/:id                      one task record, with the origin ledger projected onto it:
  *                                                   the platform's privileged read (see `task` below)
+ *   GET    /admin/v1/a2a-tasks[?updated_after=]     every stored A2A Task (wire 0.4.0), with `wire: "0.4.0"`: the
+ *                                                   Task under `record.task`, the platform's fields beside it
+ *   GET    /admin/v1/a2a-tasks/:id                  one A2A Task record, the origin ledger projected onto it
  *   GET    /admin/v1/mailboxes                      every mailbox: agent, messages, first_seq, last_seq
  *   GET    /admin/v1/mailboxes/:agent               { pending, last_arrival }
  *   GET    /admin/v1/mailboxes/:agent/senders?from=&to=   each envelope's from and ts in that range, never a payload (500 at most)
@@ -29,6 +32,7 @@ import type { KeyedStore, Storage, StreamFamily } from "../storage/index.js";
 import { roomAccountOf, type AgentOwnerRecord } from "../keychain/agent-owners.js";
 import { viewItem, type BoardItem } from "../rooms/board-store.js";
 import { OriginLedger } from "../task-manager/origin.js";
+import { taskRecords } from "../task-manager/task-records.js";
 
 const NKEY = /^U[A-Z2-7]{55}$/;
 const ROOM_ID = /^[A-Za-z0-9_-]{1,128}$/;
@@ -118,20 +122,57 @@ export function adminViews(deps: AdminViewDeps) {
     return ok({ items: out });
   }
 
-  async function tasks(q: URLSearchParams): Promise<DoorAnswer> {
+  /** The records of one Task store written after `updated_after`, each
+   *  with `extra` beside it. */
+  async function taskList(store: "mesh_tasks" | "mesh_a2a_tasks", q: URLSearchParams, extra: Json = {}): Promise<DoorAnswer> {
     const after = q.get("updated_after");
     const since = after ? Date.parse(after) : null;
     if (after && !Number.isFinite(since)) return no(400, "updated_after is an ISO time.");
     const out: Json[] = [];
     let total = 0;
-    for (const [id, entry] of await entries("mesh_tasks")) {
+    for (const [id, entry] of await entries(store)) {
       if (entry.operation !== "PUT" || !entry.value.length) continue;
       total++;
       const written = entry.created instanceof Date && !Number.isNaN(entry.created.getTime()) ? entry.created : null;
       if (since !== null && written && written.getTime() <= since) continue;
-      try { out.push({ task_id: id, written_at: written ? written.toISOString() : null, record: entry.json<Json>() }); } catch { /* not a record */ }
+      try { out.push({ task_id: id, ...extra, written_at: written ? written.toISOString() : null, record: entry.json<Json>() }); } catch { /* not a record */ }
     }
     return ok({ tasks: out, total });
+  }
+
+  const tasks = (q: URLSearchParams) => taskList("mesh_tasks", q);
+
+  /**
+   * The A2A Tasks (wire 0.4.0, task-manager/a2a-store.ts), each with
+   * `wire: "0.4.0"`. A record is the A2A Task, unchanged, under `task`, and
+   * beside it what the platform keeps (SPEC.md §7.1): `requester`,
+   * `responder`, `offering`, `engagement`, `origin`, `canceled_by`, the
+   * cancel or failure reason and attribution, `trial`, `budget`,
+   * `reported_spend`, `created_at`, `updated_at`, `seq` and `frames`.
+   * A sibling of /tasks, so a reader of the 0.3.0 rows sees them as before.
+   */
+  const a2aTasks = (q: URLSearchParams) => taskList("mesh_a2a_tasks", q, { wire: "0.4.0" });
+
+  /** One A2A Task's record, with the origin ledger projected onto it: the
+   *  privileged read of `task` below, for the A2A store. */
+  async function a2aTask(id: string): Promise<DoorAnswer> {
+    const store = await keyed("mesh_a2a_tasks");
+    const entry = await store.get(id);
+    if (!entry || entry.operation !== "PUT" || !entry.value.length) return no(404, "No A2A task record is stored under that id.");
+    const written = entry.created instanceof Date && !Number.isNaN(entry.created.getTime()) ? entry.created.toISOString() : null;
+    let record: Json;
+    try {
+      record = entry.json<Json>();
+    } catch {
+      return no(404, "The stored task record is not readable.");
+    }
+    try {
+      const ledger = new OriginLedger(await keyed("mesh_task_origins"), taskRecords(await keyed("mesh_tasks"), store));
+      record = await ledger.view(record, id);
+    } catch {
+      /* the ledger could not be opened: the record as stored */
+    }
+    return ok({ task_id: id, wire: "0.4.0", written_at: written, record });
   }
 
   /**
@@ -247,6 +288,8 @@ export function adminViews(deps: AdminViewDeps) {
       if (seg[0] === "boards" && seg.length === 1 && m === "GET") return await boards(req.query);
       if (seg[0] === "tasks" && seg.length === 1 && m === "GET") return await tasks(req.query);
       if (seg[0] === "tasks" && seg.length === 2 && m === "GET") return TASK_ID.test(seg[1]!) ? await task(seg[1]!) : no(400, "That is not a task id.");
+      if (seg[0] === "a2a-tasks" && seg.length === 1 && m === "GET") return await a2aTasks(req.query);
+      if (seg[0] === "a2a-tasks" && seg.length === 2 && m === "GET") return TASK_ID.test(seg[1]!) ? await a2aTask(seg[1]!) : no(400, "That is not a task id.");
       if (seg[0] === "mailboxes" && seg.length === 1 && m === "GET") return await mailboxList();
       if (seg[0] === "mailboxes" && seg.length >= 2) {
         if (!NKEY.test(seg[1]!)) return no(400, "That is not an agent public key (U followed by 55 characters).");

@@ -7,6 +7,7 @@ import { A2A_PROTOCOL_VERSION } from "./jsonrpc.js";
 import { overA2ACardExtension } from "./over-a2a.js";
 import { A2A_BINDING_URI } from "../../../sdk-typescript/src/a2a/binding.js";
 import { cardExtensions } from "../../../sdk-typescript/src/a2a/extensions.js";
+import { defaultOfferingOf } from "../../../sdk-typescript/src/a2a/card.js";
 
 /**
  * The A2A binding's interface for an agent (bindings/a2a.md §3): the mesh
@@ -305,7 +306,7 @@ export function manifestToCard(
         ...(declaresExtension(manifest, AUDIENCE_URI) ? [{ uri: AUDIENCE_URI, description: AUDIENCE_DESCRIPTION, required: false }] : []),
         // The binding's extensions (§12), each `required: false`, for an
         // agent that serves it: the SDK's A2A side supports all of them.
-        ...(binding ? cardExtensions() : []),
+        ...(binding ? cardExtensions(undefined, { defaultOffering: defaultOfferingOf(manifest) }) : []),
       ],
     },
     defaultInputModes: defaulted(manifest.default_input_modes),

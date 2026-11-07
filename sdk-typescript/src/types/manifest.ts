@@ -807,6 +807,11 @@ export interface Manifest {
    *  behalf. Maps directly to A2A's `defaultInputModes` / `defaultOutputModes`. */
   default_input_modes?: string[];
   default_output_modes?: string[];
+  /** For an agent with several offerings: the one a 0.4.0 Message naming
+   *  none goes to (A2A binding §12.1), shown on the agent's card in the
+   *  offering extension's `params` as `{"default": "<offering id>"}`. It
+   *  must be one of `offerings`; a named offering always wins. */
+  default_offering?: string;
   accepts?: string[];
   emits?: string[];
   /** External services this agent integrates with (§8.8). Pre-admission data:

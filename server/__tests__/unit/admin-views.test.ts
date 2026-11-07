@@ -42,6 +42,14 @@ function world() {
       ["t-new", entry("t-new", { id: "t-new", state: "working" }, new Date("2026-10-12T11:00:00.000Z"))],
       ["t-bad", entry("t-bad", "{not json", new Date("2026-10-12T11:00:00.000Z"))],
     ]),
+    mesh_a2a_tasks: new Map([
+      ["a-1", entry("a-1", {
+        task: { id: "a-1", contextId: "c", status: { state: "TASK_STATE_COMPLETED" } },
+        requester: "UREQ", responder: "URESP", offering: "quote", engagement: "eng-1", seq: 2,
+        origin: { request_id: "r1", requester: "UREQ", responder: "URESP", offering: "quote", observed_at: "2026-10-12T10:59:00.000Z", bound_by: "answer" },
+        created_at: "2026-10-12T11:00:00.000Z", updated_at: "2026-10-12T11:05:00.000Z",
+      }, new Date("2026-10-12T11:05:00.000Z"))],
+    ]),
   };
   const destroyed: string[] = [];
   const mailbox = new Map<number, string>([
@@ -121,6 +129,24 @@ describe("the core's operator views", () => {
     expect((await ask("GET", "/admin/v1/tasks/t-old"))!.body).toMatchObject({ task_id: "t-old", record: { state: "completed" } });
     expect((await ask("GET", "/admin/v1/tasks/nobody"))!.status).toBe(404);
     expect((await ask("GET", "/admin/v1/tasks?updated_after=yesterday"))!.status).toBe(400);
+  });
+
+  it("lists A2A Tasks beside the 0.3.0 rows, each with its wire and the record beside the Task, and answers one", async () => {
+    const { ask } = world();
+    // The 0.3.0 rows are unchanged: no A2A Task among them, no wire field.
+    const old = (await ask("GET", "/admin/v1/tasks"))!.body as { tasks: Array<Record<string, unknown>> };
+    expect(old.tasks.map((t) => t.task_id).sort()).toEqual(["t-new", "t-old"]);
+    expect(old.tasks.every((t) => !("wire" in t))).toBe(true);
+    const list = (await ask("GET", "/admin/v1/a2a-tasks"))!.body as { tasks: Array<Record<string, unknown>>; total: number };
+    expect(list.total).toBe(1);
+    expect(list.tasks[0]).toMatchObject({
+      task_id: "a-1", wire: "0.4.0", written_at: "2026-10-12T11:05:00.000Z",
+      record: { task: { id: "a-1", status: { state: "TASK_STATE_COMPLETED" } }, requester: "UREQ", responder: "URESP", offering: "quote", engagement: "eng-1", origin: { request_id: "r1" }, created_at: "2026-10-12T11:00:00.000Z", updated_at: "2026-10-12T11:05:00.000Z" },
+    });
+    expect(((await ask("GET", "/admin/v1/a2a-tasks?updated_after=2026-10-12T12:00:00.000Z"))!.body as { tasks: unknown[] }).tasks).toEqual([]);
+    expect((await ask("GET", "/admin/v1/a2a-tasks/a-1"))!.body).toMatchObject({ task_id: "a-1", wire: "0.4.0", record: { offering: "quote", origin: { request_id: "r1" } } });
+    expect((await ask("GET", "/admin/v1/a2a-tasks/nobody"))!.status).toBe(404);
+    expect((await ask("GET", "/admin/v1/a2a-tasks/not a task"))!.status).toBe(400);
   });
 
   it("answers mailboxes: the list, one, its senders without payloads, arrivals and discard", async () => {

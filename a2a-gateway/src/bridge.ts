@@ -393,6 +393,32 @@ export class Bridge {
     return url ?? undefined;
   }
 
+  /**
+   * Whether the agent serves the A2A binding: its manifest, as the registry
+   * holds it, lists the binding URI in `capabilities` (bindings/a2a.md §3).
+   * Read whatever the agent's exposure, because this decides only which wire
+   * a call the gateway was already asked to make travels on (the relay doors,
+   * inbound/relay.ts). Cached a minute, as manifests are; false when the
+   * manifest cannot be read, which keeps the 0.3.0 wire.
+   */
+  async servesA2ABinding(agentId: string): Promise<boolean> {
+    const cached = this.bindingServed.get(agentId);
+    if (cached && Date.now() - cached.at < MANIFEST_CACHE_MS) return cached.serves;
+    if (!this.courier) return false;
+    let serves = false;
+    try {
+      const m = await this.courier.getManifest(agentId);
+      serves = Array.isArray(m?.capabilities) && m.capabilities.includes(A2A_BINDING_URI);
+    } catch {
+      return false;
+    }
+    if (this.bindingServed.size > 10_000) this.bindingServed.clear();
+    this.bindingServed.set(agentId, { serves, at: Date.now() });
+    return serves;
+  }
+
+  private bindingServed = new Map<string, { serves: boolean; at: number }>();
+
   async exposableManifest(agentId: string): Promise<Manifest | null> {
     const cached = this.manifestCache.get(agentId);
     if (cached && Date.now() - cached.at < MANIFEST_CACHE_MS) return cached.manifest;

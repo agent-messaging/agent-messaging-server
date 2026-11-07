@@ -45,6 +45,7 @@ import {
   observedResponse,
   observedResponseBytes,
   publishMeterEvents,
+  type MeterEventBatch,
 } from "../shared/metering.js";
 import { MeteringFold } from "./metering-fold.js";
 import { tapOutcome, unansweredReason } from "./monitor-classify.js";
@@ -52,6 +53,9 @@ import { WitnessFold } from "./witness-fold.js";
 import { ExchangeIndex, type ExchangeRecord } from "./exchange-index.js";
 import { dataDbPath } from "../data-dir.js";
 import { coreUrl } from "../shared/settings.js";
+import { a2aRequestFacts, activityView, OfferingDirectory } from "../shared/a2a-frames.js";
+import { isA2AFrame } from "../../../sdk-typescript/src/a2a/binding.js";
+import { replyToOf } from "../../../sdk-typescript/src/a2a/extensions.js";
 
 /**
  * An env-configured bound, ignoring a value that is not a non-negative number.
@@ -255,6 +259,10 @@ export interface ActivityEntry {
    *  absent on every unbridged row, so those serialize byte-identically to
    *  rows written before this field existed. */
   a2aBridge?: ActivityBridgeMarker;
+  /** Common Agent §7.7: the call asked for trial work (a 0.4.0 frame with the
+   *  trial extension, bindings/a2a.md §12.8). Its meter events say
+   *  `trial: true`, which rating reads as never charged to the requester. */
+  trial?: true;
   /** Set when the unanswered sweep wrote this exchange to the audit log as
    *  `unanswered`, so a restart cannot write it twice. A response arriving
    *  AFTER this records a second, `completed` exchange on the chains — both
@@ -578,16 +586,54 @@ export class ActivityService {
     (async () => {
       for await (const msg of sub) {
         try {
-          const env = decode(msg.data);
-          const bytes = msg.data.length;
-          if (env.type === "request") {
-            this.recordRequestOrAnswer(env, bytes);
-          } else if (env.type === "respond") {
-            this.recordResponse(env, bytes);
-          }
+          await this.tapOne(decode(msg.data), msg.data.length);
         } catch { /* non-fatal — skip unparseable */ }
       }
     })();
+  }
+
+  /** One verified envelope off the tap. A 0.4.0 frame carries the offering
+   *  and the Task id inside its A2A object; it is recorded through a view in
+   *  the fields the recorders read (shared/a2a-frames.ts). Awaited in the
+   *  tap's order, so a request is on the ring before its answer is looked
+   *  for. */
+  private async tapOne(raw: Envelope, bytes: number): Promise<void> {
+    const { env, trial } = isA2AFrame(raw) ? await this.a2aView(raw) : { env: raw, trial: false };
+    if (env.type === "request") {
+      this.recordRequestOrAnswer(env, bytes, trial);
+    } else if (env.type === "respond") {
+      this.recordResponse(env, bytes);
+    }
+  }
+
+  /** The agents' declared offerings, for a 0.4.0 call naming none: the
+   *  agent's one offering is the one it serves (bindings/a2a.md §12.1).
+   *  Billing prices by offering, so the row carries that one, not "unknown". */
+  private offerings = new OfferingDirectory(() => storageOf(this.js).keyed("mesh_registry"));
+  /** `<requester>\n<messageId>` → the request envelope id, for 0.4.0 calls, so
+   *  a reply naming the Message it answers (§12.9) is metered as that
+   *  exchange's answer. Bounded, first-seen evicted. */
+  private messageIds = new Map<string, string>();
+
+  /** A 0.4.0 frame as the recorders read it, and whether it asks for trial
+   *  work (§12.8). */
+  private async a2aView(env: Envelope): Promise<{ env: Envelope; trial: boolean }> {
+    if (env.type !== "request") return { env: activityView(env), trial: false };
+    const facts = a2aRequestFacts(env);
+    if (!facts) return { env, trial: false };
+    const sending = facts.method === "SendMessage" || facts.method === "SendStreamingMessage";
+    const offering = facts.offering ?? (sending && env.to ? await this.offerings.single(env.to) : undefined);
+    const mid = facts.message?.messageId;
+    const answers = replyToOf(facts.message);
+    const inReplyTo = answers && env.to ? this.messageIds.get(`${env.to}\n${answers}`) : undefined;
+    if (sending && typeof mid === "string" && mid && !inReplyTo) {
+      this.messageIds.set(`${env.from}\n${mid}`, env.id);
+      if (this.messageIds.size > ActivityService.MAX_SEEN_RESPONDS) {
+        const oldest = this.messageIds.keys().next().value;
+        if (oldest !== undefined) this.messageIds.delete(oldest);
+      }
+    }
+    return { env: activityView(env, { ...(offering ? { offering } : {}), ...(inReplyTo ? { inReplyTo } : {}) }), trial: facts.trial };
   }
 
   async stop(): Promise<void> {
@@ -621,7 +667,7 @@ export class ActivityService {
 
   // ── Recording ─────────────────────────────────────────────────
 
-  private recordRequest(env: Envelope, bytes = 0): void {
+  private recordRequest(env: Envelope, bytes = 0, trial = false): void {
     const payload = env.payload as { offering?: string; skill?: string; input?: unknown } | undefined;
     // §8.5 deprecation window: pre-rename senders say `skill`.
     const offering = payload?.offering ?? payload?.skill ?? "unknown";
@@ -652,7 +698,7 @@ export class ActivityService {
       publishMeterEvents(
         this.nc,
         this.kp,
-        observedRequest(env.to, env.from, env.id, bytes, offering, env.task_id),
+        withTrial(observedRequest(env.to, env.from, env.id, bytes, offering, env.task_id), trial),
       );
     } else {
       if (env.to) this.usage.recordIn(env.to, bytes);
@@ -674,6 +720,7 @@ export class ActivityService {
       inputPreview: inputStr,
       inputSha256: inputJson !== undefined ? sha256hex(inputJson) : undefined,
       ...(bridged ? { a2aBridge: bridged } : {}),
+      ...(trial ? { trial: true as const } : {}),
       status: "completed", // optimistic — updated if we see a failure response
     };
 
@@ -686,6 +733,7 @@ export class ActivityService {
       to: entry.to,
       offering,
       ...(env.task_id ? { taskId: env.task_id } : {}),
+      ...(trial ? { trial: true as const } : {}),
       recordedAt: entry.recordedAt!,
     });
 
@@ -734,23 +782,23 @@ export class ActivityService {
    * `in_reply_to` — a third party's request, the asked agent writing to
    * somebody else, an unknown id — is an ordinary request.
    */
-  private recordRequestOrAnswer(env: Envelope, bytes = 0): void {
+  private recordRequestOrAnswer(env: Envelope, bytes = 0, trial = false): void {
     const replyTo = typeof env.in_reply_to === "string" && env.in_reply_to !== "" ? env.in_reply_to : undefined;
     if (replyTo === undefined || !forTheAgent(env)) {
-      this.recordRequest(env, bytes);
+      this.recordRequest(env, bytes, trial);
       return;
     }
     const entry = this.entries.find((e) => e.requestId === replyTo);
     if (entry) {
       if (answersAsRequest(env, entry)) this.recordResponse(env, bytes, entry);
-      else this.recordRequest(env, bytes);
+      else this.recordRequest(env, bytes, trial);
       return;
     }
     if (!this.index) {
-      this.recordRequest(env, bytes);
+      this.recordRequest(env, bytes, trial);
       return;
     }
-    this.recordAnswerFromIndex(env, bytes, replyTo);
+    this.recordAnswerFromIndex(env, bytes, replyTo, trial);
   }
 
   /**
@@ -760,7 +808,7 @@ export class ActivityService {
    * sender or addressee who is not the exchange's other party — the envelope
    * is recorded as the ordinary request it is.
    */
-  private recordAnswerFromIndex(env: Envelope, bytes: number, replyTo: string): void {
+  private recordAnswerFromIndex(env: Envelope, bytes: number, replyTo: string, trial = false): void {
     const index = this.index!;
     let ordinary = false;
     index
@@ -772,12 +820,12 @@ export class ActivityService {
         return this.meterFromRecord(env, bytes, rec);
       })
       .then(
-        () => { if (ordinary) this.recordRequest(env, bytes); },
+        () => { if (ordinary) this.recordRequest(env, bytes, trial); },
         (err) => {
           // The index could not say. Recording it as a request keeps the
           // traffic counted, as the tap did before inbox answers were known.
           console.error("[activity] looking up an inbox answer's exchange failed:", err instanceof Error ? err.message : err);
-          this.recordRequest(env, bytes);
+          this.recordRequest(env, bytes, trial);
         },
       );
   }
@@ -859,6 +907,7 @@ export class ActivityService {
       first,
       failed: entry.status === "failed",
       receiptTaken: hadReceipt,
+      trial: entry.trial === true,
     });
     const tookReceipt = !hadReceipt && receiptEntries !== undefined;
     if (tookReceipt) entry.receiptAt = new Date().toISOString();
@@ -962,6 +1011,8 @@ export class ActivityService {
       failed: boolean;
       /** The exchange already had a receipt honoured: this one is dropped. */
       receiptTaken: boolean;
+      /** The exchange is trial work: its events say so (§7.7). */
+      trial?: boolean;
     },
   ): Array<{ meter: string; quantity: number }> | undefined {
     const metered = this.meteringOn && x.to !== "" && x.from !== "";
@@ -1011,12 +1062,12 @@ export class ActivityService {
         );
       } else if (batch.events.length > 0) {
         receiptEntries = batch.events.map((e) => ({ meter: e.meter, quantity: e.quantity }));
-        if (this.meteringOn) publishMeterEvents(this.nc, this.kp, batch);
+        if (this.meteringOn) publishMeterEvents(this.nc, this.kp, withTrial(batch, x.trial));
       }
     }
     if (x.to && !x.first) {
       if (metered) {
-        publishMeterEvents(this.nc, this.kp, observedResponseBytes(x.to, x.from, env.id, bytes, x.requestId));
+        publishMeterEvents(this.nc, this.kp, withTrial(observedResponseBytes(x.to, x.from, env.id, bytes, x.requestId), x.trial));
       } else {
         this.usage.recordOutBytes(x.to, bytes);
       }
@@ -1026,7 +1077,7 @@ export class ActivityService {
         publishMeterEvents(
           this.nc,
           this.kp,
-          observedResponse(x.to, x.from, env.id, bytes, x.failed, x.offering, env.task_id, x.requestId),
+          withTrial(observedResponse(x.to, x.from, env.id, bytes, x.failed, x.offering, env.task_id, x.requestId), x.trial),
         );
         // §13.5 refusal events: an admission refusal is declined demand, and
         // both parties reasonably want it recorded. Derives from the REFUSING
@@ -1116,6 +1167,7 @@ export class ActivityService {
       first,
       failed: !!env.error,
       receiptTaken: hadReceipt,
+      trial: rec.trial === true,
     });
     const now = new Date().toISOString();
     const tookReceipt = !hadReceipt && receipt !== undefined;
@@ -1733,6 +1785,12 @@ function replyReceiptParties(
   return { provider: x.to, consumer: x.from, raw };
 }
 
+/** A batch of meter events marked as trial work (Common Agent §7.7), or the
+ *  batch as it is. */
+function withTrial(batch: MeterEventBatch, trial: boolean | undefined): MeterEventBatch {
+  return trial ? { ...batch, events: batch.events.map((e) => ({ ...e, trial: true })) } : batch;
+}
+
 /** A ring row's content-free twin in the exchange index; null for a row that
  *  predates `requestId` (nothing to key it by). */
 function recordOf(e: ActivityEntry): ExchangeRecord | null {
@@ -1747,6 +1805,7 @@ function recordOf(e: ActivityEntry): ExchangeRecord | null {
     // row cannot say which. The task alias is written once, at request time,
     // where the envelope can (recordRequest).
     recordedAt: agedAt(e) ?? new Date().toISOString(),
+    ...(e.trial ? { trial: true as const } : {}),
     ...(e.respondedAt ? { respondedAt: e.respondedAt } : {}),
     ...(e.receiptAt ? { receiptAt: e.receiptAt } : {}),
   };

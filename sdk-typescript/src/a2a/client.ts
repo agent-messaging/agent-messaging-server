@@ -89,6 +89,10 @@ export interface A2ACallOptions {
   /** The engagement this call runs under, recorded beside the Task by the
    *  server (§11). Carried as the envelope's `meta.engagement`. */
   engagement?: string;
+  /** Further envelope `meta` for the request frame, such as a bridge's
+   *  attribution marker (`a2a_bridge`). The keys this call sets itself
+   *  (`a2a`, `engagement`, `audience`) win over the same keys here. */
+  meta?: Record<string, unknown>;
   /** Seal the payload to the server agent's published encryption key (§8a,
    *  EXT-7); its answers come back sealed to this agent's key. */
   seal?: boolean;
@@ -127,7 +131,7 @@ export class A2AClient {
   private frameFor(agentId: string, method: A2AMethod, params: unknown, opts: A2ACallOptions): Envelope {
     const params2: Record<string, string> = { "A2A-Version": A2A_PROTOCOL_VERSION, ...(opts.serviceParams ?? {}) };
     if (opts.extensions?.length) params2["A2A-Extensions"] = opts.extensions.join(",");
-    const meta: Record<string, unknown> = { a2a: serviceParams(params2) };
+    const meta: Record<string, unknown> = { ...(opts.meta ?? {}), a2a: serviceParams(params2) };
     if (opts.engagement !== undefined) meta.engagement = opts.engagement;
     // §12.3: a Message meant for the person carries meta.audience too, which
     // is what nodes on the mesh read; the two marks agree.

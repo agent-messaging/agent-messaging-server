@@ -108,10 +108,12 @@ import type {
 } from "./types/options.js";
 import { PROTOCOL_VERSION } from "./types/envelope.js";
 import { A2ANamespace } from "./a2a/index.js";
-import { A2AServerAgent, A2A_STORE_SUBJECTS, legacyInputOf, messageOfLegacyInput, outputOfParts, partsOfOutput } from "./a2a/server.js";
+import { A2AServerAgent, A2A_STORE_SUBJECTS, legacyInputOf, messageOfLegacyInput, outputOfParts, partsOfOutput, type A2AAdmission } from "./a2a/server.js";
 import { A2A_BINDING_URI, A2A_STATE_META, A2A_WIRE_VERSION, forbiddenFieldsRefusal, isA2AFrame, isAcceptSignal, isTerminalState } from "./a2a/binding.js";
-import { A2AError } from "./a2a/errors.js";
+import { A2AError, A2AErrors } from "./a2a/errors.js";
 import { isForPerson } from "./a2a/extensions.js";
+import { routeOffering } from "./a2a/readings.js";
+import { inboundCallOf, type InboundCall } from "./inbound-call.js";
 import type { Message as A2AMessage } from "./a2a/types.js";
 import { MeshError, RejectedError, ErrorCode } from "./types/errors.js";
 import { ConnectionManager } from "./internal/connection.js";
@@ -1516,6 +1518,7 @@ export class AgentMesh {
         : undefined,
       default_input_modes: opts.default_input_modes,
       default_output_modes: opts.default_output_modes,
+      ...(opts.default_offering ? { default_offering: opts.default_offering } : {}),
       // §8.8: what this agent integrates with. Carried only when it says
       // something — an empty array would read as "declared none", which is not
       // the same as "did not say".
@@ -3753,26 +3756,30 @@ export class AgentMesh {
       streamSubject: (taskId) => Subjects.taskStream(taskId),
       serviceRequest: (subject, payload, timeoutMs) => this.serviceRequest(subject, payload, timeoutMs, { v: A2A_WIRE_VERSION }),
       offerings: () => (this.manifest?.offerings ?? []).map((o) => o.id),
+      defaultOffering: () => this.manifest?.default_offering,
     });
     // §14: a 0.4.0 SendMessage to an agent with only 0.3.0 handlers reaches
     // the handler for the offering it names, and comes back as a Message.
-    server.legacy = async (offering, message, env) => {
+    //
+    // It runs only after the gates a 0.3.0 request passes (handleA2AFrame,
+    // admitA2AWork): sender checks, admission, the person surface, the trial
+    // gate, the allowance, the agreement and funds hold, the offering's admit
+    // hook and the accept signal. `admitted` is what they admitted it as; a
+    // call that reached here without it is refused, never run ungated.
+    server.legacy = async (offering, message, env, admitted) => {
       const handler = this.router.resolve(offering ?? "");
       if (!handler || handler === this.a2aLegacyDefault) {
         throw new A2AError("InvalidParamsError", `No handler for the offering ${JSON.stringify(offering ?? "")}.`, {
           offerings: this.router.offerings,
         });
       }
-      const taskId = uuid7();
+      if (!admitted) throw A2AErrors.internal("This message did not pass the node's admission, so it was not run.");
+      // Untrusted text, framed and fenced as a 0.3.0 request's is (2.2, 2.3).
+      const raw = legacyInputOf(message);
+      const input = this.fenceInbound ? fenceInboundInput(raw, { from: env.from, trace: env.trace }) : raw;
       let out: unknown;
       try {
-        out = await handler(legacyInputOf(message), {
-          envelope: env,
-          taskId,
-          traceContext: env.trace,
-          reportUsage: () => undefined,
-          reportMeter: () => undefined,
-        });
+        out = await handler(input, admitted.request);
       } catch (err) {
         if (err instanceof MeshError && (err.code === ErrorCode.INPUT_INVALID || err.code === ErrorCode.OFFERING_NOT_FOUND)) {
           throw new A2AError("InvalidParamsError", err.message, { agentmesh_code: err.code });
@@ -3847,7 +3854,7 @@ export class AgentMesh {
   /** One 0.4.0 request frame (bindings/a2a.md): refused when it carries the
    *  old envelope fields (§4), measured against the inbound cap, put through
    *  admission (§10), then answered by the A2A side. */
-  private async handleA2AFrame(msg: Msg, env: Envelope, guarded: boolean, forPerson: boolean): Promise<void> {
+  private async handleA2AFrame(msg: Msg, env: Envelope, guarded: boolean, forPerson: boolean, buffered = false): Promise<void> {
     const refusal = forbiddenFieldsRefusal(env);
     if (refusal) {
       const errEnv = this.newEnvelope({
@@ -3889,9 +3896,17 @@ export class AgentMesh {
     const a2a = (env.payload as { a2a?: { method?: unknown; params?: unknown } } | undefined)?.a2a;
     if (this.overInboundCap(a2a?.params, env, msg, guarded)) return;
     const params = (a2a?.params ?? {}) as { message?: A2AMessage };
-    const offeringExt = params.message?.metadata?.["https://agentmessaging.ai/extensions/offering/v1"] as { offering?: unknown } | undefined;
+    // The call as the gates read it, whatever wire it came on (inbound-call.ts).
+    const call = inboundCallOf(env);
+    const server = this.a2aServer();
+    const asksForWork = a2a?.method === "SendMessage" || a2a?.method === "SendStreamingMessage";
+    // §12.1: the offering the Message names, or the agent's one offering.
+    const declared = server.options.offerings ?? (this.manifest?.offerings ?? []).map((o) => o.id);
+    const defaultOffering = server.options.defaultOffering ?? this.manifest?.default_offering;
+    const routed = asksForWork && declared.length ? routeOffering(declared, call.message?.metadata, { default: defaultOffering }) : null;
+    const offering = routed && "offering" in routed ? routed.offering : call.offering;
     const asRequest: RequestPayload = {
-      offering: typeof offeringExt?.offering === "string" ? offeringExt.offering : typeof a2a?.method === "string" ? a2a.method : "",
+      offering: offering || (typeof a2a?.method === "string" ? a2a.method : ""),
       input: params,
     };
     // A sender this agent has not admitted is refused before any operation
@@ -3906,8 +3921,149 @@ export class AgentMesh {
       return;
     }
     const frame = env;
-    await this.a2aServer().dispatch(frame, (resp) => this.sendRespond(msg, frame, encode(resp), { transportReply: guarded, tap: true }), { ...(sealTo ? { sealTo } : {}) });
+    // A message asking for work passes the gates a 0.3.0 request passes, in
+    // the same order, before anything runs: the trial gate, the allowance,
+    // the agreement and funds hold, the admit hook, then the accept signal
+    // (admitA2AWork). A message the agent cannot route (an offering it does
+    // not declare, or nothing to run it) is refused by the dispatch below
+    // without running anything, as a 0.3.0 request is.
+    let admitted: A2AAdmission | undefined;
+    if (asksForWork && !(routed && "error" in routed)) {
+      const legacyHandler = this.router.resolve(offering);
+      const runnable = server.serving || (!!legacyHandler && legacyHandler !== this.a2aLegacyDefault);
+      if (runnable) {
+        const admitHook = server.serving ? server.options.admit : this.router.optionsFor(offering)?.admit;
+        const got = await this.admitA2AWork(msg, env, call, offering, guarded, buffered, admitHook);
+        if (!got) return;
+        admitted = got;
+      }
+    }
+    const reply = (resp: Envelope): void => {
+      if (admitted) this.settleA2AHold(admitted.taskId, resp);
+      this.sendRespond(msg, frame, encode(resp), { transportReply: guarded, tap: true });
+    };
+    await server.dispatch(frame, reply, { ...(sealTo ? { sealTo } : {}), ...(admitted ? { admitted } : {}) });
   }
+
+  /**
+   * The admission gates of a 0.4.0 message that asks for work: the same ones,
+   * in the same order, as a 0.3.0 request passes (handleInboxMessage), with
+   * the 0.4.0 facts read from the A2A object (inbound-call.ts): the budget
+   * from the budget extension, trial work from the trial extension. Returns
+   * what the call was admitted as, or null after the refusal was sent as the
+   * call's first and only answer, in 0.4.0 (refuseDispatch).
+   *
+   *  0. A malformed budget is refused (§7.7).
+   *  1. A trial (Common Agent §7.7) passes the trial gate; an admitted trial
+   *     skips the allowance, the agreement and the funds hold.
+   *  2. The EXT-8 allowance.
+   *  3. The §19.5 agreement, then the funds hold against the dispatch key.
+   *  4. The admit hook: `A2AServeOptions.admit`, or for a 0.3.0 handler its
+   *     `HandlerOptions.admit`. A refusal gives a funds hold back.
+   *  5. The accept signal (`{accepted: {}}`, bindings/a2a.md §4, §11), live
+   *     and not for an attended inbox, as on 0.3.0.
+   */
+  private async admitA2AWork(
+    msg: Msg,
+    env: Envelope,
+    call: InboundCall,
+    offering: string,
+    guarded: boolean,
+    buffered: boolean,
+    admitHook: ((ctx: RequestContext) => void | Promise<void>) | undefined,
+  ): Promise<A2AAdmission | null> {
+    if (call.budgetMalformed) {
+      this.refuseDispatch(msg, env, A2AErrors.invalidParams("The budget extension is not a well-formed budget (Agent Messaging §7.7).").toErrorObject(), guarded);
+      return null;
+    }
+    // The key the gates account this call under: the Task it continues, or a
+    // fresh id for new work (the server agent names its Task later).
+    const taskKey = call.taskId ?? uuid7();
+    // The 0.3.0 places the gates read the budget and the context from. In
+    // memory only: never sent, never verified again; replies are built from
+    // `env`, whose wire this view keeps.
+    const gateEnv = { ...env, ...(call.budget ? { budget: call.budget } : {}), ...(call.contextId ? { context_id: call.contextId } : {}) } as Envelope;
+    // A trusted host's vouch for whom the trial is for (§12.8): the gate
+    // honours it only from a host this node trusts (trialRequesterOf).
+    const reqPayload = {
+      offering,
+      input: call.input,
+      ...(call.trial ? { trial: true } : {}),
+      ...(call.trial && call.trialRequester ? { trial_requester: call.trialRequester } : {}),
+    } as RequestPayload;
+    let trialCtx: TrialContext | null = null;
+    if (call.trial) {
+      trialCtx = await this.trialAdmissionGate(msg, gateEnv, reqPayload, taskKey, guarded);
+      if (!trialCtx) return null;
+    }
+    if (this.allowance && !trialCtx && !(await this.allowanceAdmission(msg, gateEnv, reqPayload, taskKey, guarded))) return null;
+    if (!trialCtx && !(await this.agreementAdmission(msg, gateEnv, reqPayload, taskKey, guarded))) return null;
+    const request: RequestContext = {
+      envelope: env,
+      taskId: taskKey,
+      traceContext: env.trace,
+      ...(call.budget ? { budget: call.budget } : {}),
+      reportUsage: (usage) => void this.reportUsage(taskKey, usage, call.contextId),
+      reportMeter: (meter, quantity) => this.reportMeterUsage(taskKey, meter, quantity),
+      ...(trialCtx ? { trial: trialCtx } : {}),
+      call: { ...call, offering },
+    };
+    if (admitHook) {
+      try {
+        await admitHook(request);
+      } catch (err) {
+        const refusal =
+          err instanceof MeshError || err instanceof A2AError
+            ? err.toErrorObject()
+            : new MeshError(ErrorCode.INTERNAL_ERROR, err instanceof Error ? err.message : "Admission refused").toErrorObject();
+        this.releaseHold(taskKey, FundsReleaseReason.ADMISSION_REFUSED);
+        this.refuseDispatch(msg, env, refusal, guarded);
+        return null;
+      }
+    }
+    if (!buffered && this.manifest?.interaction !== "interactive") {
+      const acceptEnv = this.newEnvelope({
+        type: "respond",
+        from: this.agentId,
+        v: A2A_WIRE_VERSION,
+        to: env.from,
+        in_reply_to: env.id,
+        trace: childSpan(env.trace),
+        payload: { accepted: {} },
+      });
+      this.sendRespond(msg, env, encode(acceptEnv), { transportReply: guarded, tap: true });
+    }
+    return { taskId: taskKey, request };
+  }
+
+  /**
+   * The funds hold of an admitted 0.4.0 call, at its first answer: left
+   * standing when the work was delivered (a Message, or a completed Task) or
+   * is still going or paused, given back when it failed, was refused or was
+   * canceled; a Task still running is watched to its end. A sealed answer the
+   * node cannot read leaves the hold to the platform's expiry sweep.
+   */
+  private settleA2AHold(taskKey: string, resp: Envelope): void {
+    if (!this.taskHolds.has(taskKey)) return;
+    if (resp.error) {
+      this.releaseHold(taskKey, FundsReleaseReason.TASK_FAILED);
+      return;
+    }
+    const result = (resp.payload as { a2a?: { result?: { message?: unknown; task?: { id?: string; status?: { state?: string } } } } } | undefined)?.a2a?.result;
+    if (!result || result.message) return;
+    const ended = (state: string | undefined): void => {
+      if (!isTerminalState(state) || state === "TASK_STATE_COMPLETED") return;
+      this.releaseHold(
+        taskKey,
+        state === "TASK_STATE_REJECTED" ? FundsReleaseReason.REJECTED : state === "TASK_STATE_CANCELED" ? FundsReleaseReason.CANCELED : FundsReleaseReason.TASK_FAILED,
+      );
+    };
+    const state = result.task?.status?.state;
+    if (isTerminalState(state)) return ended(state);
+    const handle = result.task?.id ? this.a2aServer().handleFor(result.task.id) : undefined;
+    void handle?.settled().then((t) => ended(t.status.state)).catch(() => undefined);
+  }
+
 
   // ─── Service requests ──────────────────────────────────────────────
 
@@ -5457,22 +5613,12 @@ export class AgentMesh {
       agentName: this.trialOpts.agentName ?? (this.manifest?.name ? String(this.manifest.name) : undefined),
     });
     if (!decision.ok) {
-      const refuseEnv = this.newEnvelope({
-        type: "respond",
-        from: this.agentId,
-        to: env.from,
-        in_reply_to: env.id,
-        task_id: env.task_id,
-        trace: childSpan(env.trace),
-        error: {
-          code: decision.refusal.code,
-          message: decision.refusal.message,
-          retryable: false,
-          details: decision.refusal.details as unknown as Record<string, unknown>,
-        },
-        payload: { status: "failed" },
-      });
-      this.sendRespond(msg, env, encode(refuseEnv), { transportReply, tap: true });
+      this.refuseDispatch(msg, env, {
+        code: decision.refusal.code,
+        message: decision.refusal.message,
+        retryable: false,
+        details: decision.refusal.details as unknown as Record<string, unknown>,
+      }, transportReply);
       return null;
     }
     // Admitted: count it now, before any work. Never undone.
@@ -7186,7 +7332,7 @@ export class AgentMesh {
       const p = env.payload as Record<string, unknown> | undefined;
       const a2aFrame = !!p && typeof p === "object" && (p.a2a !== undefined || isSealedPayload(p));
       if (a2aFrame || forbiddenFieldsRefusal(env)) {
-        await this.handleA2AFrame(msg, env, guarded, audience === "person");
+        await this.handleA2AFrame(msg, env, guarded, audience === "person", buffered);
         return;
       }
     }
@@ -7502,6 +7648,7 @@ export class AgentMesh {
           reportUsage: (usage) => void this.reportUsage(dispatchTaskId, usage, env.context_id),
           reportMeter: (meter, quantity) => this.reportMeterUsage(dispatchTaskId, meter, quantity),
           ...(trialCtx ? { trial: trialCtx } : {}),
+          call: inboundCallOf(env),
         });
       } catch (err) {
         const meshErr =
@@ -7512,22 +7659,12 @@ export class AgentMesh {
                 err instanceof Error ? err.message : "Admission refused",
                 { cause: err instanceof Error ? err : undefined },
               );
-        const refuseEnv = this.newEnvelope({
-          type: "respond",
-          from: this.agentId,
-          to: env.from,
-          in_reply_to: env.id,
-          task_id: env.task_id,
-          trace: childSpan(env.trace),
-          error: meshErr.toErrorObject(),
-          payload: { status: "failed" },
-        });
         // The application refused work the funds gate already authorised — the
         // hold was placed a few lines above, because the contract puts it where
         // coverage is established. Nothing will be done and nothing will be
         // drawn, so give it straight back.
         this.releaseHold(dispatchTaskId, FundsReleaseReason.ADMISSION_REFUSED);
-        this.sendRespond(msg, env, encode(refuseEnv), { transportReply: viaReply, tap: true });
+        this.refuseDispatch(msg, env, meshErr.toErrorObject(), viaReply);
         return;
       }
     }
@@ -7641,6 +7778,7 @@ export class AgentMesh {
       reportUsage: (usage) => void this.reportUsage(dispatchTaskId, usage, env.context_id),
       reportMeter: (meter, quantity) => this.reportMeterUsage(dispatchTaskId, meter, quantity),
       ...(trialCtx ? { trial: trialCtx } : {}),
+      call: inboundCallOf(env),
     };
 
     // The consumer half of the hop (§13.1.1), parented under the sender's span
@@ -8402,24 +8540,45 @@ export class AgentMesh {
       );
     }
 
-    const refuseEnv = this.newEnvelope({
-      type: "respond",
-      from: this.agentId,
-      to: env.from,
-      in_reply_to: env.id,
-      task_id: env.task_id,
-      trace: childSpan(env.trace),
-      error: agreementRequired({
-        sku: sku.sku,
-        sku_digest: digest,
-        approval_url: approvalUrl,
-      }).toErrorObject(),
-      payload: { status: "failed" },
-    });
-    // Tap: the refusal is observable to the operator surfaces, and the
+    // Tapped: the refusal is observable to the operator surfaces, and the
     // platform records it as a quantity-0 meter event (§13.5).
-    this.sendRespond(msg, env, encode(refuseEnv), { transportReply, tap: true });
+    this.refuseDispatch(msg, env, agreementRequired({
+      sku: sku.sku,
+      sku_digest: digest,
+      approval_url: approvalUrl,
+    }).toErrorObject(), transportReply);
     return false;
+  }
+
+  /**
+   * A refusal of admission, as this dispatch's first and only reply, in the
+   * wire version the request arrived in (bindings/a2a.md §14): on 0.3.0 a
+   * failed respond naming the request's task id; on 0.4.0 a respond frame
+   * carrying only the error (§4, §9: no task_id, no payload). Tapped to the
+   * outbox, as every admission refusal is.
+   */
+  private refuseDispatch(msg: Msg, env: Envelope, error: ErrorObject, transportReply: boolean): void {
+    const refuseEnv = isA2AFrame(env)
+      ? this.newEnvelope({
+          type: "respond",
+          from: this.agentId,
+          v: A2A_WIRE_VERSION,
+          to: env.from,
+          in_reply_to: env.id,
+          trace: childSpan(env.trace),
+          error,
+        })
+      : this.newEnvelope({
+          type: "respond",
+          from: this.agentId,
+          to: env.from,
+          in_reply_to: env.id,
+          task_id: env.task_id,
+          trace: childSpan(env.trace),
+          error,
+          payload: { status: "failed" },
+        });
+    this.sendRespond(msg, env, encode(refuseEnv), { transportReply, tap: true });
   }
 
   /**
@@ -8533,19 +8692,9 @@ export class AgentMesh {
           { retryable: true, details: { sku: sku.sku } },
         );
       }
-      const refuseEnv = this.newEnvelope({
-        type: "respond",
-        from: this.agentId,
-        to: env.from,
-        in_reply_to: env.id,
-        task_id: env.task_id,
-        trace: childSpan(env.trace),
-        error: refusal.toErrorObject(),
-        payload: { status: "failed" },
-      });
-      // Tap, like the agreement refusal beside it: an admission refusal is
+      // Tapped, like the agreement refusal beside it: an admission refusal is
       // observable to the operator surfaces.
-      this.sendRespond(msg, env, encode(refuseEnv), { transportReply, tap: true });
+      this.refuseDispatch(msg, env, refusal.toErrorObject(), transportReply);
       return false;
     }
 
@@ -8619,19 +8768,9 @@ export class AgentMesh {
       }
     }
 
-    const refuseEnv = this.newEnvelope({
-      type: "respond",
-      from: this.agentId,
-      to: env.from,
-      in_reply_to: env.id,
-      task_id: env.task_id,
-      trace: childSpan(env.trace),
-      error: budgetInsufficient(estimate).toErrorObject(),
-      payload: { status: "failed" },
-    });
-    // Tap: the refusal is observable to the operator surfaces, like every
+    // Tapped: the refusal is observable to the operator surfaces, like every
     // other response this agent makes.
-    this.sendRespond(msg, env, encode(refuseEnv), { transportReply, tap: true });
+    this.refuseDispatch(msg, env, budgetInsufficient(estimate).toErrorObject(), transportReply);
     return false;
   }
 
@@ -8664,6 +8803,7 @@ export class AgentMesh {
       reportUsage: (usage) => void this.reportUsage(taskId, usage, env.context_id),
       reportMeter: (meter, quantity) => this.reportMeterUsage(taskId, meter, quantity),
       ...(this.trialTasks.has(taskId) ? { trial: this.trialTasks.get(taskId)! } : {}),
+      call: inboundCallOf(env),
     };
 
     // Step 1: the opening "working" respond (§11.3). First-hop respond, so it
