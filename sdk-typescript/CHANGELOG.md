@@ -26,6 +26,12 @@ deprecated.
   when the reply window closes, refuses push notification configs, and
   serves an extended card when one is configured. An agent that serves A2A
   lists the binding in its manifest's `capabilities`.
+- **Streams lose nothing**: a client asks the mesh to follow its stream
+  (`mesh.task.a2a.follow`), and the task manager delivers the stream's frames
+  to its inbox from the first, out of `MESH_TASKS`, once it has checked the
+  client may read the Task. The SDK reads them past the freshness window and
+  reads the Task with `GetTask` only as a safety net; on a mesh that does not
+  deliver streams it subscribes to the stream subject itself.
 - **Extensions**: offering (with the older keys during the window), budget
   with every outcome (`exhausted`, `insufficient`, `deadline_unmeetable`,
   `ceiling_reached`, `completed_late`, the overdue mark), audience (kept in

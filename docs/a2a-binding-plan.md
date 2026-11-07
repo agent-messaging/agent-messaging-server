@@ -67,28 +67,44 @@ lists the binding URI in its manifest's `capabilities`.
   0.3.0 translation.
 - Generated cards list the binding's interface and its extensions.
 
-## Where this implementation differs from the binding, or stops short
+## Streams, readers and the 0.3.0 window
 
-- **One store, two buckets.** SPEC.md 0.10 keeps A2A Tasks in `mesh_tasks`.
-  This server keeps them in `mesh_a2a_tasks` during the transition window so
-  the 0.3.0 records, their sweeps and their readers are untouched.
-- **No durable stream behind `mesh.task.*.stream` yet** (§8 "No lost first
-  events", SPEC.md §18.3, §18.6). A client therefore reads the Task once with
-  `GetTask` after it starts listening, and after a quiet spell, and closes a
-  gap with `SubscribeToTask`. A `MESH_TASKS` stream with per-client consumers
-  on both brokers, and the credential grants for them, are the follow-up.
-- **Subscribe permission per Task** (§8 "Who may listen") is not narrowed:
-  the credential templates still grant `sub mesh.task.>`. Narrowing it needs
-  grants issued per Task to the nodes that host a reader.
-- **The 0.3.0 window has no end switch** on the receiving side yet; the
-  `wireRefusal` reading supports one.
-- **The mesh home does not serve `/agents/{id}/agent-card.json`** (§3
-  SHOULD); the gateway serves cards at its own address.
-- **The live conformance runner** (`conformance/run.mjs`) has no binding
-  cases; the fixture is checked in the SDK and gateway unit suites.
-- Sealed 0.4.0 frames are opened and answered sealed, but a sealed
-  `GetTask` cannot be relayed to the task store (the store must read the
-  frame), so the node answers it from its own copy.
+- **Durable streams.** `MESH_TASKS` holds `mesh.task.*.stream` and
+  `mesh.task.*.update` for seven days: a JetStream stream on NATS, a
+  Postgres-backed stream on RabbitMQ (storage/jetstream/tasks-stream.ts,
+  storage/postgres/streams.ts). SPEC.md §18.3 lists it as `mesh.task.>`; this
+  server leaves out the request subjects (`mesh.task.get.*`,
+  `mesh.task.a2a.*`), which a stream would answer with a pub-ack that races
+  the service's reply.
+- **Who may listen** (SPEC.md §14.3, last paragraph). This server serves each
+  stream through a consumer the platform makes only after checking §7.1: the
+  client sends `mesh.task.a2a.follow` with its own signed opening frame, the
+  task manager checks the frame is the asker's and that the asker created the
+  Task, and delivers that stream's frames to the client's inbox from the first
+  (task-manager/a2a-follow.ts). It works the same on both brokers and needs no
+  credential change while a Task lives. Subscribe grants on `mesh.task.>` stay
+  while the 0.3.0 window is open, because 0.3.0 clients read Task subjects
+  directly; they go when it closes.
+- **The window.** `MESH_WIRE_0_3_0=refuse` (default `accept`) ends it: 0.3.0
+  Task updates and reads are refused, and credentials stop granting subscribe
+  on `mesh.task.>` (shared/wire-window.ts, operator handbook §16).
+- **Cards.** The mesh API serves `/agents/{handle or id}/agent-card.json`
+  (registry/agent-card-http.ts).
+- **Conformance.** The fixture is read in the SDK and gateway suites, and c26
+  in the core profile runs the binding on a live mesh.
+
+## Where this implementation still stops short
+
+- The gateway's generated cards name the agent ID in the binding's interface,
+  not the handle (the gateway does not resolve handles); the mesh home's own
+  card names the handle.
+- MAPPING.md (the A2A Bridge 0.9.1-draft) has the bridge hold a Task of its
+  own for a queued acknowledgement on the binding path (§4.3). The gateway
+  answers that case with `-32603` and `REQUEST_QUEUED` today.
+- Credentials issued before `MESH_WIRE_0_3_0=refuse` keep their Task
+  subscribe grants until they are renewed.
+- A sealed `GetTask` cannot be relayed to the task store (the store must read
+  the frame), so the node answers it from its own copy.
 
 ## Versions
 

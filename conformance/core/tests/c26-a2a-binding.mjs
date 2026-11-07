@@ -1,4 +1,4 @@
-// c26 — A2A over Agent Messaging on a live mesh (A2A binding §4, §5, §8, §10,
+// c26: A2A over Agent Messaging on a live mesh (A2A binding §4, §5, §8, §10,
 // §12.6; conformance/a2a-binding.json is the same ground as fixtures).
 //
 // A server agent served by the SDK's `mesh.a2a.serve` and a client on the
