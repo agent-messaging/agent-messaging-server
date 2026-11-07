@@ -44,7 +44,21 @@ import {
   shapeTask,
 } from "./binding.js";
 import { A2AError, A2AErrors } from "./errors.js";
-import { budgetOf, exhaustedTask, isForPerson, offeringOf } from "./extensions.js";
+import {
+  EXT_CANCEL,
+  budgetOf,
+  ceilingReachedTask,
+  deadlineUnmeetableTask,
+  exhaustedTask,
+  highestBudgetRevision,
+  insufficientBudgetTask,
+  isCeilingReached,
+  isForPerson,
+  offeringOf,
+  type A2AAmount,
+  type A2ACancel,
+} from "./extensions.js";
+import { validateStopFields } from "../cancel.js";
 import type { Budget } from "../types/envelope.js";
 import type {
   AgentCard,
@@ -75,7 +89,17 @@ export const LIST_PAGE_MAX = 100;
 export interface A2AServerHost {
   readonly agentId: string;
   /** A signed 0.4.0 respond frame. */
-  frame(p: { to: string; in_reply_to?: string; trace: TraceContext; payload?: unknown; error?: ErrorObject }): Envelope;
+  frame(p: {
+    to: string;
+    in_reply_to?: string;
+    trace: TraceContext;
+    payload?: unknown;
+    error?: ErrorObject;
+    /** Seal the payload to this X25519 key (§8a): set when the request came sealed. */
+    sealTo?: string;
+    /** The Task state to show in clear as meta.a2a_state on a sealed frame (§8a). */
+    clearState?: string;
+  }): Envelope;
   /** Publish a frame on a subject. */
   publish(subject: string, env: Envelope): void;
   /** The subject of a Task's stream (`mesh.task.{taskId}.stream`). */
@@ -106,6 +130,13 @@ export interface TaskHandle {
   /** §12.2: the engagement's cap ended the work: canceled, with the
    *  `exhausted` outcome under the budget extension. */
   exhausted(text?: string): void;
+  /** §12.2: refused at admission, the work does not fit the cost ceiling. */
+  insufficient(estimate: A2AAmount | Record<string, unknown>, text?: string): void;
+  /** §12.2: refused at admission, the deadline cannot be met. */
+  deadlineUnmeetable(earliestCompletion: string, text?: string): void;
+  /** §12.2: paused at the cost ceiling, waiting for a higher budget revision
+   *  (input required), or a cancel with the reason budget_exhausted. */
+  ceilingReached(spent: A2AAmount | Record<string, unknown>, estimateToFinish: A2AAmount | Record<string, unknown>, text?: string): void;
   /** Replace the whole Task at once (emits a Task event). */
   replace(task: Task): void;
   /** Resolves when the Task reaches a terminal or interrupted state. */
@@ -148,7 +179,7 @@ export type A2AHandler = (message: Message, ctx: A2AContext) => A2AHandlerResult
 export interface A2AServeOptions {
   /** Called on CancelTask for a Task this node runs. Throw an A2AError to
    *  refuse; return to let the cancel stand. */
-  onCancel?: (task: Task, caller: string) => void | Promise<void>;
+  onCancel?: (task: Task, caller: string, cancel: A2ACancel) => void | Promise<void>;
   /** The extended card (GetExtendedAgentCard), or a function of the caller
    *  that returns one. Absent: ExtendedAgentCardNotConfiguredError. */
   extendedCard?: AgentCard | ((caller: string) => AgentCard | Promise<AgentCard>);
@@ -156,6 +187,10 @@ export interface A2AServeOptions {
    *  Task as it stands, so a long Task does not outlive the client's reply
    *  window. Default 10 seconds. */
   replyWindowMs?: number;
+  /** On a sealed frame, show the Task's state in clear as meta.a2a_state
+   *  (§8a), for a carrier that shows it to a person. Off by default: it
+   *  discloses the state to every carrier on the path. */
+  stateInClear?: boolean;
   /** How long the node waits for the task store before answering from what
    *  it holds itself. Default 5 seconds. */
   storeTimeoutMs?: number;
@@ -165,6 +200,8 @@ export interface A2AServeOptions {
 }
 
 interface LiveTask {
+  /** The request that created the Task came sealed: its frames are sealed to this key (§8a). */
+  sealTo?: string;
   task: Task;
   requester: string;
   seq: number;
@@ -190,6 +227,12 @@ const agentMessage = (content: string | Message, task: Task): Message =>
     : content;
 
 const now = () => new Date().toISOString();
+
+/** The Task state a result or stream event shows, if it shows one. */
+function stateOfResult(r: unknown): string | undefined {
+  const o = r as StreamResponse | undefined;
+  return o?.task?.status?.state ?? o?.statusUpdate?.status?.state ?? (isTask(r) ? (r as Task).status.state : undefined);
+}
 
 function isTask(v: unknown): v is Task {
   return !!v && typeof v === "object" && typeof (v as Task).id === "string" && !!(v as Task).status && typeof (v as Task).status === "object";
@@ -263,12 +306,13 @@ export class A2AServerAgent {
    * already passed every check the inbox makes (signature, `to`, freshness,
    * revoked or paused sender, admission) and the §4 field check.
    */
-  async dispatch(env: Envelope, reply: (resp: Envelope) => void): Promise<void> {
+  async dispatch(env: Envelope, reply: (resp: Envelope) => void, opts: { sealTo?: string } = {}): Promise<void> {
     const req = readRequestPayload(env);
+    const sealTo = opts.sealTo;
     const answerError = (err: A2AError | MeshError): void =>
-      reply(this.host.frame({ to: env.from, in_reply_to: env.id, trace: childSpan(env.trace), error: err.toErrorObject() }));
+      reply(this.frameOf({ to: env.from, in_reply_to: env.id, trace: childSpan(env.trace), error: err.toErrorObject() }, sealTo));
     const answer = (result: unknown, stream?: { seq: number; final: boolean }): void =>
-      reply(this.host.frame({ to: env.from, in_reply_to: env.id, trace: childSpan(env.trace), payload: respondPayload(result, stream) }));
+      reply(this.frameOf({ to: env.from, in_reply_to: env.id, trace: childSpan(env.trace), payload: respondPayload(result, stream) }, sealTo));
 
     if (!req) {
       answerError(new A2AError("InvalidRequestError", "A 0.4.0 request frame carries payload.a2a with method and params (A2A binding §4)."));
@@ -283,7 +327,7 @@ export class A2AServerAgent {
       switch (req.method) {
         case "SendMessage":
         case "SendStreamingMessage":
-          await this.sendMessage(env, params as unknown as SendMessageRequest, STREAMING_METHODS.has(req.method), reply);
+          await this.sendMessage(env, params as unknown as SendMessageRequest, STREAMING_METHODS.has(req.method), reply, sealTo);
           return;
         case "GetTask": {
           const p = params as unknown as GetTaskRequest;
@@ -326,6 +370,17 @@ export class A2AServerAgent {
     }
   }
 
+  /** A respond frame, sealed to `sealTo` when the request came sealed, with
+   *  the Task's state in clear when the agent asked for that (§8a). */
+  private frameOf(
+    p: { to: string; in_reply_to?: string; trace: TraceContext; payload?: unknown; error?: ErrorObject },
+    sealTo: string | undefined,
+  ): Envelope {
+    if (!sealTo) return this.host.frame(p);
+    const state = this.opts.stateInClear ? stateOfResult((p.payload as { a2a?: { result?: unknown } } | undefined)?.a2a?.result) : undefined;
+    return this.host.frame({ ...p, sealTo, ...(state ? { clearState: state } : {}) });
+  }
+
   // ─── SendMessage / SendStreamingMessage ───────────────────────────
 
   private resolveOffering(message: Message): string | undefined {
@@ -350,6 +405,7 @@ export class A2AServerAgent {
     request: SendMessageRequest,
     streaming: boolean,
     reply: (resp: Envelope) => void,
+    sealTo?: string,
   ): Promise<void> {
     const message = request?.message;
     if (!isMessage(message) || typeof message.messageId !== "string") {
@@ -368,6 +424,18 @@ export class A2AServerAgent {
       } else if (existing.requester !== env.from) {
         throw A2AErrors.taskNotFound(message.taskId);
       }
+      // §12.2: a Task paused at its cost ceiling resumes only on a budget
+      // revision higher than any before it.
+      if (isCeilingReached(existing.task)) {
+        const revision = budgetOf(message)?.revision;
+        const before = highestBudgetRevision(existing.task);
+        if (revision === undefined || revision <= before) {
+          throw A2AErrors.invalidParams(
+            "This task is paused at its cost ceiling: resume it with a budget whose revision is higher than " + before + ", or cancel it with the reason budget_exhausted.",
+            { taskId: existing.task.id, revision: before },
+          );
+        }
+      }
       if (isTerminalState(existing.task.status.state)) {
         throw new A2AError("UnsupportedOperationError", "The task is in a terminal state and takes no more messages.", {
           taskId: existing.task.id,
@@ -379,7 +447,7 @@ export class A2AServerAgent {
     if (!this.handler) {
       if (this.legacy && !existing) {
         const out = await this.legacy(offering, message, env);
-        this.answerFirst(env, reply, { message: out }, streaming ? { final: true } : undefined);
+        this.answerFirst(env, reply, { message: out }, streaming ? { final: true } : undefined, sealTo);
         return;
       }
       throw A2AErrors.unsupported("A2A messages");
@@ -397,7 +465,7 @@ export class A2AServerAgent {
       // Task, the next for a message that continues one.
       if (existing) live.seq += 1;
       const snapshot = cloneTask(live.task);
-      this.answerFirst(env, reply, { task: snapshot }, { seq: live.seq, final: streaming ? endsStream(snapshot.status.state) : false });
+      this.answerFirst(env, reply, { task: snapshot }, { seq: live.seq, final: streaming ? endsStream(snapshot.status.state) : false }, live.sealTo);
       if (endsStream(snapshot.status.state)) live.ended = true;
     };
 
@@ -431,7 +499,7 @@ export class A2AServerAgent {
             history: [{ ...message, taskId: id, contextId }],
             ...(init.metadata ? { metadata: init.metadata } : {}),
           };
-          live = { task, requester: env.from, seq: 0, announced: false, ended: false, trace: env.trace, abort, waiters: [] };
+          live = { task, requester: env.from, seq: 0, announced: false, ended: false, trace: env.trace, abort, waiters: [], ...(sealTo ? { sealTo } : {}) };
           this.live.set(id, live);
         }
         const handle = this.makeHandle(live, () => {
@@ -472,7 +540,7 @@ export class A2AServerAgent {
       // The handle of the call's own Task: answered below with its Task.
     } else if (isTask(result)) {
       if (!live) {
-        live = { task: cloneTask(result), requester: env.from, seq: 0, announced: false, ended: false, trace: env.trace, abort, waiters: [] };
+        live = { task: cloneTask(result), requester: env.from, seq: 0, announced: false, ended: false, trace: env.trace, abort, waiters: [], ...(sealTo ? { sealTo } : {}) };
         this.live.set(result.id, live);
       } else if (answered && JSON.stringify(result) !== JSON.stringify(live.task)) {
         this.emit(live, { task: cloneTask(result) });
@@ -481,7 +549,7 @@ export class A2AServerAgent {
       }
     } else if (isMessage(result)) {
       if (!live) {
-        this.answerFirst(env, reply, { message: result }, streaming ? { final: true } : undefined);
+        this.answerFirst(env, reply, { message: result }, streaming ? { final: true } : undefined, sealTo);
         return;
       }
       // A Message from a handler that also started a Task is the Task's
@@ -499,14 +567,15 @@ export class A2AServerAgent {
     reply: (resp: Envelope) => void,
     result: { task?: Task; message?: Message },
     stream?: { seq?: number; final: boolean },
+    sealTo?: string,
   ): void {
     reply(
-      this.host.frame({
+      this.frameOf({
         to: env.from,
         in_reply_to: env.id,
         trace: childSpan(env.trace),
         payload: respondPayload(result, stream ? { seq: stream.seq ?? 0, final: stream.final } : undefined),
-      }),
+      }, sealTo),
     );
   }
 
@@ -522,11 +591,14 @@ export class A2AServerAgent {
       const final = eventEndsStream(ev);
       this.host.publish(
         this.host.streamSubject(live.task.id),
-        this.host.frame({
-          to: live.requester,
-          trace: childSpan(live.trace),
-          payload: respondPayload(ev, { seq: live.seq, final }),
-        }),
+        this.frameOf(
+          {
+            to: live.requester,
+            trace: childSpan(live.trace),
+            payload: respondPayload(ev, { seq: live.seq, final }),
+          },
+          live.sealTo,
+        ),
       );
       if (final) live.ended = true;
     }
@@ -589,6 +661,18 @@ export class A2AServerAgent {
       exhausted(text) {
         const ended = exhaustedTask(live.task, text);
         status("TASK_STATE_CANCELED", ended.status.message, ended.metadata);
+      },
+      insufficient(estimate, text) {
+        const ended = insufficientBudgetTask(live.task, estimate, text);
+        status("TASK_STATE_REJECTED", ended.status.message, ended.metadata);
+      },
+      deadlineUnmeetable(earliestCompletion, text) {
+        const ended = deadlineUnmeetableTask(live.task, earliestCompletion, text);
+        status("TASK_STATE_REJECTED", ended.status.message, ended.metadata);
+      },
+      ceilingReached(spent, estimateToFinish, text) {
+        const paused = ceilingReachedTask(live.task, spent, estimateToFinish, text);
+        status("TASK_STATE_INPUT_REQUIRED", paused.status.message, paused.metadata);
       },
       replace(task) {
         self.emit(live, { task: cloneTask(task) }, after);
@@ -690,6 +774,7 @@ export class A2AServerAgent {
 
   private async cancelTask(env: Envelope, p: CancelTaskRequest): Promise<Task> {
     if (typeof p?.id !== "string" || !p.id) throw A2AErrors.invalidParams("CancelTask needs the Task's id.");
+    const cancel = cancelReasonFor(p, activatedExtensions(readServiceParams(env)).includes(EXT_CANCEL));
     let live = this.live.get(p.id);
     if (live && live.requester !== env.from) throw A2AErrors.taskNotFound(p.id);
     if (!live) {
@@ -698,15 +783,49 @@ export class A2AServerAgent {
     }
     const state = live.task.status.state;
     if (isTerminalState(state)) throw A2AErrors.taskNotCancelable(p.id, state);
-    if (this.opts.onCancel) await this.opts.onCancel(cloneTask(live.task), env.from);
+    if (this.opts.onCancel) await this.opts.onCancel(cloneTask(live.task), env.from, cancel);
     live.abort.abort();
     // The cancel ends the stream that is open, and starts one for a Task
     // whose stream had ended at an interrupted state.
     if (live.ended) live.ended = false;
     live.announced = true;
-    this.makeHandle(live).status("TASK_STATE_CANCELED", "Canceled at the client's request.", p.metadata);
+    // §12.6: the reason stays on the record, under the cancel URI.
+    this.makeHandle(live).status("TASK_STATE_CANCELED", "Canceled at the client's request (" + cancel.reason + ").", {
+      ...(p.metadata ?? {}),
+      [EXT_CANCEL]: cancel,
+    });
     return cloneTask(live.task);
   }
+}
+
+/**
+ * The reason a CancelTask carries (§12.6), checked against SPEC.md §10.8: a
+ * reason from the closed list, a note that is a string, and the field each
+ * qualified reason needs (`unmetNeed` with needs_not_furnished, `dependency`
+ * with dependency_failed; the snake_case spellings are read too). A client
+ * that does not declare the extension may send none, which is recorded as
+ * user_requested; one that declares it must send one.
+ */
+export function cancelReasonFor(p: CancelTaskRequest, declared: boolean): A2ACancel {
+  const raw = p.metadata?.[EXT_CANCEL];
+  if (raw === undefined) {
+    if (declared) throw A2AErrors.invalidParams("A client that declares the cancel extension sends a reason (A2A binding §12.6).");
+    return { reason: "user_requested" };
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw A2AErrors.invalidParams("The cancel extension's data is an object with a reason.");
+  const d = raw as Record<string, unknown>;
+  const unmetNeed = d.unmetNeed ?? d.unmet_need;
+  try {
+    validateStopFields({ reason: d.reason, note: d.note, unmet_need: unmetNeed, dependency: d.dependency }, true);
+  } catch (err) {
+    throw A2AErrors.invalidParams(err instanceof Error ? err.message : String(err), { field: "metadata." + EXT_CANCEL });
+  }
+  return {
+    reason: d.reason as A2ACancel["reason"],
+    ...(typeof d.note === "string" ? { note: d.note } : {}),
+    ...(typeof unmetNeed === "string" ? { unmetNeed } : {}),
+    ...(typeof d.dependency === "string" ? { dependency: d.dependency } : {}),
+  };
 }
 
 /** ListTasks over a set of Tasks the caller may read: filtered, newest status

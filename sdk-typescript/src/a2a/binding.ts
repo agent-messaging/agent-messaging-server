@@ -278,3 +278,29 @@ export function shapeTask(task: Task, opts: { historyLength?: number; includeArt
   if (opts.includeArtifacts === false) delete t.artifacts;
   return t;
 }
+
+// ─── Sealed frames (§8a) ────────────────────────────────────────────
+
+/** The `meta` key a sealed frame may show its Task's state under, in clear,
+ *  for a carrier that shows a person the state (§8a). */
+export const A2A_STATE_META = "a2a_state";
+
+/**
+ * The Task state a respond frame shows. Read from the payload whenever the
+ * payload can be read (it is opened, or was never sealed): `meta.a2a_state`
+ * is then ignored, wherever the two differ. Only a frame whose payload is
+ * still sealed falls back to `meta.a2a_state`, reported as `fromMeta`, which
+ * a receiver treats as a carrier's hint, never as the Task's state.
+ */
+export function stateOfFrame(env: Envelope): { state: string; fromMeta: boolean } | undefined {
+  const r = readRespondPayload(env)?.result as StreamResponse | Task | undefined;
+  const fromPayload =
+    (r as StreamResponse | undefined)?.task?.status?.state ??
+    (r as StreamResponse | undefined)?.statusUpdate?.status?.state ??
+    ((r as Task | undefined)?.status?.state as string | undefined);
+  if (typeof fromPayload === "string") return { state: fromPayload, fromMeta: false };
+  const p = env.payload as { v?: unknown } | undefined;
+  const sealed = !!p && typeof p === "object" && p.v === "sealedpayload.v1";
+  const meta = (env.meta as Record<string, unknown> | undefined)?.[A2A_STATE_META];
+  return sealed && typeof meta === "string" ? { state: meta, fromMeta: true } : undefined;
+}

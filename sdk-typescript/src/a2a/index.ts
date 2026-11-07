@@ -54,6 +54,8 @@ export {
 export {
   A2AServerAgent,
   A2A_STORE_SUBJECTS,
+  LIST_PAGE_DEFAULT,
+  LIST_PAGE_MAX,
   listFrom,
   legacyInputOf,
   messageOfLegacyInput,

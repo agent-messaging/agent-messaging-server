@@ -109,7 +109,7 @@ import type {
 import { PROTOCOL_VERSION } from "./types/envelope.js";
 import { A2ANamespace } from "./a2a/index.js";
 import { A2AServerAgent, legacyInputOf, messageOfLegacyInput, outputOfParts, partsOfOutput } from "./a2a/server.js";
-import { A2A_BINDING_URI, A2A_WIRE_VERSION, forbiddenFieldsRefusal, isA2AFrame, isAcceptSignal, isTerminalState } from "./a2a/binding.js";
+import { A2A_BINDING_URI, A2A_STATE_META, A2A_WIRE_VERSION, forbiddenFieldsRefusal, isA2AFrame, isAcceptSignal, isTerminalState } from "./a2a/binding.js";
 import { A2AError } from "./a2a/errors.js";
 import type { Message as A2AMessage } from "./a2a/types.js";
 import { MeshError, RejectedError, ErrorCode } from "./types/errors.js";
@@ -3629,7 +3629,17 @@ export class AgentMesh {
         {
           agentId: this.agentId,
           frame: (p) =>
-            this.newEnvelope({ type: "request", from: this.agentId, v: A2A_WIRE_VERSION, to: p.to, payload: p.payload, meta: p.meta }),
+            this.newEnvelope({
+              type: "request",
+              from: this.agentId,
+              v: A2A_WIRE_VERSION,
+              to: p.to,
+              // §8a: the whole A2A object is sealed, with this agent's key as
+              // reply_key so the answers come back sealed.
+              payload: p.seal ? this.sealOutbound(p.to, p.payload, this.manifestCache.get(p.to), true) : p.payload,
+              meta: p.meta,
+            }),
+          open: (env) => this.openA2AFrame(env),
           call: async (agentId, env, timeoutMs) => {
             if (this.namingGate) await this.namingGate.require();
             // Whoever this agent writes to may answer it (admission.ts).
@@ -3671,8 +3681,9 @@ export class AgentMesh {
           to: p.to,
           ...(p.in_reply_to !== undefined ? { in_reply_to: p.in_reply_to } : {}),
           trace: p.trace,
-          ...(p.payload !== undefined ? { payload: p.payload } : {}),
+          ...(p.payload !== undefined ? { payload: p.sealTo ? sealPayloadTo(p.payload, p.sealTo) : p.payload } : {}),
           ...(p.error !== undefined ? { error: p.error } : {}),
+          ...(p.sealTo && p.clearState ? { meta: { [A2A_STATE_META]: p.clearState } } : {}),
         }),
       publish: (subject, env) => this.conn.publish(subject, encode(env)),
       streamSubject: (taskId) => Subjects.taskStream(taskId),
@@ -3761,6 +3772,14 @@ export class AgentMesh {
     }
   }
 
+  /** A 0.4.0 frame with its sealed payload opened by this agent's key (§8a);
+   *  a frame that is not sealed, or does not open, is returned as it came. */
+  private openA2AFrame(env: Envelope): Envelope {
+    if (!isA2AFrame(env) || !isSealedPayload(env.payload) || !this.encryptionSeed) return env;
+    const opened = openSealedPayload(env.payload, this.encryptionSeed);
+    return opened ? { ...env, payload: opened.payload } : env;
+  }
+
   /** One 0.4.0 request frame (bindings/a2a.md): refused when it carries the
    *  old envelope fields (§4), measured against the inbound cap, put through
    *  admission (§10), then answered by the A2A side. */
@@ -3775,6 +3794,30 @@ export class AgentMesh {
         in_reply_to: env.id,
         trace: childSpan(env.trace),
         error: refusal.toErrorObject(),
+      });
+      this.sendRespond(msg, env, encode(errEnv), { transportReply: guarded, tap: true });
+      return;
+    }
+    // §8a: a sealed frame is opened here, and its answers are sealed back to
+    // the sender's own published key (the reply_key must name it).
+    let sealTo: string | undefined;
+    const sealedIn = isSealedPayload(env.payload);
+    if (sealedIn) {
+      const replyKey = (env.payload as { reply_key?: string }).reply_key;
+      const opened = this.encryptionSeed ? openSealedPayload(env.payload as Parameters<typeof openSealedPayload>[0], this.encryptionSeed) : null;
+      if (opened) {
+        env = { ...env, payload: opened.payload };
+        sealTo = (await this.replySealKey(env.from, replyKey)) ?? undefined;
+      }
+    } else if (this.manifest?.sealing === "required") {
+      const errEnv = this.newEnvelope({
+        type: "respond",
+        from: this.agentId,
+        v: A2A_WIRE_VERSION,
+        to: env.from,
+        in_reply_to: env.id,
+        trace: childSpan(env.trace),
+        error: { code: ErrorCode.SEALING_REQUIRED, message: "This agent reads sealed frames only (§8.9, A2A binding §8a).", retryable: false },
       });
       this.sendRespond(msg, env, encode(errEnv), { transportReply: guarded, tap: true });
       return;
@@ -3795,7 +3838,8 @@ export class AgentMesh {
       this.answerQueued(msg, env, guarded, surfaced);
       return;
     }
-    await this.a2aServer().dispatch(env, (resp) => this.sendRespond(msg, env, encode(resp), { transportReply: guarded, tap: true }));
+    const frame = env;
+    await this.a2aServer().dispatch(frame, (resp) => this.sendRespond(msg, frame, encode(resp), { transportReply: guarded, tap: true }), { ...(sealTo ? { sealTo } : {}) });
   }
 
   // ─── Service requests ──────────────────────────────────────────────

@@ -15,8 +15,9 @@ export const EXT_BUDGET = "https://agentmessaging.ai/extensions/budget/v1";
 export const EXT_AUDIENCE = "https://agentmessaging.ai/extensions/audience/v1";
 export const EXT_ECONOMICS = "https://agentmessaging.ai/extensions/economics/v1";
 export const EXT_ARTIFACT_REFS = "https://agentmessaging.ai/extensions/artifact-refs/v1";
+export const EXT_CANCEL = "https://agentmessaging.ai/extensions/cancel/v1";
 
-export const BINDING_EXTENSIONS = [EXT_OFFERING, EXT_BUDGET, EXT_AUDIENCE, EXT_ECONOMICS, EXT_ARTIFACT_REFS] as const;
+export const BINDING_EXTENSIONS = [EXT_OFFERING, EXT_BUDGET, EXT_AUDIENCE, EXT_ECONOMICS, EXT_ARTIFACT_REFS, EXT_CANCEL] as const;
 
 const DESCRIPTIONS: Record<string, string> = {
   [EXT_OFFERING]: "Which declared offering a message calls (Agent Messaging §8.5).",
@@ -24,6 +25,7 @@ const DESCRIPTIONS: Record<string, string> = {
   [EXT_AUDIENCE]: "A message meant for the person behind the agent (Agent Messaging §5.7).",
   [EXT_ECONOMICS]: "Payment required, with the price and how to pay (Agent Messaging §19).",
   [EXT_ARTIFACT_REFS]: "A large Part's size and digest (Agent Messaging §7.5.1).",
+  [EXT_CANCEL]: "Why a Task was canceled (Agent Messaging §10.8).",
 };
 
 /** The card's `capabilities.extensions` entries for the extensions given
@@ -136,19 +138,103 @@ export function isExhausted(task: Task | undefined): boolean {
   return task?.status?.state === "TASK_STATE_CANCELED" && extensionData<{ outcome?: unknown }>(task, EXT_BUDGET)?.outcome === "exhausted";
 }
 
-/** §12.2: the work does not fit the budget. `TASK_STATE_REJECTED` with
- *  `{"outcome": "insufficient", "estimate": {...}}` under the budget URI. */
-export function insufficientBudgetTask(task: Task, estimate: Record<string, unknown>, text = "The work does not fit the budget."): Task {
+/** A money amount on the A2A side of the budget extension. */
+export interface A2AAmount {
+  amountMicro: number;
+  currency: string;
+}
+
+/** §12.2: the work does not fit the cost ceiling, refused at admission.
+ *  `TASK_STATE_REJECTED` with `{"outcome": "insufficient", "estimate"}`. */
+export function insufficientBudgetTask(task: Task, estimate: A2AAmount | Record<string, unknown>, text = "The work does not fit the budget."): Task {
   return ended(task, "TASK_STATE_REJECTED", text, { outcome: "insufficient", estimate }, EXT_BUDGET);
 }
 
-export function budgetOutcomeOf(task: Task | undefined): { outcome: string; estimate?: Record<string, unknown> } | undefined {
-  const d = extensionData<{ outcome?: unknown; estimate?: unknown }>(task, EXT_BUDGET);
+/** §12.2: the deadline cannot be met, refused at admission.
+ *  `TASK_STATE_REJECTED` with `{"outcome": "deadline_unmeetable", "earliestCompletion"}`. */
+export function deadlineUnmeetableTask(task: Task, earliestCompletion: string, text = "The deadline cannot be met."): Task {
+  return ended(task, "TASK_STATE_REJECTED", text, { outcome: "deadline_unmeetable", earliestCompletion }, EXT_BUDGET);
+}
+
+/**
+ * §12.2: the work reached its cost ceiling and paused for more money.
+ * `TASK_STATE_INPUT_REQUIRED` with `{"outcome": "ceiling_reached", "spent",
+ * "estimateToFinish"}`. The Task resumes on a Message whose budget `revision`
+ * is higher than any before it, or ends on a cancel with the reason
+ * `budget_exhausted` (§12.6).
+ */
+export function ceilingReachedTask(
+  task: Task,
+  spent: A2AAmount | Record<string, unknown>,
+  estimateToFinish: A2AAmount | Record<string, unknown>,
+  text = "The work reached its cost ceiling. Raise the budget to go on, or cancel.",
+): Task {
+  return ended(task, "TASK_STATE_INPUT_REQUIRED", text, { outcome: "ceiling_reached", spent, estimateToFinish }, EXT_BUDGET);
+}
+
+/** The four budget outcomes of §12.2. */
+export type BudgetOutcome = "insufficient" | "deadline_unmeetable" | "ceiling_reached" | "exhausted";
+
+/** The budget outcome on a Task (§12.2), with the fields it carries. */
+export function budgetOutcomeOf(task: Task | undefined): ({ outcome: string } & Record<string, unknown>) | undefined {
+  const d = extensionData<Record<string, unknown>>(task, EXT_BUDGET);
   if (!d || typeof d.outcome !== "string") return undefined;
-  return {
-    outcome: d.outcome,
-    ...(d.estimate && typeof d.estimate === "object" ? { estimate: d.estimate as Record<string, unknown> } : {}),
-  };
+  return { ...d, outcome: d.outcome };
+}
+
+/** Is this Task paused at its cost ceiling, waiting for a higher budget? */
+export function isCeilingReached(task: Task | undefined): boolean {
+  return task?.status?.state === "TASK_STATE_INPUT_REQUIRED" && budgetOutcomeOf(task)?.outcome === "ceiling_reached";
+}
+
+/** The highest budget `revision` among the client's messages in a Task's
+ *  history, or -1 when none carried a budget. A paused Task resumes only on a
+ *  revision above it (§12.2). */
+export function highestBudgetRevision(task: Task | undefined): number {
+  let best = -1;
+  for (const m of task?.history ?? []) {
+    if (m.role !== "ROLE_USER") continue;
+    const b = budgetOf(m);
+    if (b && b.revision > best) best = b.revision;
+  }
+  return best;
+}
+
+// ─── §12.6 Cancel reasons ───────────────────────────────────────────
+
+/** The closed list of SPEC.md §10.8. */
+export const A2A_CANCEL_REASONS = [
+  "user_requested",
+  "superseded",
+  "deadline_exceeded",
+  "budget_exhausted",
+  "upstream_cancelled",
+  "policy",
+  "needs_not_furnished",
+  "dependency_failed",
+] as const;
+
+export type A2ACancelReason = (typeof A2A_CANCEL_REASONS)[number];
+
+/** The cancel extension's data: the reason, an optional note, and the fields
+ *  §10.8 requires for a reason (`unmetNeed` with `needs_not_furnished`,
+ *  `dependency` with `dependency_failed`). */
+export interface A2ACancel {
+  reason: A2ACancelReason;
+  note?: string;
+  unmetNeed?: string;
+  dependency?: string;
+}
+
+/** A CancelTask request's metadata with a reason under the cancel URI. */
+export function withCancelReason<O extends { metadata?: Record<string, unknown> }>(obj: O, cancel: A2ACancel): O {
+  return withExtensionData(obj, EXT_CANCEL, cancel as unknown as Record<string, unknown>);
+}
+
+/** The cancel reason on a CancelTask request or a canceled Task (§12.6). */
+export function cancelReasonOf(obj: { metadata?: Record<string, unknown> } | undefined): A2ACancel | undefined {
+  const d = extensionData<Record<string, unknown>>(obj, EXT_CANCEL);
+  return d && typeof d.reason === "string" ? (d as unknown as A2ACancel) : undefined;
 }
 
 // ─── §12.3 Audience ─────────────────────────────────────────────────
@@ -187,9 +273,11 @@ export function paymentRequiredOf(task: Task | undefined): PaymentRequired | und
 
 // ─── §12.5 Artifact references ──────────────────────────────────────
 
-/** A `url` Part whose value is an Agent Messaging artifact reference, with
- *  its size and digest under the artifact-refs URI. Takes the SDK's
- *  `putArtifact` result directly. */
+/** A `url` Part whose bytes are held outside the message, with their size
+ *  and digest under the artifact-refs URI. The reference is any URI its
+ *  carrier defines: an Agent Messaging artifact reference on a mesh, a `cid:`
+ *  attachment by email, an `https:` URL. Takes the SDK's `putArtifact` result
+ *  directly. */
 export function artifactRefPart(ref: {
   ref: string;
   size: number;

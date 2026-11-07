@@ -23,6 +23,7 @@ import {
   taskIdOfEvent,
 } from "./binding.js";
 import { A2AError, A2AErrors } from "./errors.js";
+import { EXT_CANCEL, cancelReasonOf, withCancelReason, type A2ACancel } from "./extensions.js";
 import type {
   A2AMethod,
   A2AOperations,
@@ -49,7 +50,9 @@ import type {
 export interface A2AClientHost {
   readonly agentId: string;
   /** A signed 0.4.0 request frame to `to`. */
-  frame(p: { to: string; payload: unknown; meta?: Record<string, unknown> }): Envelope;
+  frame(p: { to: string; payload: unknown; meta?: Record<string, unknown>; seal?: boolean }): Envelope;
+  /** A frame with its sealed payload opened (§8a), or the frame as it came. */
+  open(env: Envelope): Envelope;
   /** Send a request frame to the agent's inbox and wait for its first answer
    *  (the channel's accept signal does not count). */
   call(agentId: string, env: Envelope, timeoutMs: number): Promise<Envelope>;
@@ -69,6 +72,9 @@ export interface A2ACallOptions {
   /** The engagement this call runs under, recorded beside the Task by the
    *  server (§11). Carried as the envelope's `meta.engagement`. */
   engagement?: string;
+  /** Seal the payload to the server agent's published encryption key (§8a,
+   *  EXT-7); its answers come back sealed to this agent's key. */
+  seal?: boolean;
 }
 
 export interface A2AStreamOptions extends A2ACallOptions {
@@ -100,7 +106,7 @@ export class A2AClient {
     if (opts.extensions?.length) params2["A2A-Extensions"] = opts.extensions.join(",");
     const meta: Record<string, unknown> = { a2a: serviceParams(params2) };
     if (opts.engagement !== undefined) meta.engagement = opts.engagement;
-    return this.host.frame({ to: agentId, payload: requestPayload(method, params), meta });
+    return this.host.frame({ to: agentId, payload: requestPayload(method, params), meta, ...(opts.seal ? { seal: true } : {}) });
   }
 
   /** Any operation, by name: one request frame, its one answer. */
@@ -111,7 +117,7 @@ export class A2AClient {
     opts: A2ACallOptions = {},
   ): Promise<A2AOperations[M]["result"]> {
     const env = this.frameFor(agentId, method, params, opts);
-    const resp = await this.host.call(agentId, env, opts.timeoutMs ?? 30_000);
+    const resp = this.host.open(await this.host.call(agentId, env, opts.timeoutMs ?? 30_000));
     if (resp.error) raise(resp);
     const r = readRespondPayload(resp);
     if (!r) throw A2AErrors.invalidAgentResponse(`The answer to ${method} carried no payload.a2a.result.`);
@@ -134,8 +140,17 @@ export class A2AClient {
     return this.call(agentId, "ListTasks", request, opts);
   }
 
-  cancelTask(agentId: string, request: CancelTaskRequest | string, opts?: A2ACallOptions): Promise<Task> {
-    return this.call(agentId, "CancelTask", typeof request === "string" ? { id: request } : request, opts);
+  /**
+   * Cancel a Task, with a reason (§12.6): `opts.cancel`, or one already in
+   * the request's metadata under the cancel URI, else `user_requested`. The
+   * cancel extension is activated for the call.
+   */
+  cancelTask(agentId: string, request: CancelTaskRequest | string, opts: A2ACallOptions & { cancel?: A2ACancel } = {}): Promise<Task> {
+    const req: CancelTaskRequest = typeof request === "string" ? { id: request } : request;
+    const { cancel, ...rest } = opts;
+    const withReason = cancelReasonOf(req) ? req : withCancelReason(req, cancel ?? { reason: "user_requested" });
+    const extensions = [...new Set([...(rest.extensions ?? []), EXT_CANCEL])];
+    return this.call(agentId, "CancelTask", withReason, { ...rest, extensions });
   }
 
   subscribeToTask(agentId: string, request: { id: string; tenant?: string } | string, opts?: A2AStreamOptions): A2AEventStream {
@@ -177,7 +192,7 @@ export class A2AClient {
     const state = { taskId: undefined as string | undefined, lastSeq: opts.afterSeq ?? -1 };
     const iterate = async function* (): AsyncGenerator<StreamResponse> {
       const env = self.frameFor(agentId, method, params, opts);
-      const first = await self.host.call(agentId, env, opts.timeoutMs ?? 30_000);
+      const first = self.host.open(await self.host.call(agentId, env, opts.timeoutMs ?? 30_000));
       if (first.error) raise(first);
       const r = readRespondPayload(first);
       if (!r) throw A2AErrors.invalidAgentResponse(`The answer to ${method} carried no payload.a2a.result.`);
@@ -217,7 +232,8 @@ export class A2AClient {
       wake = null;
       w?.();
     };
-    const sub = this.host.subscribe(this.host.streamSubject(taskId), (env) => {
+    const sub = this.host.subscribe(this.host.streamSubject(taskId), (sealed) => {
+      const env = this.host.open(sealed);
       // Only the server agent speaks on its Tasks' streams, in 0.4.0 frames.
       if (env.from !== agentId || !isA2AFrame(env) || env.error) return;
       const r = readRespondPayload(env);
@@ -257,7 +273,7 @@ export class A2AClient {
         let snap: { ev: StreamResponse; seq: number; final: boolean } | null = null;
         try {
           const env = this.frameFor(agentId, "SubscribeToTask", { id: taskId }, opts);
-          const resp = await this.host.call(agentId, env, opts.timeoutMs ?? 30_000);
+          const resp = this.host.open(await this.host.call(agentId, env, opts.timeoutMs ?? 30_000));
           if (resp.error) raise(resp);
           const r = readRespondPayload(resp);
           if (r) snap = { ev: r.result as StreamResponse, seq: r.seq ?? 0, final: r.final };

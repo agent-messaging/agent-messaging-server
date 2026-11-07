@@ -37,7 +37,7 @@ export interface Bus {
    *  service) or throw a MeshError. */
   service(subject: string, fn: (req: Envelope) => Envelope | Promise<Envelope>): void;
   conn(): ConnectionManager;
-  agent(kp?: KeyPair): AgentMesh;
+  agent(kp?: KeyPair, opts?: { encryptionSeed?: string }): AgentMesh;
   /** Publish raw bytes onto the bus, as a misbehaving sender would. */
   publishRaw(subject: string, data: Uint8Array): void;
   close(): Promise<void>;
@@ -87,9 +87,9 @@ export function makeBus(): Bus {
       };
       return c as unknown as ConnectionManager;
     },
-    agent(kp) {
+    agent(kp, opts) {
       const k = kp ?? nkeys.createUser();
-      const a = AgentMesh.withConnection(bus.conn(), k, k);
+      const a = AgentMesh.withConnection(bus.conn(), k, k, opts?.encryptionSeed ? { encryptionSeed: opts.encryptionSeed } : undefined);
       agents.push(a);
       return a;
     },
