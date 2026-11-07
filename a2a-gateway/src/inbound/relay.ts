@@ -20,7 +20,12 @@
  *        attribution marker) on the envelope. A request the responder queues
  *        (REQUEST_QUEUED) is held open for its late reply, up to `timeout_ms`.
  *        Answers { kind: "done", status, output, message? }, { kind: "late" }
- *        when the answer will come later, or { kind: "failed", code }.
+ *        when the answer will come later, or { kind: "failed", code }. An
+ *        agent that serves the A2A binding (its manifest lists it) is called
+ *        with A2A's SendMessage in a 0.4.0 frame, the input as the Message's
+ *        parts and the offering in the offering extension, and its A2A answer
+ *        is given back in this same shape (relayAnswerOfA2A); the others keep
+ *        the 0.3.0 request.
  *
  * Plus the forwarding of whole path prefixes to a front end beside the gateway
  * (FORWARD_ROUTES), so the edge in front of the gateway needs no change.
@@ -29,6 +34,12 @@ import { request as httpRequest, type IncomingMessage, type ServerResponse } fro
 import { isExposed, type Bridge } from "../bridge.js";
 import type { AttachmentManager } from "../outbound/manager.js";
 import { MeshError, ErrorCode } from "../../../sdk-typescript/src/types/errors.js";
+import type { AgentMesh } from "../../../sdk-typescript/src/mesh.js";
+import { A2AError } from "../../../sdk-typescript/src/a2a/errors.js";
+import { isTerminalState } from "../../../sdk-typescript/src/a2a/binding.js";
+import { EXT_OFFERING, isExhausted } from "../../../sdk-typescript/src/a2a/extensions.js";
+import { messageOfLegacyInput, outputOfParts } from "../../../sdk-typescript/src/a2a/server.js";
+import type { Message, Task } from "../../../sdk-typescript/src/a2a/types.js";
 
 const BODY_LIMIT = 256 * 1024;
 const DEFAULT_TIMEOUT_MS = 60_000;
@@ -82,6 +93,10 @@ export async function relayTurn(
   const startedAt = Date.now();
   const tap = (outcome: "ok" | "error") =>
     bridge.emitInboundCall(t.callerKey, { responder: t.responder, offering: t.offering, outcome, latencyMs: Date.now() - startedAt, at: new Date().toISOString(), binding: t.binding });
+  // An agent that serves the A2A binding is called with A2A's SendMessage in
+  // a 0.4.0 frame (bindings/a2a.md); every other agent keeps the 0.3.0 call.
+  // The answer to the front end is the same shape either way.
+  if (await bridge.servesA2ABinding(t.responder)) return relayTurnA2A(requester, t, meta, startedAt, tap);
   try {
     const result = await requester.request(t.responder, t.offering, t.input, { timeout_ms: t.timeoutMs, ...(t.contextId ? { context_id: t.contextId } : {}), meta });
     tap("ok");
@@ -106,6 +121,80 @@ export async function relayTurn(
     tap("error");
     const code = err instanceof MeshError ? err.code : "INTERNAL";
     console.warn(`[relay] mesh request to ${t.responder.slice(0, 12)}... failed: ${code}`); // cut-ok: a key prefix in a log line
+    return { kind: "failed", code };
+  }
+}
+
+/**
+ * An A2A answer as the relay's answer, the shape its callers read on 0.3.0:
+ *
+ *  - a Message: `done`, `completed`, its parts as the output (a lone data
+ *    part's data, else the text, as the SDK maps an A2A answer for a 0.3.0
+ *    handler);
+ *  - a Task in a terminal state: `done`, its state as the 0.3.0 wire spells
+ *    it (`completed`, `failed`, `canceled`, `rejected`, `exhausted`), the
+ *    artifacts' parts as the output of a completed Task (null otherwise), and
+ *    the status message's text as `message`;
+ *  - a Task that is not finished: `late`, as a 0.3.0 Task answer is.
+ */
+export function relayAnswerOfA2A(result: unknown): RelayAnswer {
+  const r = (result ?? {}) as { message?: Message; task?: Task };
+  if (r.message && !r.task) return { kind: "done", status: "completed", output: outputOfParts(r.message.parts ?? []) };
+  const task = r.task;
+  if (!task || !isTerminalState(task.status?.state)) return { kind: "late" };
+  const status = isExhausted(task) ? "exhausted" : task.status.state.replace(/^TASK_STATE_/, "").toLowerCase();
+  const words = (task.status.message?.parts ?? []).filter((p) => typeof p.text === "string").map((p) => p.text).join("\n");
+  return {
+    kind: "done",
+    status,
+    output: status === "completed" ? outputOfParts((task.artifacts ?? []).flatMap((a) => a.parts ?? [])) : null,
+    ...(words ? { message: words } : {}),
+  };
+}
+
+/** One turn to an agent that serves the A2A binding. */
+async function relayTurnA2A(
+  requester: AgentMesh,
+  t: { responder: string; offering: string; input: unknown; contextId?: string; timeoutMs: number },
+  meta: Record<string, unknown>,
+  startedAt: number,
+  tap: (outcome: "ok" | "error") => void,
+): Promise<RelayAnswer> {
+  const message: Message = { ...messageOfLegacyInput(t.input, t.offering), ...(t.contextId ? { contextId: t.contextId } : {}) };
+  // A request the agent's node queues answers later, naming the request
+  // (A2ACallOptions.onLateAnswer): held open for it, up to the turn's time.
+  let late: (answer: RelayAnswer) => void = () => undefined;
+  const lateAnswer = new Promise<RelayAnswer>((resolve) => (late = resolve));
+  try {
+    const res = await requester.a2a.sendMessage(t.responder, message, {
+      timeoutMs: t.timeoutMs,
+      meta,
+      extensions: [EXT_OFFERING],
+      onLateAnswer: (answer) => {
+        if ("result" in answer) late(relayAnswerOfA2A(answer.result));
+        else late({ kind: "done", status: "rejected", output: null, message: answer.error.message });
+      },
+    });
+    tap("ok");
+    return relayAnswerOfA2A(res);
+  } catch (err) {
+    if (err instanceof MeshError && err.code === ErrorCode.REQUEST_QUEUED) {
+      tap("ok");
+      const left = Math.max(1000, t.timeoutMs - (Date.now() - startedAt));
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const waited = await Promise.race([
+        lateAnswer,
+        new Promise<RelayAnswer>((resolve) => {
+          timer = setTimeout(() => resolve({ kind: "late" }), left);
+          timer.unref?.();
+        }),
+      ]);
+      if (timer) clearTimeout(timer);
+      return waited;
+    }
+    tap("error");
+    const code = err instanceof A2AError ? err.code : err instanceof MeshError ? err.code : "INTERNAL";
+    console.warn(`[relay] A2A request to ${t.responder.slice(0, 12)}... failed: ${code}`); // cut-ok: a key prefix in a log line
     return { kind: "failed", code };
   }
 }

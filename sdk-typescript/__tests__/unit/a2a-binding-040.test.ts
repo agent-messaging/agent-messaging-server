@@ -78,3 +78,23 @@ describe("§12.10 receipts", () => {
     expect(cardExtensions([EXT_TRIAL, EXT_REPLY, EXT_RECEIPTS]).every((e) => e.required === false && !!e.description)).toBe(true);
   });
 });
+
+describe("A2ACallOptions.meta", () => {
+  it("rides on the request frame, under the keys the call sets itself", async () => {
+    const { makeBus } = await import("./a2a-bus.js");
+    const bus = makeBus();
+    try {
+      const client = bus.agent();
+      const server = bus.agent();
+      server.a2a.serve(() => ({ messageId: "r1", role: "ROLE_AGENT", parts: [{ text: "ok" }] }));
+      await client.a2a.sendMessage(server.id, msg(), { meta: { a2a_bridge: { direction: "inbound" }, a2a: "ignored", engagement: "x" }, engagement: "eng-1" });
+      const req = bus.log.find((l) => l.env.type === "request" && l.env.to === server.id)!.env;
+      const meta = req.meta as Record<string, unknown>;
+      expect(meta.a2a_bridge).toEqual({ direction: "inbound" });
+      expect((meta.a2a as Record<string, string>)["A2A-Version"]).toBe("1.0");
+      expect(meta.engagement).toBe("eng-1");
+    } finally {
+      await bus.close();
+    }
+  });
+});

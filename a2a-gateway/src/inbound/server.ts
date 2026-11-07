@@ -843,7 +843,7 @@ async function handleRpc(
   const passMethod = bindingMethod(rpc.method);
   if (passMethod && servesBinding(manifest) && overA2AMetadata(sendParams?.message)?.knock === undefined) {
     const startedAt = Date.now();
-    const outcome = await passThroughBinding(res, id, passMethod, rpc.params, requester, manifest.id, serviceParamsFromHeaders(req.headers), json, manifest.offerings.map((o) => o.id), { callerKey });
+    const outcome = await passThroughBinding(res, id, passMethod, rpc.params, requester, manifest.id, serviceParamsFromHeaders(req.headers), json, manifest.offerings.map((o) => o.id), { callerKey, meta: bridge.attributionMeta(callerKey) });
     tapInbound(bridge, callerKey, { responder: manifest.id, offering: passMethod, outcome, startedAt });
     return;
   }
