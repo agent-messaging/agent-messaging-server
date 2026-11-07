@@ -170,3 +170,14 @@ describe("the activity tap on 0.4.0 frames", () => {
     expect(of(events, req.id).every((e) => e.trial === undefined)).toBe(true);
   });
 });
+
+describe("the offering a call naming none goes to (§12.1, 0.4.2-draft)", () => {
+  it("is the agent's default when it declares several and names one, else none", async () => {
+    const registry = memoryKv();
+    await registry.put(AGENT, JSON.stringify({ offerings: [{ id: "chat" }, { id: "help" }], default_offering: "chat" }));
+    await registry.put(CALLER, JSON.stringify({ offerings: [{ id: "chat" }, { id: "help" }], default_offering: "launch" }));
+    const dir = new OfferingDirectory(async () => registry);
+    expect(await dir.single(AGENT)).toBe("chat");
+    expect(await dir.single(CALLER)).toBeUndefined();
+  });
+});

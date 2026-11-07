@@ -1518,6 +1518,7 @@ export class AgentMesh {
         : undefined,
       default_input_modes: opts.default_input_modes,
       default_output_modes: opts.default_output_modes,
+      ...(opts.default_offering ? { default_offering: opts.default_offering } : {}),
       // §8.8: what this agent integrates with. Carried only when it says
       // something — an empty array would read as "declared none", which is not
       // the same as "did not say".
@@ -3755,6 +3756,7 @@ export class AgentMesh {
       streamSubject: (taskId) => Subjects.taskStream(taskId),
       serviceRequest: (subject, payload, timeoutMs) => this.serviceRequest(subject, payload, timeoutMs, { v: A2A_WIRE_VERSION }),
       offerings: () => (this.manifest?.offerings ?? []).map((o) => o.id),
+      defaultOffering: () => this.manifest?.default_offering,
     });
     // §14: a 0.4.0 SendMessage to an agent with only 0.3.0 handlers reaches
     // the handler for the offering it names, and comes back as a Message.
@@ -3900,7 +3902,8 @@ export class AgentMesh {
     const asksForWork = a2a?.method === "SendMessage" || a2a?.method === "SendStreamingMessage";
     // §12.1: the offering the Message names, or the agent's one offering.
     const declared = server.options.offerings ?? (this.manifest?.offerings ?? []).map((o) => o.id);
-    const routed = asksForWork && declared.length ? routeOffering(declared, call.message?.metadata) : null;
+    const defaultOffering = server.options.defaultOffering ?? this.manifest?.default_offering;
+    const routed = asksForWork && declared.length ? routeOffering(declared, call.message?.metadata, { default: defaultOffering }) : null;
     const offering = routed && "offering" in routed ? routed.offering : call.offering;
     const asRequest: RequestPayload = {
       offering: offering || (typeof a2a?.method === "string" ? a2a.method : ""),
@@ -3980,7 +3983,14 @@ export class AgentMesh {
     // memory only: never sent, never verified again; replies are built from
     // `env`, whose wire this view keeps.
     const gateEnv = { ...env, ...(call.budget ? { budget: call.budget } : {}), ...(call.contextId ? { context_id: call.contextId } : {}) } as Envelope;
-    const reqPayload = { offering, input: call.input, ...(call.trial ? { trial: true } : {}) } as RequestPayload;
+    // A trusted host's vouch for whom the trial is for (§12.8): the gate
+    // honours it only from a host this node trusts (trialRequesterOf).
+    const reqPayload = {
+      offering,
+      input: call.input,
+      ...(call.trial ? { trial: true } : {}),
+      ...(call.trial && call.trialRequester ? { trial_requester: call.trialRequester } : {}),
+    } as RequestPayload;
     let trialCtx: TrialContext | null = null;
     if (call.trial) {
       trialCtx = await this.trialAdmissionGate(msg, gateEnv, reqPayload, taskKey, guarded);

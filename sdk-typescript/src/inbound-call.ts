@@ -15,7 +15,8 @@ import type { Budget, Envelope } from "./types/envelope.js";
 import { audienceOf } from "./audience.js";
 import { receiptLevelOf, type ReceiptLevel } from "./receipt.js";
 import { A2A_WIRE_VERSION, readRequestPayload } from "./a2a/binding.js";
-import { budgetFromA2A, isForPerson, isTrialMessage } from "./a2a/extensions.js";
+import { budgetFromA2A, isForPerson, isTrialMessage, trialVouchOf } from "./a2a/extensions.js";
+import type { TrialRequesterVouch } from "./types/primitives.js";
 import { isValidBudgetBlock } from "./a2a/readings.js";
 import { EXT_BUDGET } from "./a2a/extensions.js";
 import type { Message } from "./a2a/types.js";
@@ -47,6 +48,10 @@ export interface InboundCall {
   /** The call asks for trial work (Common Agent §7.7): `payload.trial` on
    *  0.3.0, the trial extension on 0.4.0 (§12.8). */
   trial: boolean;
+  /** Whom a trial is for, as the call vouches (0.3.0 `trial_requester`, the
+   *  trial extension's `requester` on 0.4.0, in the 0.3.0 spelling). A claim:
+   *  the trial gate honours it only from a trusted host. */
+  trialRequester?: TrialRequesterVouch;
   /** Who the call is for (SPEC §5.7): `meta.audience`, and on 0.4.0 the
    *  audience extension too; the two disagreeing reads as the person. */
   audience: "agent" | "person";
@@ -107,13 +112,14 @@ export function inboundCallOf(env: Envelope): InboundCall {
       ...(budgetOk ? { budget: budgetFromA2A(rawBudget) } : {}),
       ...(rawBudget !== undefined && !budgetOk ? { budgetMalformed: true as const } : {}),
       trial: isTrialMessage(message),
+      ...(isTrialMessage(message) && trialVouchOf(message) ? { trialRequester: trialVouchOf(message) } : {}),
       audience: meta === "agent" && !isForPerson(message) ? "agent" : "person",
       receipt: receiptLevelOf(env.payload),
       ...(taskId ? { taskId } : {}),
       ...(str(message?.contextId) ? { contextId: message!.contextId } : {}),
     };
   }
-  const p = (env.payload && typeof env.payload === "object" ? env.payload : {}) as { offering?: unknown; skill?: unknown; input?: unknown; trial?: unknown };
+  const p = (env.payload && typeof env.payload === "object" ? env.payload : {}) as { offering?: unknown; skill?: unknown; input?: unknown; trial?: unknown; trial_requester?: TrialRequesterVouch };
   return {
     wire: "0.3.0",
     from: env.from,
@@ -122,6 +128,7 @@ export function inboundCallOf(env: Envelope): InboundCall {
     input: p.input,
     ...(env.budget !== undefined && env.budget !== null ? { budget: env.budget } : {}),
     trial: p.trial === true,
+    ...(p.trial === true && p.trial_requester && typeof p.trial_requester === "object" ? { trialRequester: p.trial_requester } : {}),
     audience: meta === "agent" ? "agent" : "person",
     receipt: receiptLevelOf(env.payload),
     ...(env.task_id ? { taskId: env.task_id } : {}),

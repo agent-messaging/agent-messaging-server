@@ -48,6 +48,31 @@ Also in this release: trial work, replies and receipt requests on the A2A
 binding (bindings/a2a.md 0.4.0-draft, §12.8 to §12.10), and envelope meta on
 an A2A call.
 
+From binding 0.4.2-draft:
+
+- **A default offering** (§12.1). An agent with several offerings may name
+  one as its default: `register({ default_offering })` (the manifest's
+  `default_offering`) or `a2a.serve(handler, { defaultOffering })`. A 0.4.0
+  Message naming no offering goes there, on the legacy path and through
+  `serve`; a named offering wins, and an undeclared one is still
+  `InvalidParamsError`. The card shows it in the offering extension's
+  `params` as `{"default": "<offering id>"}` (`cardExtensions(uris,
+  { defaultOffering })`, `cardDefaultOffering(card)`), and
+  `routeOffering(declared, metadata, { default })` routes by it.
+- **Whom a trial is for** (§12.8). `withTrial(message, requester)` puts
+  `{id, kind: "visitor"}` or `{id, kind: "account", signedIn, verified}` in
+  the trial extension. The trial gate honours it only from a trusted host
+  (`setTrials({ trustedHosts })`, as the 0.3.0 `trial_requester` vouch is)
+  and counts the trial against that requester; from anyone else it is
+  ignored and the sending agent is counted. A visitor is never signed in or
+  verified, and a malformed requester is no vouch (`isValidTrialRequester`,
+  `trialVouchOf`). `ctx.call.trialRequester` carries the claim on either
+  wire.
+- `trialReplyReceiptReading(message)` reads the trial, reply and receipt
+  extensions as `conformance/a2a-binding.json` pins them, and
+  `trialRefusalOf` reads a refusal only when its reason is one of Common
+  Agent §7.7's.
+
 - **Trial work** (`https://agentmessaging.ai/extensions/trial/v1`,
   `EXT_TRIAL`): `withTrial(message)` marks the Message that starts trial
   work, `isTrialMessage` and `isTrialTask` read it, `trialRefusedTask` ends a

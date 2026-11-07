@@ -118,13 +118,16 @@ export function isValidFailureObject(state: TaskState, o: unknown): boolean {
  * extension's value, or during the transition window the older keys
  * `agentmesh.offering` and `agentmesh.skill` (`added: true` says the
  * extension's key should be added with that value). One declared offering
- * serves a Message naming none; several, a name not declared, or the two keys
- * disagreeing, is the invalid-parameters error listing the offerings.
+ * serves a Message naming none, and so does `opts.default` when the agent
+ * declares several and names one of them as its default (0.4.2-draft); a
+ * named offering always wins. Several and no default, a name not declared,
+ * or the two keys disagreeing, is the invalid-parameters error listing the
+ * offerings.
  */
 export function routeOffering(
   declared: readonly string[],
   metadata: Record<string, unknown> | undefined,
-  opts: { window?: boolean } = {},
+  opts: { window?: boolean; default?: string } = {},
 ): { offering: string; added?: true } | { error: -32602; offerings: string[] } {
   const md = metadata ?? {};
   const ext = (md[EXT_OFFERING] as { offering?: unknown } | undefined)?.offering;
@@ -134,7 +137,11 @@ export function routeOffering(
   const refuse = { error: -32602 as const, offerings: [...declared] };
   if (named0 !== undefined && old !== undefined && named0 !== old) return refuse;
   const named = named0 ?? old;
-  if (named === undefined) return declared.length === 1 ? { offering: declared[0] } : refuse;
+  if (named === undefined) {
+    if (declared.length === 1) return { offering: declared[0] };
+    // §12.1 (0.4.2-draft): an agent with several may name a default.
+    return opts.default !== undefined && declared.includes(opts.default) ? { offering: opts.default } : refuse;
+  }
   if (!declared.includes(named)) return refuse;
   return named0 === undefined ? { offering: named, added: true } : { offering: named };
 }

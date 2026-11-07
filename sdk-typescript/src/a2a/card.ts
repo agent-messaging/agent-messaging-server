@@ -26,6 +26,12 @@ export function a2aBindingInterface(meshHome: string, agent: string): AgentInter
 
 const ASSUMED_MODES = ["application/json", "text/plain"];
 
+/** The manifest's default offering (§12.1), when it names one it declares. */
+export function defaultOfferingOf(manifest: Pick<Manifest, "offerings" | "default_offering">): string | undefined {
+  const d = manifest.default_offering;
+  return typeof d === "string" && (manifest.offerings ?? []).some((o) => o.id === d) ? d : undefined;
+}
+
 /**
  * The card for a manifest. `agent` is what the interface URL names: the
  * agent's handle when it has one, else its agent ID. `more` adds interfaces
@@ -46,7 +52,7 @@ export function a2aCardFromManifest(
       streaming: true,
       pushNotifications: false,
       extendedAgentCard: false,
-      extensions: cardExtensions(),
+      extensions: cardExtensions(undefined, { defaultOffering: defaultOfferingOf(manifest) }),
     },
     defaultInputModes: modes(manifest.default_input_modes),
     defaultOutputModes: modes(manifest.default_output_modes),

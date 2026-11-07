@@ -194,8 +194,11 @@ work now passes the node's trial gate, allowance, agreement and funds hold,
 admit hook and accept signal, on the legacy path and through `a2a.serve`,
 which 0.66.0 skipped; `ctx.call` gives the gates and a host one view of the
 call on either wire), the trial, reply and receipt helpers of binding
-0.4.0-draft §12.8 to §12.10, and `A2ACallOptions.meta`. The server and the
-gateway build against the SDK folder, so 0.5.1 carries the fix. Nothing is
+0.4.0-draft §12.8 to §12.10, binding 0.4.2-draft's default offering and
+trial requester (the activity tap and the task store route a call naming no
+offering to an agent's `default_offering` too), and `A2ACallOptions.meta`.
+The server and the gateway build against the SDK folder, so 0.5.1 carries
+the fix. `conformance/a2a-binding.json` is the 0.4.2-draft fixture. Nothing is
 published, tagged or released here.
 
 ### Left open

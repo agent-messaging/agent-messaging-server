@@ -124,6 +124,9 @@ export interface A2AServerHost {
   serviceRequest(subject: string, payload: unknown, timeoutMs: number): Promise<unknown>;
   /** The offerings this agent declares (§12.1), in its manifest. */
   offerings(): string[];
+  /** The offering a Message naming none goes to, when the agent declares
+   *  several and names a default (§12.1). */
+  defaultOffering?(): string | undefined;
 }
 
 /** One Task this agent runs, as its handle shows it to the handler. */
@@ -234,6 +237,9 @@ export interface A2AServeOptions {
   /** The offerings to resolve the offering extension against (§12.1).
    *  Default: the offerings the agent declares in its manifest. */
   offerings?: string[];
+  /** For an agent with several offerings, the one a Message naming none goes
+   *  to (§12.1). Default: the manifest's `default_offering`. */
+  defaultOffering?: string;
   /**
    * The admission decision for a message that asks for work, run after the
    * node's own gates (the trial gate, the EXT-8 allowance, the agreement and
@@ -449,7 +455,7 @@ export class A2AServerAgent {
     // with the invalid-parameters error listing them.
     // During the transition window the older keys are read too (routeOffering).
     if (declared.length === 0) return named;
-    const routed = routeOffering(declared, message.metadata);
+    const routed = routeOffering(declared, message.metadata, { default: this.opts.defaultOffering ?? this.host.defaultOffering?.() });
     if ("offering" in routed) return routed.offering;
     throw A2AErrors.invalidParams(
       named === undefined

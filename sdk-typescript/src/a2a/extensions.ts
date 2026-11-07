@@ -9,6 +9,7 @@
  */
 import type { Budget } from "../types/envelope.js";
 import type { AgentExtension, Message, Part, Task, TaskState } from "./types.js";
+import { TRIAL_REASONS } from "../trial.js";
 
 export const EXT_OFFERING = "https://agentmessaging.ai/extensions/offering/v1";
 export const EXT_BUDGET = "https://agentmessaging.ai/extensions/budget/v1";
@@ -41,9 +42,23 @@ const DESCRIPTIONS: Record<string, string> = {
 };
 
 /** The card's `capabilities.extensions` entries for the extensions given
- *  (all five by default), each `required: false` (§12). */
-export function cardExtensions(uris: readonly string[] = BINDING_EXTENSIONS): AgentExtension[] {
-  return uris.map((uri) => ({ uri, ...(DESCRIPTIONS[uri] ? { description: DESCRIPTIONS[uri] } : {}), required: false }));
+ *  (the binding's seven by default), each `required: false` (§12). With
+ *  `defaultOffering`, the offering extension's entry carries it in its
+ *  `params` as `{"default": "<offering id>"}` (§12.1, 0.4.2-draft). */
+export function cardExtensions(uris: readonly string[] = BINDING_EXTENSIONS, opts: { defaultOffering?: string } = {}): AgentExtension[] {
+  return uris.map((uri) => ({
+    uri,
+    ...(DESCRIPTIONS[uri] ? { description: DESCRIPTIONS[uri] } : {}),
+    required: false,
+    ...(uri === EXT_OFFERING && opts.defaultOffering ? { params: { default: opts.defaultOffering } } : {}),
+  }));
+}
+
+/** The default offering a card names in the offering extension's `params`
+ *  (§12.1), or undefined. */
+export function cardDefaultOffering(card: { capabilities?: { extensions?: AgentExtension[] } } | undefined): string | undefined {
+  const d = card?.capabilities?.extensions?.find((e) => e.uri === EXT_OFFERING)?.params?.default;
+  return typeof d === "string" && d ? d : undefined;
 }
 
 type WithMetadata = { metadata?: Record<string, unknown> };
@@ -355,10 +370,42 @@ export function artifactRefOf(part: Part): { ref: string; size: number; digest?:
 
 // ─── §12.8 Trial work ───────────────────────────────────────────────
 
+/** Whom a trial is for, as a host vouches for it (§12.8, 0.4.2-draft): a
+ *  visitor with no account, or an account holder. A node honours it only
+ *  from a host it trusts; a visitor is never signed in or verified. */
+export type A2ATrialRequester =
+  | { id: string; kind: "visitor" }
+  | { id: string; kind: "account"; signedIn: boolean; verified: boolean };
+
 /** The Message that starts trial work: `{"trial": true}` under the trial
- *  URI. A trial carries no budget (Common Agent §7.7). */
-export function withTrial(message: Message): Message {
-  return usesExtension(withExtensionData(message, EXT_TRIAL, { trial: true }), EXT_TRIAL);
+ *  URI, with `requester` when a host says whom it is for. A trial carries no
+ *  budget (Common Agent §7.7). */
+export function withTrial(message: Message, requester?: A2ATrialRequester): Message {
+  return usesExtension(withExtensionData(message, EXT_TRIAL, { trial: true, ...(requester ? { requester } : {}) }), EXT_TRIAL);
+}
+
+/** Is this a well-formed trial requester (§12.8)? An `id`, and `kind`
+ *  `visitor` with neither `signedIn` nor `verified`, or `account` with
+ *  each of them a boolean when present. */
+export function isValidTrialRequester(r: unknown): r is A2ATrialRequester {
+  if (!r || typeof r !== "object" || Array.isArray(r)) return false;
+  const o = r as Record<string, unknown>;
+  if (typeof o.id !== "string" || !o.id) return false;
+  if (o.kind === "visitor") return o.signedIn === undefined && o.verified === undefined;
+  if (o.kind !== "account") return false;
+  return (o.signedIn === undefined || typeof o.signedIn === "boolean") && (o.verified === undefined || typeof o.verified === "boolean");
+}
+
+/** The requester a trial Message names, in the 0.3.0 vouch's spelling the
+ *  node's trial gate reads (`trial_requester`), or undefined when it names
+ *  none or one that is not well formed. Whether it is honoured is the
+ *  gate's decision: only from a trusted host. */
+export function trialVouchOf(message: Message | undefined): { id: string; kind: "visitor" | "account"; signed_in: boolean; verified: boolean } | undefined {
+  const r = extensionData<{ requester?: unknown }>(message, EXT_TRIAL)?.requester;
+  if (!isValidTrialRequester(r)) return undefined;
+  return r.kind === "visitor"
+    ? { id: r.id, kind: "visitor", signed_in: false, verified: false }
+    : { id: r.id, kind: "account", signed_in: r.signedIn === true, verified: r.verified === true };
 }
 
 /** Does this Message ask for trial work (§12.8)? */
@@ -385,7 +432,35 @@ export function trialRefusedTask(task: Task, refusal: Omit<A2ATrialRefusal, "ref
 export function trialRefusalOf(task: Task | undefined): A2ATrialRefusal | undefined {
   if (task?.status?.state !== "TASK_STATE_REJECTED") return undefined;
   const d = extensionData<Record<string, unknown>>(task, EXT_TRIAL);
-  return d?.refusal === "TRIAL_REFUSED" && typeof d.reason === "string" ? (d as A2ATrialRefusal) : undefined;
+  return d?.refusal === "TRIAL_REFUSED" && typeof d.reason === "string" && (TRIAL_REASONS as readonly string[]).includes(d.reason) ? (d as A2ATrialRefusal) : undefined;
+}
+
+/**
+ * What a receiver reads from a Message's trial, reply and receipt
+ * extensions (§12.8 to §12.10), as conformance/a2a-binding.json
+ * `trial_reply_receipt` pins it: a trial is `trial: true` with no budget
+ * and, when present, a well-formed requester; a reply carries the
+ * conversation's `contextId` and `inReplyTo`; a receipt request names a
+ * level from the list. `ok: false` when any of them is malformed.
+ */
+export function trialReplyReceiptReading(message: { contextId?: string; metadata?: Record<string, unknown> }): { ok: boolean } {
+  const md = message.metadata ?? {};
+  const trial = md[EXT_TRIAL];
+  if (trial !== undefined) {
+    const t = trial as Record<string, unknown> | null;
+    if (!t || typeof t !== "object" || t.trial !== true) return { ok: false };
+    if (t.requester !== undefined && !isValidTrialRequester(t.requester)) return { ok: false };
+    if (md[EXT_BUDGET] !== undefined) return { ok: false };
+  }
+  const reply = md[EXT_REPLY];
+  if (reply !== undefined) {
+    const r = reply as Record<string, unknown> | null;
+    if (!r || typeof r !== "object" || typeof r.inReplyTo !== "string" || !r.inReplyTo) return { ok: false };
+    if (typeof message.contextId !== "string" || !message.contextId) return { ok: false };
+  }
+  const receipt = md[EXT_RECEIPTS];
+  if (receipt !== undefined && receiptRequestOf(message as Message) === null) return { ok: false };
+  return { ok: true };
 }
 
 /** Was this Task started as trial work: does the first Message from the

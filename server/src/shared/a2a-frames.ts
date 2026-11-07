@@ -151,7 +151,7 @@ export function isAccept(env: Envelope): boolean {
  * registry could not be read for, has no single offering: undefined.
  */
 export class OfferingDirectory {
-  private readonly cache = new Map<string, { at: number; ids: string[] | null }>();
+  private readonly cache = new Map<string, { at: number; ids: string[] | null; fallback?: string }>();
   private registry: KeyedStore | null = null;
 
   constructor(
@@ -165,14 +165,17 @@ export class OfferingDirectory {
     const hit = this.cache.get(agent);
     if (hit && Date.now() - hit.at < this.ttlMs) return hit.ids;
     let ids: string[] | null = null;
+    let fallback: string | undefined;
     try {
       const kv = (this.registry ??= await this.open());
       const entry = await kv.get(agent);
       if (entry && entry.operation !== "DEL" && entry.operation !== "PURGE" && entry.value?.length) {
-        const m = entry.json<{ offerings?: unknown }>();
+        const m = entry.json<{ offerings?: unknown; default_offering?: unknown }>();
         ids = (Array.isArray(m?.offerings) ? m.offerings : [])
           .map((o) => (o as { id?: unknown })?.id)
           .filter((id): id is string => typeof id === "string" && id !== "");
+        // §12.1 (0.4.2-draft): an agent with several may name a default.
+        if (typeof m.default_offering === "string" && ids.includes(m.default_offering)) fallback = m.default_offering;
       } else {
         ids = [];
       }
@@ -180,7 +183,7 @@ export class OfferingDirectory {
       this.registry = null;
       ids = null;
     }
-    this.cache.set(agent, { at: Date.now(), ids });
+    this.cache.set(agent, { at: Date.now(), ids, ...(fallback ? { fallback } : {}) });
     if (this.cache.size > this.max) {
       const oldest = this.cache.keys().next().value;
       if (oldest !== undefined) this.cache.delete(oldest);
@@ -188,10 +191,13 @@ export class OfferingDirectory {
     return ids;
   }
 
-  /** The agent's one declared offering, or undefined. */
+  /** The offering a call naming none goes to (§12.1): the agent's one
+   *  declared offering, or the default an agent with several names in its
+   *  manifest (`default_offering`), or undefined. */
   async single(agent: string): Promise<string | undefined> {
     const ids = await this.offerings(agent);
-    return ids && ids.length === 1 ? ids[0] : undefined;
+    if (ids && ids.length === 1) return ids[0];
+    return this.cache.get(agent)?.fallback;
   }
 }
 

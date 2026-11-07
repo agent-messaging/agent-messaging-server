@@ -38,6 +38,8 @@ import {
   readTaskSnapshots,
   routeOffering,
   wireRefusal,
+  trialRefusalOf,
+  trialReplyReceiptReading,
   type StreamDelivery,
   type Task,
 } from "../../src/a2a/index.js";
@@ -66,6 +68,7 @@ const KNOWN = new Set([
   "offering",
   "legacy_fields",
   "failure_reasons",
+  "trial_reply_receipt",
 ]);
 
 const verifies = (f: Envelope): boolean => {
@@ -157,7 +160,23 @@ describe("offering (§12.1)", () => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   for (const c of F.offering.cases as any[]) {
     it(c.name, () => {
-      expect(routeOffering(c.declared, c.metadata, { window: c.window })).toEqual(c.expect);
+      expect(routeOffering(c.declared, c.metadata, { window: c.window, ...(c.default ? { default: c.default } : {}) })).toEqual(c.expect);
+    });
+  }
+});
+
+describe("trial work, replies and receipts (§12.8 to §12.10)", () => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  for (const c of F.trial_reply_receipt.messages as any[]) {
+    it(c.name, () => {
+      expect(trialReplyReceiptReading({ ...(c.contextId ? { contextId: c.contextId } : {}), metadata: c.metadata })).toEqual(c.expect);
+    });
+  }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  for (const c of F.trial_reply_receipt.tasks as any[]) {
+    it(c.name, () => {
+      const task = { id: "t", contextId: "c", status: { state: c.state }, metadata: { [F.trial_reply_receipt.uris.trial]: c.value } } as Task;
+      expect({ ok: trialRefusalOf(task) !== undefined }).toEqual(c.expect);
     });
   }
 });
