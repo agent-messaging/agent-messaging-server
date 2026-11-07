@@ -38,6 +38,7 @@ import type { Envelope } from "../sdk.js";
 import { storageOf, type MessagingLike, type StorageLike, type StreamConsumer, type StreamFamily } from "../storage/index.js";
 import { decode } from "../sdk.js";
 import { AuditLog, sha256hex } from "./audit-log.js";
+import { activityView } from "../shared/a2a-frames.js";
 
 const DURABLE = "audit_witness";
 
@@ -155,7 +156,10 @@ export class WitnessFold {
    * delay to nak it back for later. Throws are the caller's poison path.
    */
   private judge(data: Uint8Array): number {
-    const env: Envelope = decode(data); // verifies the envelope signature
+    // Verifies the envelope signature. A 0.4.0 frame is read through the view
+    // of its A2A object the live tap uses (shared/a2a-frames.ts): its offering,
+    // its Task id, and its accept signal, which is no exchange.
+    const env: Envelope = activityView(decode(data));
     const t = Date.parse(env.ts ?? "");
     // No date means no hold window and no age bound - and a row we cannot
     // place in time adds nothing an audit could settle.

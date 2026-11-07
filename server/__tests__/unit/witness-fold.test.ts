@@ -21,9 +21,10 @@ const kp = nkeys.createUser();
 /** Signed envelope bytes with a chosen age. `ts` is set BEFORE sealing, so
  *  the signature covers the backdated claim the way a real sender's would. */
 function envelopeBytes(
-  over: { type?: "request" | "respond"; ageMs?: number; payload?: unknown; inReplyTo?: string } = {},
+  over: { type?: "request" | "respond"; ageMs?: number; payload?: unknown; inReplyTo?: string; v?: string } = {},
 ) {
   const env = createEnvelope({
+    ...(over.v ? { v: over.v } : {}),
     type: over.type ?? "request",
     from: kp.getPublicKey(),
     to: AGENT,
@@ -273,6 +274,20 @@ describe("the witness fold", () => {
     expect(accept.acked).toBe(true);
     expect(queuedAck.acked).toBe(true);
     expect(log.list([AGENT, kp.getPublicKey()], 10)).toHaveLength(0);
+  });
+
+  it("reads a 0.4.0 frame through its A2A object: the offering and Task id it names; its accept is no exchange", async () => {
+    const req = envelopeBytes({
+      v: "0.4.0",
+      ageMs: 20 * 60_000,
+      payload: { a2a: { method: "SendMessage", params: { message: { messageId: "m", role: "ROLE_USER", parts: [{ text: "go" }], taskId: "task-7", metadata: { "https://agentmessaging.ai/extensions/offering/v1": { offering: "quote" } } } } } },
+    });
+    const accept = fakeMsg(envelopeBytes({ v: "0.4.0", type: "respond", ageMs: 20 * 60_000, inReplyTo: "0198c000-0000-7000-8000-00000000c009", payload: { accepted: {} } }).bytes);
+    await drive({ [`MESH_INBOX_${AGENT}`]: [fakeMsg(req.bytes), accept] });
+    expect(accept.acked).toBe(true);
+    const served = log.list([AGENT], 10);
+    expect(served).toHaveLength(1);
+    expect(served[0]).toMatchObject({ request_id: req.id, skill: "quote", task_id: "task-7" });
   });
 
   it("a respond nobody chained witnesses its EXCHANGE - keyed by the request's id, direction read in reverse", async () => {

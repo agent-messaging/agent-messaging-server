@@ -321,3 +321,22 @@ describe("origin and cancel attribution on an A2A Task (SPEC.md §7.1, §10.8)",
     expect(on("mesh.event.task.canceled_by_settled")[0]).toMatchObject({ task_id: "s1", state: "canceled", requester: C, offering: "q" });
   });
 });
+
+describe("a read settles an unverified cancel attribution (§10.8)", () => {
+  it("GetTask through the responder's node asks the ledger to settle it", async () => {
+    const settled: string[] = [];
+    const origins = { settleCanceledBy: async (id: string) => { settled.push(id); return { outcome: "nothing" }; } } as never;
+    store = new A2ATaskStore(kv, { origins });
+    await kv.put("g1", JSON.stringify({
+      task: task("g1", "TASK_STATE_CANCELED"), requester: C, responder: S, engagement: null, seq: 1,
+      created_at: "2026-11-07T00:00:00Z", updated_at: "2026-11-07T00:01:00Z",
+      origin: { request_id: "r", requester: C, responder: S, offering: "", observed_at: "2026-11-07T00:00:00Z", bound_by: "answer" },
+      canceled_by: { party: "responder", at: "2026-11-07T00:01:00Z", unverified: true, unverified_reason: "settling" },
+    }));
+    const get = frame(clientKp, { type: "request", to: S, payload: { a2a: { method: "GetTask", params: { id: "g1" } } } });
+    const relay = signEnvelope(createEnvelope({ type: "request", from: S, payload: { frame: get } }), serverKp as never);
+    const resp = await store.handleGet(relay, {} as never, svcKp.getPublicKey());
+    expect(resp.error).toBeUndefined();
+    expect(settled).toEqual(["g1"]);
+  });
+});

@@ -423,6 +423,12 @@ export class A2ATaskStore {
     if (!frame || !id) return a2aError(notFound(), req, serviceId);
     const cur = await this.read(id);
     if (!cur || cur.record.responder !== req.from || cur.record.requester !== frame.from) return a2aError(notFound(id), req, serviceId);
+    // A read of the Task settles an unverified cancel attribution when the
+    // ledger now supports it (SPEC.md §10.8), as a 0.3.0 Task read does. The
+    // A2A Task is answered as it stands; the record is settled beside it.
+    if (cur.record.canceled_by?.unverified && cur.record.origin && this.deps.origins) {
+      void this.deps.origins.settleCanceledBy(id).catch(() => undefined);
+    }
     return createEnvelope({
       type: "respond",
       from: serviceId,
