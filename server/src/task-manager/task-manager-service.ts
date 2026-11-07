@@ -11,6 +11,8 @@ import { declaredNeedRefs, type DeclaredNeedsFn } from "./cancel.js";
 import { OriginLedger, CANCEL_SWEEP_INTERVAL_MS } from "./origin.js";
 import { OriginTap } from "./origin-tap.js";
 import { A2ATaskStore } from "./a2a-store.js";
+import { taskRecords } from "./task-records.js";
+import { OfferingDirectory } from "../shared/a2a-frames.js";
 import { A2AFollow, A2A_FOLLOW_SUBJECT } from "./a2a-follow.js";
 import { wire030Refused, wire030RefusalError } from "../shared/wire-window.js";
 import { createEnvelope, childSpan } from "../sdk.js";
@@ -52,6 +54,9 @@ export class TaskManagerService {
   private cancelSweep: ReturnType<typeof setInterval> | null = null;
 
   private kv: KeyedStore;
+  /** Both Task stores as one (task-records.ts): what the origin ledger reads
+   *  and writes, and what the cancel sweep walks. */
+  private records: KeyedStore;
   /** The registry's bucket, once it has opened (see `declaredNeeds`). */
   private registryKv: KeyedStore | null = null;
   /** Task origins (origin.ts): the requests this server observed routing and
@@ -74,11 +79,26 @@ export class TaskManagerService {
     a2aTasks?: KeyedLike,
   ) {
     this.kv = keyedOf(kv, js);
-    this.a2a = a2aTasks ? new A2ATaskStore(keyedOf(a2aTasks, js)) : null;
+    const a2aKv = a2aTasks ? keyedOf(a2aTasks, js) : null;
+    // The origin ledger attaches origins and settles cancel attributions on
+    // both kinds of Task record (task-records.ts).
+    this.records = a2aKv ? taskRecords(this.kv, a2aKv) : this.kv;
     this.origins = origins
-      ? new OriginLedger(keyedOf(origins, js), this.kv, {
+      ? new OriginLedger(keyedOf(origins, js), this.records, {
           onCanceledBySettled: (record) => publishCanceledBySettled(this.nc, this.kp, record),
           graceMs: settleGraceFromEnv(),
+        })
+      : null;
+    // An A2A Task gives the platform what a 0.3.0 Task gives it: its
+    // lifecycle events, receipts and meter events (a2a-outputs.ts).
+    this.a2a = a2aKv
+      ? new A2ATaskStore(a2aKv, {
+          nc: this.nc,
+          kp: this.kp,
+          declaredNeeds: this.declaredNeeds,
+          origins: this.origins ?? undefined,
+          records: this.records,
+          offerings: new OfferingDirectory(() => storageOf(this.js).keyed("mesh_registry")),
         })
       : null;
   }
@@ -265,7 +285,7 @@ export class TaskManagerService {
       void origins.checkGraceConfig();
       this.cancelSweep = setInterval(() => {
         origins
-          .sweepCanceledBy(async () => (await this.kv.list()).entries)
+          .sweepCanceledBy(async () => (await this.records.list()).entries)
           .catch((err) => console.error("[task-manager] canceled_by sweep failed:", err));
       }, CANCEL_SWEEP_INTERVAL_MS);
       this.cancelSweep.unref?.();

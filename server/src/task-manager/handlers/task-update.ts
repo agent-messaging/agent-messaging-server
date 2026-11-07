@@ -47,6 +47,8 @@ import {
 import { rewriteTask } from "../task-write.js";
 import { noteOriginMiss } from "../origin-tap.js";
 import type { TaskCanceledBy, TaskOrigin } from "../../sdk.js";
+import { isA2ARecord } from "../task-records.js";
+import { wire030State } from "../../shared/a2a-frames.js";
 
 /** The stored record, with every additive field family this service writes. */
 type TaskRecord = BudgetTask & TaskCancelFields & {
@@ -878,6 +880,11 @@ export async function handleTaskUpdate(
  */
 export function publishCanceledBySettled(nc: Messaging, serviceId: ServiceIdentity, record: Record<string, unknown>): void {
   const task = record as unknown as TaskRecord;
+  // An A2A Task's record (a2a-store.ts) keeps the Task beside these fields:
+  // its id and state are read from the Task, the state in the 0.3.0
+  // spelling the lifecycle events use (SPEC.md §6.8, §7.1).
+  const a2a = isA2ARecord(record) ? record.task : null;
+  const id = a2a ? a2a.id : task.id;
   const ev = createEnvelope({
     type: "emit",
     from: idOf(serviceId),
@@ -885,8 +892,8 @@ export function publishCanceledBySettled(nc: Messaging, serviceId: ServiceIdenti
       domain: "task",
       event_type: "canceled_by_settled",
       data: {
-        task_id: task.id,
-        state: task.state,
+        task_id: id,
+        state: a2a ? wire030State(a2a) : task.state,
         requester: task.requester,
         responder: task.responder,
         offering: task.offering,
@@ -897,12 +904,12 @@ export function publishCanceledBySettled(nc: Messaging, serviceId: ServiceIdenti
     },
   });
   nc.publish(Subjects.event("task.canceled_by_settled"), sealEnvelope(ev, serviceId));
-  console.log(`[task-manager] task ${task.id}: canceled_by settled`);
+  console.log(`[task-manager] task ${id}: canceled_by settled`);
 }
 
 /** An origin as the broadcast lifecycle event carries it: no request ids
  *  beyond the origin's own. */
-function broadcastOrigin(origin: TaskOrigin): TaskOrigin {
+export function broadcastOrigin(origin: TaskOrigin): TaskOrigin {
   const {
     contested_by: _c,
     contested_overflow: _o,
@@ -964,7 +971,7 @@ function createdLongBefore(createdAt: string | undefined, observedAt: string): b
  * which a refund consumer would read as the responder's own cancel. The
  * handler then retries it in the background.
  */
-async function canceledBy(
+export async function canceledBy(
   task: TaskRecord,
   env: Envelope,
   taskId: string,
