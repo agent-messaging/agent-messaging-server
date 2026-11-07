@@ -15,7 +15,8 @@ import { OriginLedger } from "../../src/task-manager/origin.js";
 import { OriginTap } from "../../src/task-manager/origin-tap.js";
 import { taskRecords } from "../../src/task-manager/task-records.js";
 import { adminViews } from "../../src/admin/admin-views.js";
-import { EXT_CANCEL, EXT_OFFERING } from "../../../sdk-typescript/src/a2a/extensions.js";
+import { OverdueSweep } from "../../src/task-manager/overdue-sweep.js";
+import { EXT_BUDGET, EXT_CANCEL, EXT_OFFERING } from "../../../sdk-typescript/src/a2a/extensions.js";
 
 type Kp = ReturnType<typeof nkeys.createUser>;
 const frame = (kp: Kp, p: Record<string, unknown>): Envelope => signEnvelope(createEnvelope({ v: "0.4.0", from: kp.getPublicKey(), ...p } as never), kp as never);
@@ -83,4 +84,53 @@ export async function a2aParityScenario(stores: { tasks: KeyedStore; a2a: KeyedS
   expect(one!.body).toMatchObject({ task_id: id, wire: "0.4.0", record: { offering: "quote", task: { status: { state: "TASK_STATE_CANCELED" } } } });
   const list = await views.handle({ method: "GET", path: "/admin/v1/a2a-tasks", query: new URLSearchParams(), body: null, caller: "t" } as never);
   expect((list!.body as { tasks: Array<{ task_id: string }> }).tasks.map((t) => t.task_id)).toContain(id);
+}
+
+/**
+ * Server 0.5.3's fields beside an A2A Task on a real store: the creating
+ * Message's parts (`inputs`), the problem reports of an input wait
+ * (`waiting_on`), the overdue mark the sweep writes, and an exhausted Task's
+ * cancel fields; each read back through the admin list.
+ */
+export async function a2aFollowupsScenario(stores: { a2a: KeyedStore; storage: Storage }): Promise<void> {
+  const client = nkeys.createUser();
+  const server = nkeys.createUser();
+  const svc = nkeys.createUser();
+  const C = client.getPublicKey();
+  const S = server.getPublicKey();
+  const id = `f-${Math.random().toString(36).slice(2)}`;
+  const nc = { publish() {} } as never;
+  const store = new A2ATaskStore(stores.a2a, { nc, kp: svc as never });
+  const problems = [{ input: "invoice", problem: "missing", description: "Attach the March invoice." }];
+
+  const req = frame(client, {
+    type: "request", to: S,
+    payload: { a2a: { method: "SendMessage", params: { message: { messageId: "m1", role: "ROLE_USER", parts: [{ text: "quote" }, { data: { qty: 3 } }], metadata: { [EXT_BUDGET]: { deadline: "2026-01-01T00:00:00Z", revision: 0 } } } } } },
+  });
+  await store.observe(`mesh.agent.${S}.inbox`, encode(req));
+  await store.observe(`mesh.task.${id}.update`, encode(frame(server, { type: "respond", to: C, in_reply_to: req.id, payload: { a2a: { result: { task: { id, contextId: "ctx", status: { state: "TASK_STATE_WORKING" } } }, seq: 0 } } })));
+  const update = (seq: number, status: Record<string, unknown>, metadata?: Record<string, unknown>) =>
+    store.observe(`mesh.task.${id}.update`, encode(frame(server, { type: "respond", to: C, payload: { a2a: { result: { statusUpdate: { taskId: id, contextId: "ctx", status, ...(metadata ? { metadata } : {}) } }, seq } } })));
+  await update(1, { state: "TASK_STATE_INPUT_REQUIRED", message: { messageId: "s", role: "ROLE_AGENT", parts: [{ data: { problems } }] } });
+
+  const sweep = new OverdueSweep(nc, {} as never, {} as never, svc as never, async () => new Map(), { store: stores.a2a });
+  expect(await sweep.sweep()).toContain(id);
+
+  let stored = (await stores.a2a.get(id))!.json<Record<string, unknown>>();
+  expect(stored).toMatchObject({
+    inputs: { message_id: "m1", parts: [{ text: "quote" }, { data: { qty: 3 } }] },
+    waiting_on: problems,
+    overdue: true,
+    task: { status: { state: "TASK_STATE_INPUT_REQUIRED" } },
+  });
+
+  await update(2, { state: "TASK_STATE_CANCELED" }, { [EXT_BUDGET]: { outcome: "exhausted" }, [EXT_CANCEL]: { reason: "policy" } });
+  stored = (await stores.a2a.get(id))!.json<Record<string, unknown>>();
+  expect(stored).toMatchObject({ cancel_reason: "policy", canceled_by: { party: "responder" }, overdue: true, inputs: { message_id: "m1" } });
+  expect(stored).not.toHaveProperty("waiting_on");
+
+  const views = adminViews({ storage: stores.storage });
+  const list = await views.handle({ method: "GET", path: "/admin/v1/a2a-tasks", query: new URLSearchParams(), body: null, caller: "t" } as never);
+  const row = (list!.body as { tasks: Array<{ task_id: string; record: Record<string, unknown> }> }).tasks.find((t) => t.task_id === id);
+  expect(row!.record).toMatchObject({ inputs: { message_id: "m1" }, cancel_reason: "policy", overdue: true });
 }

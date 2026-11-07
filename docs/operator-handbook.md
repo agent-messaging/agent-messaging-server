@@ -705,7 +705,13 @@ agents move to 0.4.0:
   attribution is computed by the task manager, never read from the agent.
 - **The record beside each Task**: the offering, whether it was trial work,
   the budget, the reported spend, the origin (the request the server saw
-  create it), who canceled it, the reasons and the attribution.
+  create it), who canceled it, the reasons and the attribution. From 0.5.3
+  also the parts of the message that created the Task (`inputs`, large parts
+  kept as their size and digest), the problem reports while the Task waits
+  for the client (`waiting_on`), and `overdue` once its deadline passed.
+- **Overdue A2A Tasks** (from 0.5.3). The overdue sweep marks an A2A Task past
+  its deadline, as it does a 0.3.0 Task, and sends the requester a notice on
+  the Task's update subject; the Task's state does not change.
 - **The admin API** lists A2A Tasks at `GET /admin/v1/a2a-tasks` (and one at
   `GET /admin/v1/a2a-tasks/<id>`), each with `wire: "0.4.0"` and the record
   beside the Task. `GET /admin/v1/tasks` still lists only 0.3.0 Tasks, as

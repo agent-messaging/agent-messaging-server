@@ -181,7 +181,10 @@ describe("cancellation", () => {
   it("exhausted: canceled with the exhausted outcome is announced as exhausted, with no canceled receipt", async () => {
     await start("x1");
     await status("x1", 1, "TASK_STATE_CANCELED", { [EXT_BUDGET]: { outcome: "exhausted" } });
-    expect(on("mesh.event.task.exhausted")).toEqual([{ task_id: "x1", state: "exhausted", requester: C, responder: S, offering: "" }]);
+    const [ev] = on("mesh.event.task.exhausted");
+    expect(ev).toMatchObject({ task_id: "x1", state: "exhausted", requester: C, responder: S, offering: "", canceled_by: { party: "responder" } });
+    // No reason was stated, and exhaustion is not one a party asked for.
+    expect(ev).not.toHaveProperty("cancel_reason");
     expect(on("mesh.event.task.canceled")).toEqual([]);
     expect(on("mesh.event.metering.task_canceled")).toEqual([]);
   });

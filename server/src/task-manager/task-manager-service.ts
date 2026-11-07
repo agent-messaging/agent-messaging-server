@@ -57,6 +57,8 @@ export class TaskManagerService {
   /** Both Task stores as one (task-records.ts): what the origin ledger reads
    *  and writes, and what the cancel sweep walks. */
   private records: KeyedStore;
+  /** The A2A Task store itself, which the overdue sweep walks too. */
+  private a2aKv: KeyedStore | null;
   /** The registry's bucket, once it has opened (see `declaredNeeds`). */
   private registryKv: KeyedStore | null = null;
   /** Task origins (origin.ts): the requests this server observed routing and
@@ -80,6 +82,7 @@ export class TaskManagerService {
   ) {
     this.kv = keyedOf(kv, js);
     const a2aKv = a2aTasks ? keyedOf(a2aTasks, js) : null;
+    this.a2aKv = a2aKv;
     // The origin ledger attaches origins and settles cancel attributions on
     // both kinds of Task record (task-records.ts).
     this.records = a2aKv ? taskRecords(this.kv, a2aKv) : this.kv;
@@ -275,7 +278,8 @@ export class TaskManagerService {
     // §7.7: the deadline half of the budget is the half the platform CAN
     // enforce without the responder's cooperation, because this service holds
     // Task state and the clock centrally.
-    this.overdueSweep = new OverdueSweep(this.nc, this.js, this.kv, this.kp);
+    // A2A Tasks too: the mark beside the Task, the state untouched.
+    this.overdueSweep = new OverdueSweep(this.nc, this.js, this.kv, this.kp, undefined, this.a2aKv ? { store: this.a2aKv } : undefined);
     this.overdueSweep.start();
 
     if (this.origins) {

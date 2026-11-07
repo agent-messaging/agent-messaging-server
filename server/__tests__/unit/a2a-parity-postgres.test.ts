@@ -10,7 +10,7 @@ import { pgSql, type Sql } from "../../src/storage/postgres/sql.js";
 import { PostgresState } from "../../src/storage/postgres/state.js";
 import type { Storage } from "../../src/storage/index.js";
 import { pgliteSql } from "./pglite-sql.js";
-import { a2aParityScenario } from "../helpers/a2a-parity-scenario.js";
+import { a2aFollowupsScenario, a2aParityScenario } from "../helpers/a2a-parity-scenario.js";
 
 let sql: Sql & { close(): Promise<void> };
 let state: PostgresState;
@@ -36,6 +36,13 @@ it("an A2A Task from request to cancel: origin, canceled_by, receipt and admin r
     tasks: state.keyed("mesh_tasks"),
     a2a: state.keyed("mesh_a2a_tasks"),
     origins: state.keyed("mesh_task_origins"),
+    storage: { keyed: async (name: string) => state.keyed(name as never) } as unknown as Storage,
+  });
+});
+
+it("an A2A Task's inputs, input wait, overdue mark and exhausted cancel fields on Postgres", async () => {
+  await a2aFollowupsScenario({
+    a2a: state.keyed("mesh_a2a_tasks"),
     storage: { keyed: async (name: string) => state.keyed(name as never) } as unknown as Storage,
   });
 });

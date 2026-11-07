@@ -10,7 +10,7 @@
 import { afterAll, beforeAll, it } from "vitest";
 import { startNatsServer, type TestServer } from "../helpers/nats-server.js";
 import { storageOf } from "../../src/storage/index.js";
-import { a2aParityScenario } from "../helpers/a2a-parity-scenario.js";
+import { a2aFollowupsScenario, a2aParityScenario } from "../helpers/a2a-parity-scenario.js";
 
 let server: TestServer | null = null;
 
@@ -31,4 +31,10 @@ it("an A2A Task from request to cancel: origin, canceled_by, receipt and admin r
     origins: await storage.keyed("mesh_task_origins"),
     storage,
   });
+});
+
+it("an A2A Task's inputs, input wait, overdue mark and exhausted cancel fields on JetStream", async (ctx) => {
+  if (!server) return ctx.skip();
+  const storage = storageOf(server.nc.jetstream());
+  await a2aFollowupsScenario({ a2a: await storage.keyed("mesh_a2a_tasks"), storage });
 });

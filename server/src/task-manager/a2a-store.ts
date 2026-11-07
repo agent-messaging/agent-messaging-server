@@ -29,7 +29,12 @@
  * the client is the agent that created the Task. Anyone else gets
  * TaskNotFoundError, so a Task's existence is not disclosed (§10). An agent a
  * creator delegated to (SPEC.md §4.11) signs as that creator, so it passes the
- * same test.
+ * same test. The responder may also read its own Task with no client frame,
+ * which is how a node that restarted takes up a Task it had handed back.
+ *
+ * Beside the Task the record also keeps the creating Message's parts
+ * (`inputs`), and while the Task waits on the client the problem reports of
+ * that wait (`waiting_on`), as a2a-outputs.ts says.
  */
 import type { BusMessage, KeyedStore } from "../storage/index.js";
 import type { Envelope } from "../sdk.js";
@@ -56,7 +61,18 @@ import {
 } from "../../../sdk-typescript/src/a2a/index.js";
 import { a2aRequestFacts, wire030State, type OfferingDirectory } from "../shared/a2a-frames.js";
 import { spendFromPayload, type Budget } from "./budget.js";
-import { applyStateFields, flagStrandedA2A, MAX_FRAMES, publishStateOutputs, stopObjectRefusal, type A2AOutputDeps, type A2APlatformFields } from "./a2a-outputs.js";
+import {
+  applyStateFields,
+  applyWaitingOn,
+  flagStrandedA2A,
+  inputsOf,
+  MAX_FRAMES,
+  publishStateOutputs,
+  stopObjectRefusal,
+  type A2AInputs,
+  type A2AOutputDeps,
+  type A2APlatformFields,
+} from "./a2a-outputs.js";
 import { attachOrigin, partiesMatch, ORIGIN_SKEW_MS } from "./origin.js";
 import { noteOriginMiss } from "./origin-tap.js";
 
@@ -86,6 +102,8 @@ interface SeenRequest {
   offering?: string;
   trial?: boolean;
   budget?: Budget;
+  /** The Message's parts, as the record keeps them (a2a-outputs.ts). */
+  inputs?: A2AInputs;
 }
 
 /** A CancelTask this instance saw delivered: who sent it to whom, and the
@@ -199,6 +217,9 @@ export class A2ATaskStore {
         return;
       }
       const budget = budgetOfMessage(facts?.message);
+      // A Message that continues a Task did not create one, so its parts
+      // are not the Task's inputs.
+      const inputs = facts?.message && !facts.taskId ? inputsOf(facts.message) : undefined;
       this.remember(env.id, {
         from: env.from,
         to: env.to,
@@ -206,14 +227,22 @@ export class A2ATaskStore {
         ...(facts?.offering ? { offering: facts.offering } : {}),
         ...(facts?.trial ? { trial: true } : {}),
         ...(budget ? { budget } : {}),
+        ...(inputs ? { inputs } : {}),
       });
       // A Message continuing a Task with a higher budget revision revises
       // the budget the receipts carry (§7.7, §12.2).
       if (facts?.taskId && budget) await this.reviseBudget(facts.taskId, env, budget);
       return;
     }
-    if (env.type !== "respond" || env.error) return;
-    const answer = readRespondPayload(env);
+    if (env.type !== "respond") return;
+    const answer = env.error ? null : readRespondPayload(env);
+    // A request answered at the client's inbox with an error or a Message
+    // made no Task: what was remembered of it is let go.
+    if (subject.endsWith(".inbox") && typeof env.in_reply_to === "string" && (env.error || (answer && (answer.result as StreamResponse)?.message && !(answer.result as StreamResponse).task))) {
+      const asked = this.seen.get(env.in_reply_to);
+      if (asked && asked.to === env.from) this.seen.delete(env.in_reply_to);
+      return;
+    }
     if (!answer) return;
     const ev = answer.result as StreamResponse;
     if (!ev || typeof ev !== "object") return;
@@ -313,6 +342,7 @@ export class A2ATaskStore {
           offering,
           ...(asked?.trial || isTrialTask(ev.task) ? { trial: true } : {}),
           ...(asked?.budget ? { budget: asked.budget } : {}),
+          ...(asked?.inputs ? { inputs: asked.inputs } : {}),
         };
         announce = wire030State(ev.task);
       } else {
@@ -343,6 +373,8 @@ export class A2ATaskStore {
       next.frames = [...(next.frames ?? []), env].slice(-MAX_FRAMES);
       const found = await this.originFor(next, taskId);
       if (found) next.origin = found;
+      // The problem reports of an input wait, while it lasts.
+      applyWaitingOn(next, prevState);
       // What the Task's new state brings: written once, when it is entered.
       if (announce !== null && announce !== prevState) {
         await applyStateFields(next, announce, env, taskId, this.deps, this.cancels.get(taskId)?.cancel);
@@ -386,7 +418,7 @@ export class A2ATaskStore {
     if (state === null) return;
     publishStateOutputs(record, state, env, this.deps);
     if (state === prevState) return;
-    if (state === "canceled" && record.canceled_by?.unverified && origins) origins.settleCanceledByLater(taskId);
+    if ((state === "canceled" || state === "exhausted") && record.canceled_by?.unverified && origins) origins.settleCanceledByLater(taskId);
     if (state === "canceled") {
       await flagStrandedA2A(record, this.kv, this.deps).catch((err) => console.error(`[task-manager] stranded-delegate check failed for A2A task ${taskId}:`, err));
     }
@@ -412,8 +444,26 @@ export class A2ATaskStore {
   }
 
   /** `mesh.task.a2a.get`: one Task, for its creator, through its responder's
-   *  node. Answers `{task, seq, requester}`. */
+   *  node, or for the responder itself when it sends only the Task's `id`.
+   *  Answers `{task, seq, requester}`. */
   async handleGet(req: Envelope, _msg: BusMessage, serviceId: string): Promise<Envelope> {
+    // The server agent reading its own Task (SPEC.md §7.1: the server agent
+    // may read it), with no client frame: a node that restarted rebuilds the
+    // handle of a Task it had handed back (the SDK's `a2a.taskHandle`).
+    // Answered only to the Task's recorded responder, else not found.
+    const own = req.payload as { frame?: unknown; id?: unknown } | undefined;
+    if (own && own.frame === undefined && typeof own.id === "string" && own.id) {
+      const cur = await this.read(own.id);
+      if (!cur || cur.record.responder !== req.from) return a2aError(notFound(own.id), req, serviceId);
+      return createEnvelope({
+        type: "respond",
+        from: serviceId,
+        to: req.from,
+        in_reply_to: req.id,
+        trace: childSpan(req.trace),
+        payload: { task: cur.record.task, seq: cur.record.seq, requester: cur.record.requester },
+      });
+    }
     const frame = this.relayedFrame(req);
     if (frame && forbiddenFieldsRefusal(frame)) return a2aError(new A2AError("InvalidRequestError", "The relayed frame carries task_id, context_id or artifacts."), req, serviceId);
     const params = (frame?.payload as { a2a?: { params?: { id?: unknown; historyLength?: unknown } } } | undefined)?.a2a?.params;
