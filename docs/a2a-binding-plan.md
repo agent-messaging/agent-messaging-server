@@ -189,8 +189,13 @@ is read from changes.
 ### Release
 
 Server and gateway 0.5.1 (additive: nothing a deployment acts on), with SDK
-0.67.0 and its CHANGELOG entry (the trial, reply and receipt helpers of
-binding 0.4.0-draft §12.8 to §12.10, and `A2ACallOptions.meta`). Nothing is
+0.67.0 and its CHANGELOG entry: a security fix (a 0.4.0 call that asks for
+work now passes the node's trial gate, allowance, agreement and funds hold,
+admit hook and accept signal, on the legacy path and through `a2a.serve`,
+which 0.66.0 skipped; `ctx.call` gives the gates and a host one view of the
+call on either wire), the trial, reply and receipt helpers of binding
+0.4.0-draft §12.8 to §12.10, and `A2ACallOptions.meta`. The server and the
+gateway build against the SDK folder, so 0.5.1 carries the fix. Nothing is
 published, tagged or released here.
 
 ### Left open
