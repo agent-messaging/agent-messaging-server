@@ -13,7 +13,8 @@
 import type { ServerResponse } from "node:http";
 import type { AgentMesh } from "../../../sdk-typescript/src/mesh.js";
 import type { Manifest } from "../../../sdk-typescript/src/types/manifest.js";
-import { MeshError } from "../../../sdk-typescript/src/types/errors.js";
+import { MeshError, ErrorCode } from "../../../sdk-typescript/src/types/errors.js";
+import { HeldTasks, heldTasks } from "./binding-held.js";
 import { A2A_BINDING_URI, isA2AMethod } from "../../../sdk-typescript/src/a2a/binding.js";
 import { A2AError } from "../../../sdk-typescript/src/a2a/errors.js";
 import { EXT_OFFERING } from "../../../sdk-typescript/src/a2a/extensions.js";
@@ -87,10 +88,31 @@ export function bindingErrorToRpc(id: JsonRpcRequest["id"], err: unknown): { sta
   return { status: 200, body: rpcError(id, -32603, err instanceof Error ? err.message : String(err)) };
 }
 
+/** Write one Server-Sent Event stream of a single A2A event, and end it. */
+function oneEventStream(res: ServerResponse, id: JsonRpcRequest["id"], ev: unknown): void {
+  res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+  res.write(`data: ${JSON.stringify(rpcResult(id, ev))}\n\n`);
+  res.end();
+}
+
+/** The request id and acknowledgement a REQUEST_QUEUED error carries, or
+ *  null for any other error. */
+function queuedOf(err: unknown): { requestId: string; delivered: boolean; paused: boolean } | null {
+  if (!(err instanceof MeshError) || err.code !== ErrorCode.REQUEST_QUEUED) return null;
+  const d = (err.details ?? {}) as { request_id?: unknown; delivered?: unknown; paused?: unknown };
+  if (typeof d.request_id !== "string" || !d.request_id) return null;
+  return { requestId: d.request_id, delivered: d.delivered === true, paused: d.paused === true };
+}
+
 /**
  * One A2A operation for a binding agent. A streaming operation answers with
  * Server-Sent Events, each the JSON-RPC result of one stream event, ending
  * when the stream does; every other operation answers with its one result.
+ *
+ * The channel's queued acknowledgement is answered with a Task the bridge
+ * holds itself (MAPPING.md §4.3, binding-held.ts), and the operations on a
+ * held Task are answered from it, or, once the agent answered with a Task of
+ * its own, passed through under the agent's Task id.
  */
 export async function passThroughBinding(
   res: ServerResponse,
@@ -103,9 +125,17 @@ export async function passThroughBinding(
   write: (res: ServerResponse, status: number, body: unknown) => void,
   /** The offerings the agent declares, for the older offering keys (§4.5). */
   declared: readonly string[] = [],
+  /** The caller, and the Tasks the bridge holds (§4.3). */
+  ctx: { callerKey: string; held?: HeldTasks } = { callerKey: "" },
 ): Promise<"ok" | "error"> {
-  const opts = { serviceParams, timeoutMs: 60_000 };
-  if (method === "SendMessage" || method === "SendStreamingMessage") {
+  const held = ctx.held ?? heldTasks;
+  const sending = method === "SendMessage" || method === "SendStreamingMessage";
+  const opts = {
+    serviceParams,
+    timeoutMs: 60_000,
+    ...(sending ? { onLateAnswer: (answer: Parameters<HeldTasks["settle"]>[1], requestId: string) => held.settle(requestId, answer) } : {}),
+  };
+  if (sending) {
     const fixed = withOfferingKey(params, declared);
     if ("error" in fixed) {
       write(res, 200, rpcError(id, -32602, "The offering keys disagree, or name no offering this agent declares.", { offerings: fixed.offerings }));
@@ -113,6 +143,38 @@ export async function passThroughBinding(
     }
     params = fixed.params;
   }
+
+  // An operation on a Task the bridge holds (§4.3).
+  if (method === "GetTask" || method === "SubscribeToTask" || method === "CancelTask") {
+    const h = held.get((params as { id?: unknown } | undefined)?.id, ctx.callerKey);
+    if (h?.agentTaskId) {
+      // The agent answered with a Task: the held id stands for it.
+      params = { ...(params as object), id: h.agentTaskId };
+    } else if (h) {
+      try {
+        if (method === "GetTask") write(res, 200, rpcResult(id, h.task));
+        else if (method === "SubscribeToTask") oneEventStream(res, id, { task: h.task });
+        else write(res, 200, rpcResult(id, held.cancel(h.task.id, ctx.callerKey)));
+        return "ok";
+      } catch (err) {
+        const mapped = bindingErrorToRpc(id, err);
+        write(res, mapped.status, mapped.body);
+        return "error";
+      }
+    }
+  }
+
+  const holdFor = (q: { requestId: string; delivered: boolean; paused: boolean }) =>
+    held.hold(q.requestId, {
+      callerKey: ctx.callerKey,
+      responder: agentId,
+      delivered: q.delivered,
+      paused: q.paused,
+      ...(typeof (params as { message?: { contextId?: unknown } })?.message?.contextId === "string"
+        ? { contextId: (params as { message: { contextId: string } }).message.contextId }
+        : {}),
+    });
+
   if (method === "SendStreamingMessage" || method === "SubscribeToTask") {
     const stream =
       method === "SendStreamingMessage"
@@ -130,6 +192,12 @@ export async function passThroughBinding(
       if (started) res.end();
       return "ok";
     } catch (err) {
+      const q = !started && method === "SendStreamingMessage" ? queuedOf(err) : null;
+      if (q) {
+        // One event, the held Task; the answer lands on it (§4.3).
+        oneEventStream(res, id, { task: holdFor(q) });
+        return "ok";
+      }
       const mapped = bindingErrorToRpc(id, err);
       if (!started) write(res, mapped.status, mapped.body);
       else {
@@ -144,6 +212,11 @@ export async function passThroughBinding(
     write(res, 200, rpcResult(id, result));
     return "ok";
   } catch (err) {
+    const q = method === "SendMessage" ? queuedOf(err) : null;
+    if (q) {
+      write(res, 200, rpcResult(id, { task: holdFor(q) }));
+      return "ok";
+    }
     const mapped = bindingErrorToRpc(id, err);
     write(res, mapped.status, mapped.body);
     return "error";

@@ -63,7 +63,7 @@ export interface A2AClientHost {
   open(env: Envelope): Envelope;
   /** Send a request frame to the agent's inbox and wait for its first answer
    *  (the channel's accept signal does not count). */
-  call(agentId: string, env: Envelope, timeoutMs: number): Promise<Envelope>;
+  call(agentId: string, env: Envelope, timeoutMs: number, opts?: { onLate?: (env: Envelope) => void }): Promise<Envelope>;
   /** Watch a subject for signed frames (each verified before it is passed on). */
   subscribe(subject: string, onFrame: (env: Envelope) => void): { unsubscribe(): void };
   /** The subject of a Task's stream. */
@@ -92,6 +92,14 @@ export interface A2ACallOptions {
   /** Seal the payload to the server agent's published encryption key (§8a,
    *  EXT-7); its answers come back sealed to this agent's key. */
   seal?: boolean;
+  /**
+   * When the agent's node queues the request for later (a queued
+   * acknowledgement, SPEC.md §6.4a), the call rejects with REQUEST_QUEUED
+   * (its details name `request_id`, `inbox_id`, `delivered`, `paused`).
+   * The A2A answer that arrives later, naming that request, is handed here:
+   * the result, or the A2AError or MeshError it carried. Kept for a day.
+   */
+  onLateAnswer?: (answer: { result: unknown } | { error: A2AError | MeshError }, requestId: string) => void;
 }
 
 export interface A2AStreamOptions extends A2ACallOptions {
@@ -136,7 +144,19 @@ export class A2AClient {
     opts: A2ACallOptions = {},
   ): Promise<A2AOperations[M]["result"]> {
     const env = this.frameFor(agentId, method, params, opts);
-    const resp = this.host.open(await this.host.call(agentId, env, opts.timeoutMs ?? 30_000));
+    const onLateAnswer = opts.onLateAnswer;
+    const onLate = onLateAnswer
+      ? (late: Envelope) => {
+          const opened = this.host.open(late);
+          if (opened.error) {
+            onLateAnswer({ error: A2AError.fromErrorObject(opened.error) ?? MeshError.fromErrorObject(opened.error) }, env.id);
+            return;
+          }
+          const r = readRespondPayload(opened);
+          if (r) onLateAnswer({ result: r.result }, env.id);
+        }
+      : undefined;
+    const resp = this.host.open(await this.host.call(agentId, env, opts.timeoutMs ?? 30_000, onLate ? { onLate } : undefined));
     if (resp.error) raise(resp);
     const r = readRespondPayload(resp);
     if (!r) throw A2AErrors.invalidAgentResponse(`The answer to ${method} carried no payload.a2a.result.`);
@@ -212,12 +232,23 @@ export class A2AClient {
     const iterate = async function* (): AsyncGenerator<StreamResponse> {
       const env = self.frameFor(agentId, method, params, opts);
       state.streamId = env.id;
+      const onLateAnswer = opts.onLateAnswer;
+      const onLate = onLateAnswer
+        ? (late: Envelope) => {
+            const opened = self.host.open(late);
+            if (opened.error) onLateAnswer({ error: A2AError.fromErrorObject(opened.error) ?? MeshError.fromErrorObject(opened.error) }, env.id);
+            else {
+              const r = readRespondPayload(opened);
+              if (r) onLateAnswer({ result: r.result }, env.id);
+            }
+          }
+        : undefined;
       // SubscribeToTask names its Task, so the stream subject is listened to
       // before the request leaves and no event can come first.
       const known = method === "SubscribeToTask" ? (params as { id?: string }).id : undefined;
       const listener = known && isSubjectToken(known) ? await self.listen(agentId, known, env) : null;
       try {
-        const first = self.host.open(await self.host.call(agentId, env, opts.timeoutMs ?? 30_000));
+        const first = self.host.open(await self.host.call(agentId, env, opts.timeoutMs ?? 30_000, onLate ? { onLate } : undefined));
         if (first.error) raise(first);
         const r = readRespondPayload(first);
         if (!r) throw A2AErrors.invalidAgentResponse(`The answer to ${method} carried no payload.a2a.result.`);

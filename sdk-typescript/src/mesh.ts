@@ -2245,6 +2245,7 @@ export class AgentMesh {
           // The mesh's answer for a paused agent (§4.12) says so, with the
           // reason a stop carries everywhere else (`agent_paused`).
           ...(c.paused === true ? { paused: true as const } : {}),
+          ...(c.delivered === true ? { delivered: true as const } : {}),
           ...(typeof c.code === "string" ? { reason: c.code } : {}),
         };
       }
@@ -2273,6 +2274,7 @@ export class AgentMesh {
           request_id: request.id,
           ...(ack.text !== undefined ? { text: ack.text } : {}),
           ...(ack.paused ? { paused: true, reason: ack.reason ?? "agent_paused" } : {}),
+          ...(ack.delivered ? { delivered: true } : {}),
         },
       },
     );
@@ -2325,7 +2327,14 @@ export class AgentMesh {
     bytes: Uint8Array,
     agentId: string,
     timeout: number,
-    hooks: { onAccept?: (env: Envelope) => void; onQueued?: (ack: QueuedAck, env: Envelope) => void },
+    hooks: {
+      onAccept?: (env: Envelope) => void;
+      onQueued?: (ack: QueuedAck, env: Envelope) => void;
+      /** The answer that arrives after a queued acknowledgement (§6.4a), at
+       *  this agent's inbox, from the agent the request went to, naming the
+       *  request in `in_reply_to`. Kept for a day. */
+      onLate?: (env: Envelope) => void;
+    },
   ): Promise<Envelope> {
     const conn = this.conn as ConnectionManager & {
       requestMulti?: ConnectionManager["requestMulti"];
@@ -2396,7 +2405,9 @@ export class AgentMesh {
             } catch {
               /* the hook's problem */
             }
-            settle(() => reject(this.queuedError(ack, envelope)));
+            if (hooks.onLate) this.keepLate(envelope.id, agentId, hooks.onLate);
+            if (hooks.onLate) this.keepLate(envelope.id, agentId, hooks.onLate);
+        settle(() => reject(this.queuedError(ack, envelope)));
             return;
           }
           settle(() => resolve(env));
@@ -3608,6 +3619,37 @@ export class AgentMesh {
 
   // ─── A2A over Agent Messaging (bindings/a2a.md) ────────────────────
 
+  /** Answers still awaited after a queued acknowledgement, by request id. */
+  private readonly lateAnswers = new Map<string, { agentId: string; at: number; onLate: (env: Envelope) => void }>();
+
+  private keepLate(requestId: string, agentId: string, onLate: (env: Envelope) => void): void {
+    const now = Date.now();
+    for (const [k, v] of this.lateAnswers) if (now - v.at > 24 * 3600_000) this.lateAnswers.delete(k);
+    if (this.lateAnswers.size >= 10_000) {
+      const first = this.lateAnswers.keys().next().value;
+      if (first !== undefined) this.lateAnswers.delete(first);
+    }
+    this.lateAnswers.set(requestId, { agentId, at: now, onLate });
+  }
+
+  /** A respond that names a request whose wait ended in a queued
+   *  acknowledgement: from the agent it went to, it is the late answer (an
+   *  accept or another acknowledgement is not). */
+  private deliverLate(env: Envelope): void {
+    const id = env.in_reply_to;
+    const late = typeof id === "string" ? this.lateAnswers.get(id) : undefined;
+    if (!late || env.from !== late.agentId) return;
+    if (this.queuedAckOf(env)) return;
+    if (!env.error && ((env.payload as RespondPayload | undefined)?.status === "accepted" || (isA2AFrame(env) && isAcceptSignal(env)))) return;
+    if (!this.rememberInboxId(env.from, env.id)) return; // §22.2
+    this.lateAnswers.delete(id as string);
+    try {
+      late.onLate(env);
+    } catch {
+      /* the hook's problem */
+    }
+  }
+
   /** Streams this agent reads that the mesh delivers to its inbox, by
    *  streamId (A2A binding §8). */
   private readonly a2aStreamListeners = new Map<string, (env: Envelope) => void>();
@@ -3645,13 +3687,13 @@ export class AgentMesh {
               meta: p.meta,
             }),
           open: (env) => this.openA2AFrame(env),
-          call: async (agentId, env, timeoutMs) => {
+          call: async (agentId, env, timeoutMs, callOpts) => {
             if (this.namingGate) await this.namingGate.require();
             // Whoever this agent writes to may answer it (admission.ts).
             this.admissionGate?.noteAddressed(agentId);
             const bytes = encode(env);
             preflightEnvelopeSize(bytes.length, this.conn.maxPayload);
-            return this.awaitAgentReply(this.resolvedInbox(agentId), env, bytes, agentId, timeoutMs, {});
+            return this.awaitAgentReply(this.resolvedInbox(agentId), env, bytes, agentId, timeoutMs, callOpts?.onLate ? { onLate: callOpts.onLate } : {});
           },
           subscribe: (subject, onFrame) => {
             const sub = this.conn.subscribe(subject, (m: Msg) => {
@@ -6881,7 +6923,10 @@ export class AgentMesh {
       typeof env.in_reply_to === "string"
         ? this.pendingAgentReplies.get(env.in_reply_to)
         : undefined;
-    if (!pending) return;
+    if (!pending) {
+      this.deliverLate(env);
+      return;
+    }
     try {
       this.bindResponse(env, pending.request, { agent: pending.agentId });
     } catch {

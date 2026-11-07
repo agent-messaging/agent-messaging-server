@@ -97,6 +97,7 @@ import type { Budget } from "../../../sdk-typescript/src/types/envelope.js";
 import { handleHttpsFront, handleMcp, protectedResourceMetadata } from "./fronts.js";
 import { presentedCredential, ProofRefused } from "./proofs.js";
 import { bindingMethod, passThroughBinding, serviceParamsFromHeaders, servesBinding } from "./binding-pass.js";
+import { A2A_BINDING_URI as A2A_BINDING_URI_FOR_CARDS } from "../../../sdk-typescript/src/a2a/binding.js";
 
 const BODY_LIMIT = 1024 * 1024; // 1 MB
 const SUPPORTED_A2A_VERSIONS = new Set(["1.0", "0.3"]);
@@ -345,6 +346,8 @@ async function handle(
         anonymous: bridge.anonymousAllowed,
       },
       bridge.config.meshHome ?? bridge.config.coreUrl,
+      // The handle, when the mesh home's card names one (bridge.ts).
+      (manifest.capabilities ?? []).includes(A2A_BINDING_URI_FOR_CARDS) ? await bridge.bindingInterfaceUrl(manifest.id) : undefined,
     );
     // Generated from the agent's Descriptor where it published one (EXT-14
     // §10): the Descriptor is the one description, the card a projection.
@@ -840,7 +843,7 @@ async function handleRpc(
   const passMethod = bindingMethod(rpc.method);
   if (passMethod && servesBinding(manifest) && overA2AMetadata(sendParams?.message)?.knock === undefined) {
     const startedAt = Date.now();
-    const outcome = await passThroughBinding(res, id, passMethod, rpc.params, requester, manifest.id, serviceParamsFromHeaders(req.headers), json, manifest.offerings.map((o) => o.id));
+    const outcome = await passThroughBinding(res, id, passMethod, rpc.params, requester, manifest.id, serviceParamsFromHeaders(req.headers), json, manifest.offerings.map((o) => o.id), { callerKey });
     tapInbound(bridge, callerKey, { responder: manifest.id, offering: passMethod, outcome, startedAt });
     return;
   }

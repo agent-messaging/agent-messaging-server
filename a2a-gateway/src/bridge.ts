@@ -5,6 +5,7 @@
  * the bridge-local task store.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
+import { A2A_BINDING_URI } from "../../sdk-typescript/src/a2a/binding.js";
 import { randomUUID } from "node:crypto";
 import { createUser, fromSeed } from "nkeys.js";
 import { MeshNode } from "../../sdk-typescript/src/node.js";
@@ -358,6 +359,40 @@ export class Bridge {
   /** Fetch (with a short cache) the manifest of a mesh agent, applying the
    *  exposure policy: public, non-sandbox agents only. Returns null when the
    *  agent must not be exposed (indistinguishable from not existing). */
+  /** The binding interface URL the mesh home's own card names, by agent. */
+  private bindingUrls = new Map<string, { url: string | null; at: number }>();
+
+  /**
+   * The A2A binding's interface URL for an agent, as the mesh home's own card
+   * names it (`<mesh home>/agents/<handle or id>/agent-card.json`, served by
+   * the server's mesh API). The mesh home uses the agent's handle only when
+   * the naming service confirms it both ways, so the gateway takes the URL
+   * from there rather than resolving names itself. Undefined when the mesh
+   * home is not configured, does not answer, or names no binding interface;
+   * the generated card then names the agent ID. Kept ten minutes, a minute
+   * after a failure.
+   */
+  async bindingInterfaceUrl(agentId: string, fetchImpl: typeof fetch = fetch): Promise<string | undefined> {
+    const home = (this.config.meshHome ?? this.config.coreUrl)?.replace(/\/+$/, "");
+    if (!home) return undefined;
+    const hit = this.bindingUrls.get(agentId);
+    if (hit && Date.now() - hit.at < (hit.url ? 600_000 : 60_000)) return hit.url ?? undefined;
+    let url: string | null = null;
+    try {
+      const r = await fetchImpl(`${home}/agents/${encodeURIComponent(agentId)}/agent-card.json`, { signal: AbortSignal.timeout(3000) });
+      if (r.ok) {
+        const card = (await r.json().catch(() => null)) as { supportedInterfaces?: Array<{ url?: unknown; protocolBinding?: unknown }> } | null;
+        const iface = card?.supportedInterfaces?.find((i) => i?.protocolBinding === A2A_BINDING_URI && typeof i.url === "string");
+        if (iface && /^https?:\/\/[^/]+\/(.+\/)?agents\/[^/]+$/.test(iface.url as string)) url = iface.url as string;
+      }
+    } catch {
+      url = null;
+    }
+    if (this.bindingUrls.size > 10_000) this.bindingUrls.clear();
+    this.bindingUrls.set(agentId, { url, at: Date.now() });
+    return url ?? undefined;
+  }
+
   async exposableManifest(agentId: string): Promise<Manifest | null> {
     const cached = this.manifestCache.get(agentId);
     if (cached && Date.now() - cached.at < MANIFEST_CACHE_MS) return cached.manifest;

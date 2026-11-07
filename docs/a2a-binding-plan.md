@@ -90,17 +90,17 @@ lists the binding URI in its manifest's `capabilities`.
   on `mesh.task.>` (shared/wire-window.ts, operator handbook §16).
 - **Cards.** The mesh API serves `/agents/{handle or id}/agent-card.json`
   (registry/agent-card-http.ts).
+- **The bridge's own Tasks.** When an agent's node queues a binding request,
+  the gateway answers the HTTP caller with a Task it holds, as the A2A Bridge
+  §4.3 says (a2a-gateway/src/inbound/binding-held.ts); the SDK hands the
+  agent's later answer to `onLateAnswer`. The gateway's generated cards take
+  the binding interface URL from the mesh home's own card, so they name the
+  handle the naming service confirms.
 - **Conformance.** The fixture is read in the SDK and gateway suites, and c26
   in the core profile runs the binding on a live mesh.
 
 ## Where this implementation still stops short
 
-- The gateway's generated cards name the agent ID in the binding's interface,
-  not the handle (the gateway does not resolve handles); the mesh home's own
-  card names the handle.
-- MAPPING.md (the A2A Bridge 0.9.1-draft) has the bridge hold a Task of its
-  own for a queued acknowledgement on the binding path (§4.3). The gateway
-  answers that case with `-32603` and `REQUEST_QUEUED` today.
 - Credentials issued before `MESH_WIRE_0_3_0=refuse` keep their Task
   subscribe grants until they are renewed.
 - A sealed `GetTask` cannot be relayed to the task store (the store must read

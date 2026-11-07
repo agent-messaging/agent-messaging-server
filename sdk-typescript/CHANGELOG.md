@@ -32,6 +32,10 @@ deprecated.
   client may read the Task. The SDK reads them past the freshness window and
   reads the Task with `GetTask` only as a safety net; on a mesh that does not
   deliver streams it subscribes to the stream subject itself.
+- **Queued requests**: a call the agent's node queues rejects with
+  REQUEST_QUEUED as before, now saying `delivered` when the message reached the
+  agent's inbox (`QueuedAck.delivered`); `onLateAnswer` receives the A2A
+  answer that arrives later from that agent, naming the request.
 - **Extensions**: offering (with the older keys during the window), budget
   with every outcome (`exhausted`, `insufficient`, `deadline_unmeetable`,
   `ceiling_reached`, `completed_late`, the overdue mark), audience (kept in

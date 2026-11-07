@@ -246,6 +246,10 @@ export function manifestToCard(
   /** The mesh home (bindings/a2a.md §3). With it, an agent that serves the
    *  A2A binding lists the binding among its interfaces. */
   meshHome?: string,
+  /** The binding interface's URL as the mesh home's own card names it (with
+   *  the agent's handle when the naming service confirms one); without it,
+   *  the mesh home and the agent ID. */
+  bindingUrl?: string,
 ): AgentCard {
   const base = publicBaseUrl.replace(/\/+$/, "");
   const binding = Array.isArray(manifest.capabilities) && manifest.capabilities.includes(A2A_BINDING_URI);
@@ -271,7 +275,11 @@ export function manifestToCard(
       // The agent's own interface on the mesh, for a client that is on one
       // (bindings/a2a.md §3). Listed after the HTTP ones, which are what this
       // gateway serves.
-      ...(binding && meshHome ? [bindingInterface(meshHome, manifest.id)] : []),
+      ...(binding && bindingUrl
+        ? [{ ...bindingInterface(meshHome ?? "", manifest.id), url: bindingUrl }]
+        : binding && meshHome
+          ? [bindingInterface(meshHome, manifest.id)]
+          : []),
     ],
     provider: manifest.provider
       ? { organization: manifest.provider.name, url: manifest.provider.url }

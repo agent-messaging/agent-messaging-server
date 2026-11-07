@@ -175,3 +175,29 @@ describe("generated cards (§3)", () => {
     expect(plain.supportedInterfaces.map((i) => i.protocolBinding)).toEqual(["JSONRPC", "HTTP+JSON"]);
   });
 });
+
+describe("generated cards name the handle the mesh home confirms (§3)", () => {
+  it("takes the binding interface URL from the mesh home's own card, and the agent ID when it cannot", async () => {
+    const m = manifestFixture({ capabilities: [A2A_BINDING_URI] });
+    const bridge = new Bridge({ meshUrl: "ws://127.0.0.1:1", publicBaseUrl: "https://a2a.mesh.example.com", port: 0, coreUrl: "http://server:3005" } as never);
+    const asked: string[] = [];
+    const meshHome = (async (url: string) => {
+      asked.push(url);
+      return new Response(
+        JSON.stringify({ supportedInterfaces: [{ url: "https://api.mesh.example.com/agents/quotes.acme@example.com", protocolBinding: A2A_BINDING_URI, protocolVersion: "1.0" }] }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+    const url = await bridge.bindingInterfaceUrl(m.id, meshHome);
+    expect(asked).toEqual([`http://server:3005/agents/${m.id}/agent-card.json`]);
+    expect(url).toBe("https://api.mesh.example.com/agents/quotes.acme@example.com");
+    const card = manifestToCard(m, "https://a2a.mesh.example.com", { apiKey: true, anonymous: false }, "http://server:3005", url);
+    expect(card.supportedInterfaces.find((i) => i.protocolBinding === A2A_BINDING_URI)?.url).toBe("https://api.mesh.example.com/agents/quotes.acme@example.com");
+
+    const down = new Bridge({ meshUrl: "ws://127.0.0.1:1", publicBaseUrl: "https://a2a.mesh.example.com", port: 0, coreUrl: "http://server:3005" } as never);
+    const none = await down.bindingInterfaceUrl(m.id, (async () => new Response("nope", { status: 404 })) as unknown as typeof fetch);
+    expect(none).toBeUndefined();
+    const fallback = manifestToCard(m, "https://a2a.mesh.example.com", { apiKey: true, anonymous: false }, "https://api.mesh.example.com", none);
+    expect(fallback.supportedInterfaces.find((i) => i.protocolBinding === A2A_BINDING_URI)?.url).toBe(`https://api.mesh.example.com/agents/${m.id}`);
+  });
+});
