@@ -1,7 +1,8 @@
 /**
  * The A2A card at the mesh home (registry/agent-card-http.ts; A2A binding
  * §3): found by agent id or by handle, its interface URL naming the handle
- * when the agent has one, and nothing for agents that are private, unlisted,
+ * when the agent has one, a card for an unlisted agent (it answers when
+ * addressed directly, SPEC §8.6), and nothing for agents that are private,
  * sandboxed or do not serve the binding.
  */
 import { describe, it, expect } from "vitest";
@@ -32,10 +33,12 @@ async function setup(names: Record<string, string> = {}) {
   const plain = nkeys.createUser().getPublicKey();
   const privateOne = nkeys.createUser().getPublicKey();
   const notBinding = nkeys.createUser().getPublicKey();
+  const unlisted = nkeys.createUser().getPublicKey();
   await kv.put(named, JSON.stringify(manifest(named)));
   await kv.put(plain, JSON.stringify(manifest(plain)));
   await kv.put(privateOne, JSON.stringify(manifest(privateOne, { visibility: "private" })));
   await kv.put(notBinding, JSON.stringify(manifest(notBinding, { capabilities: [] })));
+  await kv.put(unlisted, JSON.stringify(manifest(unlisted, { visibility: "unlisted" })));
   const handles: Record<string, string> = { [named]: "quotes.acme@example.com", ...names };
   const lookup = Object.assign(
     async (k: string): Promise<NameAnswer> => (handles[k] ? { status: "named", handle: handles[k] } : { status: "unnamed", handle: null }),
@@ -47,7 +50,7 @@ async function setup(names: Record<string, string> = {}) {
     names: lookup,
     resolveHandle: async (h) => Object.entries(handles).find(([, v]) => v === h)?.[0] ?? null,
   });
-  return { cards, named, plain, privateOne, notBinding };
+  return { cards, named, plain, privateOne, notBinding, unlisted };
 }
 
 const body = (a: { body: unknown }) => a.body as { supportedInterfaces: Array<{ url: string; protocolBinding: string; protocolVersion: string }>; skills: unknown[]; capabilities: { pushNotifications: boolean } };
@@ -62,6 +65,13 @@ describe("GET /agents/{handle or id}/agent-card.json", () => {
     expect(body(a).skills).toHaveLength(1);
     const b = await cards.card(plain);
     expect(body(b).supportedInterfaces[0].url).toBe(`${HOME}/agents/${plain}`);
+  });
+
+  it("serves the card of an unlisted agent, which answers when addressed directly", async () => {
+    const { cards, unlisted } = await setup();
+    const a = await cards.card(unlisted);
+    expect(a.status).toBe(200);
+    expect(body(a).supportedInterfaces[0].url).toBe(`${HOME}/agents/${unlisted}`);
   });
 
   it("serves the card by handle", async () => {
