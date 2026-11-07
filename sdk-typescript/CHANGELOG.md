@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.66.0 (2026-11-07)
+
+A2A over Agent Messaging: agents call each other with A2A 1.0's own
+operations and objects, in signed frames at wire version 0.4.0
+(bindings/a2a.md, 0.3.0-draft). The 0.3.0 calls keep working and are
+deprecated.
+
+- **`mesh.a2a`**: a call for each of the eleven A2A operations
+  (`sendMessage`, `sendStreamingMessage`, `getTask`, `listTasks`,
+  `cancelTask`, `subscribeToTask`, the four push notification config calls,
+  `getExtendedAgentCard`) and `call(agentId, method, params)` for any of
+  them. Service parameters ride in `meta.a2a` (`A2A-Version` is set; pass
+  `extensions` and `serviceParams`), and `engagement` is carried as
+  `meta.engagement`. `seal: true` seals the A2A object to the agent's
+  published key, and the answers come back sealed.
+- **`mesh.a2a.serve(handler, options)`**: the handler receives each A2A
+  Message and returns a Message, or a Task through `ctx.startTask()`, whose
+  handle emits status and artifact updates (`status`, `artifact`,
+  `complete`, `fail`, `reject`, `requireInput`, `requireAuth`). The node
+  numbers each stream's events (`streamId`, `seq`, `final`), publishes
+  every change to a Task on `mesh.task.{taskId}.update` for the task store,
+  answers `GetTask`, `ListTasks` and `SubscribeToTask` from the store under
+  the binding's access rule, answers a long Task with the Task as it stands
+  when the reply window closes, refuses push notification configs, and
+  serves an extended card when one is configured. An agent that serves A2A
+  lists the binding in its manifest's `capabilities`.
+- **Extensions**: offering (with the older keys during the window), budget
+  with every outcome (`exhausted`, `insufficient`, `deadline_unmeetable`,
+  `ceiling_reached`, `completed_late`, the overdue mark), audience (kept in
+  agreement with `meta.audience`), economics, artifact references on any
+  carrier URI, cancel reasons and failure reasons. Readers for each
+  (`budgetReading`, `cancelReasonOf`, `failureReasonOf`, `isValidPart` and
+  the rest) are what `conformance/a2a-binding.json` checks.
+- **Errors**: `A2AError`, named as A2A names it, with `rpcCode` and
+  `data`; channel errors stay `MeshError`.
+- **Frames**: a 0.4.0 frame carrying `task_id`, `context_id`, `budget` or
+  `artifacts` is refused with `INVALID_ENVELOPE`. The channel's own frames
+  (describe, knock, the probe) travel at 0.4.0 unchanged.
+- **0.3.0 beside 0.4.0**: each request is answered in the wire version it
+  arrived in. A 0.4.0 message to an agent with only `onRequest` handlers
+  reaches the handler for the offering it names; a 0.3.0 request to an agent
+  that only serves A2A reaches its A2A handler. `createEnvelope` takes `v`.
+- **Deprecated**: `request`, `requestStream`, `onRequest`,
+  `onStreamRequest`, `onDefault`, `awaitTask`, `getTask`, `onTaskUpdate`,
+  `cancel`, `failTask` and `reviseBudget`, the 0.3.0 wire.
+
 ## 0.65.1 (2026-11-03)
 
 - **`mesh.inventory` and `mesh.traffic`**: the getters for 0.65.0's two new

@@ -147,6 +147,67 @@ revoked the agent or its tenant.
 
 The six [examples](../examples) use exactly this pattern, on both brokers.
 
+## A2A over Agent Messaging
+
+From 0.66.0 agents call each other with A2A 1.0's own operations and objects,
+carried in signed 0.4.0 frames: the binding is
+[A2A over Agent Messaging](https://agentmessaging.ai/bindings/a2a/v1). An
+agent serves A2A with one handler, and calls other agents with `mesh.a2a`.
+
+```ts
+import { A2A } from "agent-messaging";
+
+// Serve: receive an A2A Message, answer with a Message or a Task.
+mesh.a2a.serve(async (message, ctx) => {
+  const task = ctx.startTask({ state: "TASK_STATE_WORKING" });
+  task.artifact({ artifactId: "quote", name: "quote", parts: [{ data: { price: 40, currency: "USD" } }] });
+  task.complete("Here is the quote.");
+  return task;
+});
+await mesh.register({ name: "quotes", offerings: [{ id: "quote", name: "Quote", description: "Prices a part." }] });
+
+// Call: every A2A operation, by its A2A name.
+const res = await mesh.a2a.sendMessage(agentId, {
+  messageId: crypto.randomUUID(),
+  role: "ROLE_USER",
+  parts: [{ text: "Quote 200 units of part 7741." }],
+});
+if (res.task) {
+  const task = await mesh.a2a.getTask(agentId, res.task.id);
+  console.log(task.status.state, task.artifacts);
+}
+
+// Stream: the events of one stream, in order, to its end.
+for await (const event of mesh.a2a.sendStreamingMessage(agentId, message)) console.log(event);
+```
+
+| Call | What it does | Binding |
+|---|---|---|
+| `a2a.serve(handler, options)` | Answer A2A messages. The handler returns a Message, or a Task through `ctx.startTask()`, whose handle emits status and artifact updates while the work runs. | §5, §8 |
+| `a2a.sendMessage`, `a2a.sendStreamingMessage` | Send a Message; get a Message or a Task, or a stream of events. | §5, §8 |
+| `a2a.getTask`, `a2a.listTasks`, `a2a.subscribeToTask` | Read Tasks this agent created, from the mesh's task store. | §5, §10 |
+| `a2a.cancelTask(agentId, id, { cancel })` | Cancel a Task, with a reason. | §5, §12.6 |
+| `a2a.createTaskPushNotificationConfig` and the other three, `a2a.getExtendedAgentCard` | The remaining operations. | §5 |
+| `A2A.withOffering`, `A2A.withBudget`, `A2A.forPerson`, `A2A.artifactRefPart`, `A2A.withCancelReason` | Write an extension's data in `metadata`. | §12 |
+| `A2A.budgetReading`, `A2A.isExhausted`, `A2A.cancelReasonOf`, `A2A.failureReasonOf` | Read what a Task says about its budget, cancel or failure. | §12 |
+
+A handle ends a Task the way the budget extension says: `task.exhausted()`
+(canceled at the engagement's cap, never failed and never retried),
+`task.insufficient(estimate)` and `task.deadlineUnmeetable(when)` (refused),
+`task.ceilingReached(spent, estimateToFinish)` (paused for a higher budget),
+`task.overdue()` and `task.completeLate()`. A2A errors are `A2AError`,
+named as A2A names them, with the JSON-RPC integer as `rpcCode`; errors from
+the channel stay `MeshError`.
+
+**The 0.3.0 calls are deprecated.** `request`, `requestStream`,
+`onRequest`, `onStreamRequest`, `onDefault`, `awaitTask`, `getTask`,
+`onTaskUpdate`, `cancel`, `failTask` and `reviseBudget` speak the 0.3.0
+wire. They keep working through the transition window and will not be
+removed in a minor release. The SDK answers each request in the wire version
+it arrived in: a 0.4.0 message to an agent that has only `onRequest`
+handlers reaches the handler for the offering it names, and a 0.3.0 request
+to an agent that only serves A2A reaches its A2A handler as a Message.
+
 ## Names
 
 Names are a deployment-defined part of Agent Messaging (§1.6): a server may
@@ -197,12 +258,13 @@ The calls, grouped the way the specification groups them.
 | | `contacts.waiting()` | Who is waiting at the door: who knocked, and whose message is held. | EXT-6 §9 |
 | | `contacts.admit({ sender })`, `contacts.block({ sender })` | Let a sender in (what it sent moves to the inbox), or keep it out. | EXT-6 §5 |
 | | `register({ guarded: true, ... })` | Put the inbox behind the server's admission service, which drops what the roster blocks before delivery. | EXT-6 §7 |
-| **Inbox messaging** | `request(agentId, offering, input)` | Ask and wait. A request to an agent that is away waits in its mailbox. | `request`, §6.4 |
+| **A2A** | `a2a.serve(handler)`, `a2a.sendMessage`, `a2a.getTask` and every other A2A operation | A2A 1.0 over the mesh, in 0.4.0 frames ([A2A over Agent Messaging](#a2a-over-agent-messaging)). | binding §5 |
+| **Inbox messaging** (0.3.0 wire, deprecated) | `request(agentId, offering, input)` | Ask and wait. A request to an agent that is away waits in its mailbox. | `request`, §6.4 |
 | | `requestStream(...)` | Ask, and get the answer streamed back. | §11.3 |
 | | `onRequest(offering, handler)`, `onStreamRequest(...)`, `onDefault(handler)` | Answer requests. | `respond`, §6.5 |
 | | `messages.send({ to, text })` | Send a plain text message to an agent's `chat` offering; any reply arrives later if the agent is away. | §6.4, §16.4 |
 | | `messages.inbox()`, `.reply({ inbox_id, text })`, `.dismiss({ inbox_ids })` | Read the inbox an agent with admission keeps, answer a message, clear what is done. | §6.4a, EXT-6 |
-| **Tasks** | `awaitTask(taskId)`, `getTask(taskId)`, `onTaskUpdate(fn)` | Work that takes longer than one reply. | §7 |
+| **Tasks** (0.3.0 wire, deprecated) | `awaitTask(taskId)`, `getTask(taskId)`, `onTaskUpdate(fn)` | Work that takes longer than one reply. | §7 |
 | | `cancel(taskId, reason)`, `failTask(taskId, reason)` | Stop work, from either side, with a reason. | §7.3, §10.8 |
 | | `reviseBudget(taskId, revision)` | Change a running task's budget. | §7.7 |
 | **Publish and subscribe** | `emit(topic, data)` | Publish an event. | `emit`, §6.6 |
