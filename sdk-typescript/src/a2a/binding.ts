@@ -313,3 +313,63 @@ export function stateOfFrame(env: Envelope): { state: string; fromMeta: boolean 
   const meta = (env.meta as Record<string, unknown> | undefined)?.[A2A_STATE_META];
   return sealed && typeof meta === "string" ? { state: meta, fromMeta: true } : undefined;
 }
+
+// ─── Reading a stream (§8) ──────────────────────────────────────────
+
+/** One frame as a client received it: on its inbox, or on a stream subject. */
+export interface StreamDelivery {
+  subject: string;
+  frame: Envelope;
+  /** The broker lost it (a test's way of saying it never arrived). */
+  drop?: boolean;
+}
+
+export type StreamReading =
+  | { events: StreamResponse[]; complete: true; ignored?: number; skipped?: number }
+  | { events: StreamResponse[]; complete: false; gap_at: number; next: "SubscribeToTask" }
+  | { events: StreamResponse[]; complete: false; broken: string };
+
+/**
+ * What a client reads from the frames of one stream (§8), in the order they
+ * arrived: only frames whose `streamId` is the stream's (others are skipped);
+ * the first event (seq 0) on the inbox and every later one on the Task's
+ * stream subject; a redelivered seq dropped; a gap, or a later event on the
+ * inbox, stops the reading at the missing seq (the client then calls
+ * SubscribeToTask); `final` on an event that does not end the stream is a
+ * broken stream; nothing after `final` is read. The client's own stream
+ * logic applies the same rules as frames arrive.
+ */
+export function readStreamFrames(deliveries: StreamDelivery[], streamId: string, inbox = "inbox"): StreamReading {
+  const events: StreamResponse[] = [];
+  let next = 0;
+  let taskId: string | undefined;
+  let done = false;
+  let ignored = 0;
+  let skipped = 0;
+  for (const d of deliveries) {
+    if (d.drop) continue;
+    const r = readRespondPayload(d.frame);
+    if (!r || r.streamId !== streamId) {
+      skipped++;
+      continue;
+    }
+    if (done) {
+      ignored++;
+      continue;
+    }
+    const seq = r.seq ?? -1;
+    if (seq < next) continue;
+    const gap = { events, complete: false as const, gap_at: next, next: "SubscribeToTask" as const };
+    if (seq > next) return gap;
+    const ev = r.result as StreamResponse;
+    const where = next === 0 ? inbox : `mesh.task.${taskId}.stream`;
+    if (d.subject !== where) return gap;
+    if (next === 0) taskId = taskIdOfEvent(ev);
+    if (r.final && !eventEndsStream(ev)) return { events, complete: false, broken: "final on an event that does not end the stream" };
+    events.push(ev);
+    next++;
+    if (r.final) done = true;
+  }
+  if (!done) return { events, complete: false, gap_at: next, next: "SubscribeToTask" };
+  return { events, complete: true, ...(ignored ? { ignored } : {}), ...(skipped ? { skipped } : {}) };
+}

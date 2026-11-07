@@ -16,6 +16,8 @@ import type { Manifest } from "../../../sdk-typescript/src/types/manifest.js";
 import { MeshError } from "../../../sdk-typescript/src/types/errors.js";
 import { A2A_BINDING_URI, isA2AMethod } from "../../../sdk-typescript/src/a2a/binding.js";
 import { A2AError } from "../../../sdk-typescript/src/a2a/errors.js";
+import { EXT_OFFERING } from "../../../sdk-typescript/src/a2a/extensions.js";
+import { routeOffering } from "../../../sdk-typescript/src/a2a/readings.js";
 import type { A2AMethod } from "../../../sdk-typescript/src/a2a/types.js";
 import { meshErrorToRpc } from "../core/errors.js";
 import { rpcError, rpcResult, type JsonRpcRequest, type JsonRpcResponse } from "../core/jsonrpc.js";
@@ -48,9 +50,36 @@ export function serviceParamsFromHeaders(headers: Record<string, string | string
   return out;
 }
 
+/**
+ * The A2A Bridge §4.5: during the transition window a caller with no key may
+ * still name the offering with the older metadata keys (`agentmesh.offering`,
+ * `agentmesh.skill`). The gateway adds the offering extension's key with the
+ * same value before the frame is signed, and refuses the two disagreeing.
+ */
+export function withOfferingKey(params: unknown, declared: readonly string[]): { params: unknown } | { error: true; offerings: string[] } {
+  const message = (params as { message?: { metadata?: Record<string, unknown> } } | undefined)?.message;
+  const md = message?.metadata;
+  if (!md || (md["agentmesh.offering"] === undefined && md["agentmesh.skill"] === undefined)) return { params };
+  const routed = routeOffering(declared, md);
+  if ("error" in routed) {
+    // Only the keys' disagreement is the gateway's to refuse; anything else
+    // (an undeclared name) the agent answers itself.
+    const ext = (md[EXT_OFFERING] as { offering?: unknown } | undefined)?.offering;
+    const old = md["agentmesh.offering"] ?? md["agentmesh.skill"];
+    return ext !== undefined && ext !== old ? { error: true, offerings: routed.offerings } : { params };
+  }
+  if (!routed.added) return { params };
+  return {
+    params: {
+      ...(params as object),
+      message: { ...message, metadata: { ...md, [EXT_OFFERING]: { offering: routed.offering } } },
+    },
+  };
+}
+
 /** A binding error or a channel error, as a JSON-RPC error and HTTP status. */
 export function bindingErrorToRpc(id: JsonRpcRequest["id"], err: unknown): { status: number; body: JsonRpcResponse } {
-  if (err instanceof A2AError) return { status: 200, body: rpcError(id, err.rpcCode, err.message, err.data) };
+  if (err instanceof A2AError) return { status: 200, body: rpcError(id, err.rpcCode, err.message, Object.keys(err.data).length ? err.data : undefined) };
   if (err instanceof MeshError) {
     const mapped = meshErrorToRpc(err);
     return { status: mapped.httpStatus, body: { jsonrpc: "2.0", id, error: mapped.error } };
@@ -72,8 +101,18 @@ export async function passThroughBinding(
   agentId: string,
   serviceParams: Record<string, string>,
   write: (res: ServerResponse, status: number, body: unknown) => void,
+  /** The offerings the agent declares, for the older offering keys (§4.5). */
+  declared: readonly string[] = [],
 ): Promise<"ok" | "error"> {
   const opts = { serviceParams, timeoutMs: 60_000 };
+  if (method === "SendMessage" || method === "SendStreamingMessage") {
+    const fixed = withOfferingKey(params, declared);
+    if ("error" in fixed) {
+      write(res, 200, rpcError(id, -32602, "The offering keys disagree, or name no offering this agent declares.", { offerings: fixed.offerings }));
+      return "error";
+    }
+    params = fixed.params;
+  }
   if (method === "SendStreamingMessage" || method === "SubscribeToTask") {
     const stream =
       method === "SendStreamingMessage"

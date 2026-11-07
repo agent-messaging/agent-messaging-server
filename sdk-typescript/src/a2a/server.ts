@@ -65,6 +65,7 @@ import {
   type A2AFailure,
 } from "./extensions.js";
 import { validateStopFields } from "../cancel.js";
+import { routeOffering } from "./readings.js";
 import type { Budget } from "../types/envelope.js";
 import type {
   AgentCard,
@@ -415,14 +416,15 @@ export class A2AServerAgent {
     // §12.1: one declared offering is served when a message names none;
     // several, and a message naming none or one not declared, is refused
     // with the invalid-parameters error listing them.
+    // During the transition window the older keys are read too (routeOffering).
     if (declared.length === 0) return named;
-    if (named === undefined && declared.length === 1) return declared[0];
-    if (named !== undefined && declared.includes(named)) return named;
+    const routed = routeOffering(declared, message.metadata);
+    if ("offering" in routed) return routed.offering;
     throw A2AErrors.invalidParams(
       named === undefined
         ? "This agent declares several offerings; name one with the offering extension."
         : `This agent does not declare the offering ${JSON.stringify(named)}.`,
-      { offerings: declared },
+      { offerings: routed.offerings },
     );
   }
 

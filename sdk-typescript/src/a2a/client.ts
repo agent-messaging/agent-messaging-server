@@ -7,11 +7,13 @@
  * on `mesh.task.{taskId}.stream`, where several streams of one Task may share
  * the subject. Each frame names its stream (`streamId`, the opening request
  * frame's id) and its place in it (`seq`). The client reads its own stream's
- * frames in `seq` order and drops one it has seen. This server has no
- * durable stream behind the subject (SPEC.md §18.3), so a gap, or a stream
- * that stays quiet, is checked with `GetTask`, and the Task as it stands is
- * delivered as an event. A client that lost its connection calls
- * `subscribeToTask`, which opens a new stream from the Task's current state.
+ * frames in `seq` order and drops one it has seen. A gap is closed with
+ * `SubscribeToTask`, which opens a new stream from the Task's current state,
+ * and reading goes on there. This server has no durable stream behind the
+ * subject (SPEC.md §18.3), so events sent before the client listened are not
+ * kept for it: the client reads the Task once with `GetTask` after it starts
+ * listening, and again after a quiet spell, and delivers the Task as an event
+ * when it moved on.
  */
 import type { Envelope } from "../types/envelope.js";
 import { MeshError, ErrorCode } from "../types/errors.js";
@@ -266,10 +268,11 @@ export class A2AClient {
     agentId: string,
     state: { taskId: string | undefined; lastSeq: number },
     opts: A2AStreamOptions,
-    l: StreamListener,
+    listener: StreamListener,
     first: StreamResponse,
   ): AsyncGenerator<StreamResponse> {
     const taskId = state.taskId!;
+    let l = listener;
     const idleMs = opts.idleResyncMs ?? 5_000;
     let lastState: string | undefined;
     let lastStamp: string | undefined;
@@ -290,6 +293,9 @@ export class A2AClient {
         let next = l.pending.get(state.lastSeq + 1);
         while (next) {
           l.pending.delete(state.lastSeq + 1);
+          // `final` on an event that does not end the stream (an interrupted
+          // state, say) is a broken stream (§8).
+          if (next.final && !eventEndsStream(next.ev)) throw A2AErrors.invalidAgentResponse("A stream frame said final on an event that does not end the stream (A2A binding §8).");
           state.lastSeq += 1;
           note(next.ev);
           yield next.ev;
@@ -311,8 +317,34 @@ export class A2AClient {
           });
           if (woke) continue;
         }
-        // A gap, a quiet spell, or the first pass: read the Task as the store
-        // holds it.
+        if (gap) {
+          // A gap the subscription cannot close: a new stream from the Task's
+          // current state (§8). Its frames are listened for before it is asked.
+          const env = this.frameFor(agentId, "SubscribeToTask", { id: taskId }, opts);
+          const l2 = this.listen(agentId, taskId, env.id);
+          let resp: Envelope;
+          try {
+            resp = this.host.open(await this.host.call(agentId, env, opts.timeoutMs ?? 30_000));
+            if (resp.error) raise(resp);
+          } catch (err) {
+            l2.stop();
+            throw err;
+          }
+          const r = readRespondPayload(resp);
+          if (!r) {
+            l2.stop();
+            throw A2AErrors.invalidAgentResponse("The answer to SubscribeToTask carried no payload.a2a.result.");
+          }
+          l.stop();
+          l = l2;
+          state.lastSeq = 0;
+          const ev = r.result as StreamResponse;
+          note(ev);
+          yield ev;
+          if (r.final || eventEndsStream(ev)) return;
+          continue;
+        }
+        // A quiet spell, or the first pass: read the Task as the store holds it.
         catchUp = false;
         let task: Task | null = null;
         try {
@@ -321,17 +353,11 @@ export class A2AClient {
           if (err instanceof A2AError) throw err;
           if (!(err instanceof MeshError) || err.code !== ErrorCode.TRANSPORT_TIMEOUT) throw err;
         }
-        // After a gap the Task holds what was lost, so it is always delivered;
-        // after a quiet spell, only when it moved on.
-        if (task && (gap || task.status.state !== lastState || (task.status.timestamp && task.status.timestamp !== lastStamp))) {
+        // Delivered only when it moved on.
+        if (task && (task.status.state !== lastState || (task.status.timestamp && task.status.timestamp !== lastStamp))) {
           note({ task });
           yield { task };
           if (isTerminalState(task.status.state)) return;
-        }
-        if (gap) {
-          // What was lost is in the Task just delivered (or the store has not
-          // caught up): go on from what has arrived.
-          state.lastSeq = Math.min(...l.pending.keys()) - 1;
         }
       }
     } finally {

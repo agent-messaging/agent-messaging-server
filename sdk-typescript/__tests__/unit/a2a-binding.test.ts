@@ -231,7 +231,7 @@ describe("SendStreamingMessage (§8)", () => {
     expect((resp.env.payload as { a2a: { final?: boolean; seq?: number } }).a2a).toMatchObject({ final: true, seq: 0 });
   });
 
-  it("a lost frame: the gap is closed with the Task as the store holds it, and the stream goes on", async () => {
+  it("a lost frame: the gap is closed by SubscribeToTask, and reading goes on in the new stream", async () => {
     const { client, server } = setup();
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
@@ -262,7 +262,8 @@ describe("SendStreamingMessage (§8)", () => {
     expect(snap).toBeDefined();
     const last = events.at(-1)!;
     expect(last.statusUpdate?.status.state ?? last.task?.status.state).toBe("TASK_STATE_COMPLETED");
-    expect(bus.log.some((l) => (l.env.payload as { a2a?: { method?: string } })?.a2a?.method === "GetTask")).toBe(true);
+    // The gap was closed by a new stream from the Task's current state.
+    expect(bus.log.some((l) => (l.env.payload as { a2a?: { method?: string } })?.a2a?.method === "SubscribeToTask")).toBe(true);
   });
 
   it("a quiet stream is checked, so a final event lost before the client listened still ends it", async () => {
