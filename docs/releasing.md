@@ -8,8 +8,11 @@ from here. Deployments run a release, never a copy of the source.
 A few files here are copies of documents written where the specification is:
 `conformance/` (the core profile of the conformance suite, and `SPEC.md`),
 `a2a-gateway/MAPPING.md` and `docs/rabbitmq-binding.md`
-(`tools/monorepo-export.json` lists them). A change to one of them is made
-there and arrives here in a pull request; the server's own code, tests and
+(`tools/monorepo-export.json` lists them, and its `canonical` block names the
+source of each one written in the standards repository: `MAPPING.md` is the A2A
+Bridge, `conformance/a2a-binding.json` the binding's fixture set,
+`docs/rabbitmq-binding.md` the RabbitMQ binding). A change to one of them is
+made there and arrives here in a pull request; the server's own code, tests and
 documents are changed here.
 
 ## A change

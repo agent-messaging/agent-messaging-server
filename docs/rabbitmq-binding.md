@@ -247,7 +247,7 @@ There is no publish-side deduplication in RabbitMQ. Deduplication happens **on r
 | Delivery: ordered, at least once, deduplicated on `(from, id)` | Per-queue order; manual acknowledgment with redelivery (§6); deduplication on receipt (§7) |
 | Durable publish and subscribe | §6.2 and §6.3 |
 | Request-reply with a reply address and a timeout | §2.3, direct reply-to with publisher returns |
-| Durable task store | `mesh_tasks` as keyed records in Postgres: one row per task with a revision that grows on every write, compare-and-set on it, seven-day expiry (§18.4's settings) |
+| Durable task store | `mesh_a2a_tasks` for A2A Tasks, and `mesh_tasks` for 0.3.0 records during the transition window, as keyed records in Postgres: one row per task with a revision that grows on every write, compare-and-set on it, seven-day expiry (§18.4's settings) |
 | Large-payload storage | The artifact store and room drive on disk or Google Cloud Storage (§18.5 already allows either) |
 | Identity and credentials | §3 to §5 |
 | Tenant import and export | Not offered: the server runs its tenants in one virtual host as records it enforces itself, the tenancy model §1.6 allows (the capabilities answer says `one_rabbitmq_vhost`) |

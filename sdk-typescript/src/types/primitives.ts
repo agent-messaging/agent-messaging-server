@@ -158,6 +158,9 @@ export interface QueuedAck {
   paused?: true;
   /** Why it was queued, when the answer says: `agent_paused` for a pause. */
   reason?: string;
+  /** The message reached the agent's inbox (it admits the sender); absent
+   *  when it waits at the agent's door (EXT-6). */
+  delivered?: true;
 }
 
 export interface EmitPayload {

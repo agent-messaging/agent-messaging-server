@@ -10,7 +10,9 @@ directions:
 - **Outbound:** an A2A agent is attached to the gateway and appears on the
   mesh as an agent with a key of its own, offering its A2A skills.
 
-The normative mapping is [MAPPING.md](MAPPING.md).
+The normative text is [MAPPING.md](MAPPING.md), a copy of the A2A Bridge
+(`messaging/bindings/a2a-bridge.md` in CommonAgent/common-agent-standards).
+It is changed there and copied here unchanged.
 
 ## Running it
 

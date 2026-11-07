@@ -76,13 +76,15 @@ tasks, rooms and files. Each one works on either broker.
 | | `mesh.contacts.admit({ sender })`, `mesh.contacts.block({ sender })` | Lets a sender in, which moves what it sent into the inbox, or keeps it out. | EXT-6 §5 |
 | | `mesh.contacts.admit({ source })`, `admission.start({ bridged })` | Lets in, or keeps out, every agent whose identity came from one source (`oauth:<issuer>`, `spiffe://<trust domain>`), and decides what bridged senders get. | EXT-6 0.5.0 |
 | | `mesh.register({ guarded: true, ... })` | Puts the agent's inbox behind the server's admission service, which drops what the roster blocks before it is delivered. | EXT-6 §7 |
-| **Inbox messaging** | `mesh.request(agentId, offering, input)` | Asks an agent something and waits for the answer. A request to an agent that is away waits in its mailbox. | `request`, §6.4 |
+| **A2A** | `mesh.a2a.serve(handler)` | Answers A2A messages: the handler returns an A2A Message or a Task and emits status and artifact updates. | A2A binding §5, §8 |
+| | `mesh.a2a.sendMessage`, `.sendStreamingMessage`, `.getTask`, `.listTasks`, `.cancelTask`, `.subscribeToTask`, and the rest | Calls another agent with A2A 1.0's own operations, carried in signed 0.4.0 frames. Tasks are kept in the server's task store. | A2A binding §5 |
+| **Inbox messaging** (0.3.0 wire, deprecated) | `mesh.request(agentId, offering, input)` | Asks an agent something and waits for the answer. A request to an agent that is away waits in its mailbox. | `request`, §6.4 |
 | | `mesh.requestStream(...)` | The same, with the answer streamed back in parts. | §11.3 |
 | | `mesh.onRequest(offering, handler)` | Answers requests for one offering. `onStreamRequest` streams the answer, and `onDefault` takes everything else. | `respond`, §6.5 |
 | | `mesh.messages.send({ to, text })` | Sends a plain text message to an agent's `chat` offering. If the agent is busy or away, the mailbox holds it and any reply comes later. | §6.4, §16.4 |
 | | `mesh.messages.inbox()`, `.reply({ inbox_id, text })`, `.dismiss({ inbox_ids })` | Reads the inbox an agent with admission keeps, answers a message in it, and clears what is done. | §6.4a, EXT-6 |
 | | `mesh.request(..., { on_behalf_of })`, `verifyOnBehalfOf(envelope, options)` | Carries evidence that a request acts for a person (a token-exchange token, an ID-JAG, a transaction token), and checks it on arrival: verified, refused or unverifiable. | §4.16 |
-| **Tasks** | `mesh.awaitTask(taskId)`, `mesh.getTask(taskId)`, `mesh.onTaskUpdate(fn)` | Follows work that takes longer than one reply. | §7 |
+| **Tasks** (0.3.0 wire, deprecated) | `mesh.awaitTask(taskId)`, `mesh.getTask(taskId)`, `mesh.onTaskUpdate(fn)` | Follows work that takes longer than one reply. | §7 |
 | | `mesh.cancel(taskId, reason)`, `mesh.failTask(taskId, reason)` | Stops work, from either side, with a reason. | §7.3, §10.8 |
 | | `mesh.reviseBudget(...)` | Changes a task's budget while it runs. | §7.7 |
 | **Publish and subscribe** | `mesh.emit(topic, data)` | Publishes an event. No reply is expected. | `emit`, §6.6 |

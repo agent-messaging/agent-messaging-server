@@ -107,6 +107,12 @@ import type {
   SecurityWarning,
 } from "./types/options.js";
 import { PROTOCOL_VERSION } from "./types/envelope.js";
+import { A2ANamespace } from "./a2a/index.js";
+import { A2AServerAgent, A2A_STORE_SUBJECTS, legacyInputOf, messageOfLegacyInput, outputOfParts, partsOfOutput } from "./a2a/server.js";
+import { A2A_BINDING_URI, A2A_STATE_META, A2A_WIRE_VERSION, forbiddenFieldsRefusal, isA2AFrame, isAcceptSignal, isTerminalState } from "./a2a/binding.js";
+import { A2AError } from "./a2a/errors.js";
+import { isForPerson } from "./a2a/extensions.js";
+import type { Message as A2AMessage } from "./a2a/types.js";
 import { MeshError, RejectedError, ErrorCode } from "./types/errors.js";
 import { ConnectionManager } from "./internal/connection.js";
 import { createEnvelope } from "./internal/envelope-builder.js";
@@ -1492,7 +1498,11 @@ export class AgentMesh {
         attestation: createAttestation(this.nodeKp, this.agentId, vouchTtl),
         profile: nodeProfile,
       },
-      capabilities: opts.capabilities ?? [],
+      // An agent that serves A2A lists the binding (bindings/a2a.md §3), which
+      // is how a gateway or a client knows to send it 0.4.0 frames.
+      capabilities: this.a2aServerCache?.serving
+        ? [...new Set([...(opts.capabilities ?? []), A2A_BINDING_URI])]
+        : (opts.capabilities ?? []),
       // Deprecation window (§8.5): embedders written against the pre-rename
       // API said `skills`. Honoured as input; the manifest emits only `offerings`.
       offerings: offeringsDeclared,
@@ -2235,6 +2245,7 @@ export class AgentMesh {
           // The mesh's answer for a paused agent (§4.12) says so, with the
           // reason a stop carries everywhere else (`agent_paused`).
           ...(c.paused === true ? { paused: true as const } : {}),
+          ...(c.delivered === true ? { delivered: true as const } : {}),
           ...(typeof c.code === "string" ? { reason: c.code } : {}),
         };
       }
@@ -2263,6 +2274,7 @@ export class AgentMesh {
           request_id: request.id,
           ...(ack.text !== undefined ? { text: ack.text } : {}),
           ...(ack.paused ? { paused: true, reason: ack.reason ?? "agent_paused" } : {}),
+          ...(ack.delivered ? { delivered: true } : {}),
         },
       },
     );
@@ -2315,7 +2327,14 @@ export class AgentMesh {
     bytes: Uint8Array,
     agentId: string,
     timeout: number,
-    hooks: { onAccept?: (env: Envelope) => void; onQueued?: (ack: QueuedAck, env: Envelope) => void },
+    hooks: {
+      onAccept?: (env: Envelope) => void;
+      onQueued?: (ack: QueuedAck, env: Envelope) => void;
+      /** The answer that arrives after a queued acknowledgement (§6.4a), at
+       *  this agent's inbox, from the agent the request went to, naming the
+       *  request in `in_reply_to`. Kept for a day. */
+      onLate?: (env: Envelope) => void;
+    },
   ): Promise<Envelope> {
     const conn = this.conn as ConnectionManager & {
       requestMulti?: ConnectionManager["requestMulti"];
@@ -2367,7 +2386,9 @@ export class AgentMesh {
         request: envelope,
         agentId,
         onRespond: (env: Envelope) => {
-          if (!env.error && (env.payload as RespondPayload | undefined)?.status === "accepted") {
+          // The accept signal: 0.3.0 says it as status "accepted"; a 0.4.0
+          // frame as {accepted} with no a2a member (bindings/a2a.md §11).
+          if (!env.error && ((env.payload as RespondPayload | undefined)?.status === "accepted" || (isA2AFrame(env) && isAcceptSignal(env)))) {
             accepted = true;
             arm(); // §6.4a: reset the timeout, keep waiting
             try {
@@ -2384,7 +2405,9 @@ export class AgentMesh {
             } catch {
               /* the hook's problem */
             }
-            settle(() => reject(this.queuedError(ack, envelope)));
+            if (hooks.onLate) this.keepLate(envelope.id, agentId, hooks.onLate);
+            if (hooks.onLate) this.keepLate(envelope.id, agentId, hooks.onLate);
+        settle(() => reject(this.queuedError(ack, envelope)));
             return;
           }
           settle(() => resolve(env));
@@ -2903,6 +2926,7 @@ export class AgentMesh {
 
   /** Set a default handler for requests that don't match any registered offering. */
   onDefault(handler: OfferingHandler): void {
+    this.a2aLegacyDefault = null;
     this.router.setDefault(handler);
   }
 
@@ -3593,6 +3617,298 @@ export class AgentMesh {
     return handle;
   }
 
+  // ─── A2A over Agent Messaging (bindings/a2a.md) ────────────────────
+
+  /** Answers still awaited after a queued acknowledgement, by request id. */
+  private readonly lateAnswers = new Map<string, { agentId: string; at: number; onLate: (env: Envelope) => void }>();
+
+  private keepLate(requestId: string, agentId: string, onLate: (env: Envelope) => void): void {
+    const now = Date.now();
+    for (const [k, v] of this.lateAnswers) if (now - v.at > 24 * 3600_000) this.lateAnswers.delete(k);
+    if (this.lateAnswers.size >= 10_000) {
+      const first = this.lateAnswers.keys().next().value;
+      if (first !== undefined) this.lateAnswers.delete(first);
+    }
+    this.lateAnswers.set(requestId, { agentId, at: now, onLate });
+  }
+
+  /** A respond that names a request whose wait ended in a queued
+   *  acknowledgement: from the agent it went to, it is the late answer (an
+   *  accept or another acknowledgement is not). */
+  private deliverLate(env: Envelope): void {
+    const id = env.in_reply_to;
+    const late = typeof id === "string" ? this.lateAnswers.get(id) : undefined;
+    if (!late || env.from !== late.agentId) return;
+    if (this.queuedAckOf(env)) return;
+    if (!env.error && ((env.payload as RespondPayload | undefined)?.status === "accepted" || (isA2AFrame(env) && isAcceptSignal(env)))) return;
+    if (!this.rememberInboxId(env.from, env.id)) return; // §22.2
+    this.lateAnswers.delete(id as string);
+    try {
+      late.onLate(env);
+    } catch {
+      /* the hook's problem */
+    }
+  }
+
+  /** Streams this agent reads that the mesh delivers to its inbox, by
+   *  streamId (A2A binding §8). */
+  private readonly a2aStreamListeners = new Map<string, (env: Envelope) => void>();
+
+  /** @internal The node's A2A side, made on first use. */
+  private a2aServerCache: A2AServerAgent | null = null;
+  private a2aCache: A2ANamespace | null = null;
+  /** The router default `serve` installed for 0.3.0 requests (§14), so a
+   *  later `onDefault` replaces it and nothing else does. */
+  private a2aLegacyDefault: OfferingHandler | null = null;
+
+  /**
+   * A2A over Agent Messaging: the client calls of every A2A operation
+   * (`sendMessage`, `sendStreamingMessage`, `getTask`, `listTasks`,
+   * `cancelTask`, `subscribeToTask`, the push notification config calls,
+   * `getExtendedAgentCard`), each a 0.4.0 frame (bindings/a2a.md §4, §5), and
+   * `serve(handler)` for answering them. This is the way agents call each
+   * other from Agent Messaging 0.10 on; `request`, `onRequest` and the task
+   * calls are the 0.3.0 wire, kept for the transition window.
+   */
+  get a2a(): A2ANamespace {
+    if (!this.a2aCache) {
+      this.a2aCache = new A2ANamespace(
+        {
+          agentId: this.agentId,
+          frame: (p) =>
+            this.newEnvelope({
+              type: "request",
+              from: this.agentId,
+              v: A2A_WIRE_VERSION,
+              to: p.to,
+              // §8a: the whole A2A object is sealed, with this agent's key as
+              // reply_key so the answers come back sealed.
+              payload: p.seal ? this.sealOutbound(p.to, p.payload, this.manifestCache.get(p.to), true) : p.payload,
+              meta: p.meta,
+            }),
+          open: (env) => this.openA2AFrame(env),
+          call: async (agentId, env, timeoutMs, callOpts) => {
+            if (this.namingGate) await this.namingGate.require();
+            // Whoever this agent writes to may answer it (admission.ts).
+            this.admissionGate?.noteAddressed(agentId);
+            const bytes = encode(env);
+            preflightEnvelopeSize(bytes.length, this.conn.maxPayload);
+            return this.awaitAgentReply(this.resolvedInbox(agentId), env, bytes, agentId, timeoutMs, callOpts?.onLate ? { onLate: callOpts.onLate } : {});
+          },
+          subscribe: (subject, onFrame) => {
+            const sub = this.conn.subscribe(subject, (m: Msg) => {
+              let env: Envelope;
+              try {
+                env = decode(m.data);
+              } catch {
+                return;
+              }
+              onFrame(env);
+            });
+            return { unsubscribe: () => sub.unsubscribe() };
+          },
+          streamSubject: (taskId) => Subjects.taskStream(taskId),
+          follow: async (taskId, opening) => {
+            try {
+              await this.serviceRequest(A2A_STORE_SUBJECTS.FOLLOW, { frame: opening, taskId }, 10_000, { v: A2A_WIRE_VERSION });
+              return true;
+            } catch (err) {
+              const a2a = err instanceof MeshError ? A2AError.fromErrorObject(err.toErrorObject()) : null;
+              if (a2a) throw a2a;
+              return false; // no task manager here, or it holds no MESH_TASKS
+            }
+          },
+          onStreamFrame: (streamId, onFrame) => {
+            this.a2aStreamListeners.set(streamId, onFrame);
+            return () => {
+              if (this.a2aStreamListeners.get(streamId) === onFrame) this.a2aStreamListeners.delete(streamId);
+            };
+          },
+        },
+        this.a2aServer(),
+        () => this.onA2AServe(),
+      );
+    }
+    return this.a2aCache;
+  }
+
+  private a2aServer(): A2AServerAgent {
+    if (this.a2aServerCache) return this.a2aServerCache;
+    const server = new A2AServerAgent({
+      agentId: this.agentId,
+      frame: (p) =>
+        this.newEnvelope({
+          type: "respond",
+          from: this.agentId,
+          v: A2A_WIRE_VERSION,
+          to: p.to,
+          ...(p.in_reply_to !== undefined ? { in_reply_to: p.in_reply_to } : {}),
+          trace: p.trace,
+          ...(p.payload !== undefined ? { payload: p.sealTo ? sealPayloadTo(p.payload, p.sealTo) : p.payload } : {}),
+          ...(p.error !== undefined ? { error: p.error } : {}),
+          ...(p.sealTo && p.clearState ? { meta: { [A2A_STATE_META]: p.clearState } } : {}),
+        }),
+      publish: (subject, env) => this.conn.publish(subject, encode(env)),
+      updateSubject: (taskId) => Subjects.taskUpdate(taskId),
+      streamSubject: (taskId) => Subjects.taskStream(taskId),
+      serviceRequest: (subject, payload, timeoutMs) => this.serviceRequest(subject, payload, timeoutMs, { v: A2A_WIRE_VERSION }),
+      offerings: () => (this.manifest?.offerings ?? []).map((o) => o.id),
+    });
+    // §14: a 0.4.0 SendMessage to an agent with only 0.3.0 handlers reaches
+    // the handler for the offering it names, and comes back as a Message.
+    server.legacy = async (offering, message, env) => {
+      const handler = this.router.resolve(offering ?? "");
+      if (!handler || handler === this.a2aLegacyDefault) {
+        throw new A2AError("InvalidParamsError", `No handler for the offering ${JSON.stringify(offering ?? "")}.`, {
+          offerings: this.router.offerings,
+        });
+      }
+      const taskId = uuid7();
+      let out: unknown;
+      try {
+        out = await handler(legacyInputOf(message), {
+          envelope: env,
+          taskId,
+          traceContext: env.trace,
+          reportUsage: () => undefined,
+          reportMeter: () => undefined,
+        });
+      } catch (err) {
+        if (err instanceof MeshError && (err.code === ErrorCode.INPUT_INVALID || err.code === ErrorCode.OFFERING_NOT_FOUND)) {
+          throw new A2AError("InvalidParamsError", err.message, { agentmesh_code: err.code });
+        }
+        throw err;
+      }
+      return {
+        messageId: uuid7(),
+        role: "ROLE_AGENT",
+        parts: partsOfOutput(out),
+        ...(message.contextId ? { contextId: message.contextId } : {}),
+      } satisfies A2AMessage;
+    };
+    this.a2aServerCache = server;
+    return server;
+  }
+
+  /** `serve` was called: 0.3.0 requests nobody else handles reach the A2A
+   *  handler as Messages (§14), and a registered agent lists the binding. */
+  private onA2AServe(): void {
+    // Serving means receiving: the inbox is listened to even before register.
+    this.listenInbox();
+    if (!this.router.hasDefault) {
+      const server = this.a2aServer();
+      const adapter: OfferingHandler = async (input, ctx) => {
+        const payload = ctx.envelope.payload as RequestPayload | undefined;
+        const message = messageOfLegacyInput(input, payload?.offering);
+        const relay = this.newEnvelope({
+          type: "request",
+          from: ctx.envelope.from,
+          v: A2A_WIRE_VERSION,
+          to: this.agentId,
+          trace: ctx.traceContext,
+          payload: { a2a: { method: "SendMessage", params: { message } } },
+        });
+        // The A2A handler runs as for a 0.4.0 call from the same sender; the
+        // answer is read back here rather than sent.
+        let answer: Envelope | null = null;
+        await server.dispatch({ ...relay, from: ctx.envelope.from, id: ctx.envelope.id }, (resp) => {
+          answer ??= resp;
+        });
+        const resp = answer as Envelope | null;
+        if (!resp) throw new MeshError(ErrorCode.INTERNAL_ERROR, "The A2A handler gave no answer.");
+        if (resp.error) {
+          throw new MeshError((resp.error.code === "InvalidParamsError" ? ErrorCode.INPUT_INVALID : ErrorCode.INTERNAL_ERROR), resp.error.message, {
+            details: resp.error.details,
+          });
+        }
+        const result = (resp.payload as { a2a?: { result?: { message?: A2AMessage; task?: { id: string; status: { state: string }; artifacts?: { parts: A2AMessage["parts"] }[] } } } })
+          .a2a?.result;
+        if (result?.message) return outputOfParts(result.message.parts);
+        let task = result?.task;
+        if (task && !isTerminalState(task.status.state)) task = (await server.handleFor(task.id)?.settled()) ?? task;
+        if (task?.status.state === "TASK_STATE_COMPLETED") return outputOfParts((task.artifacts ?? []).flatMap((a) => a.parts));
+        throw new MeshError(ErrorCode.INTERNAL_ERROR, `The A2A task ended ${task?.status.state ?? "without a state"}.`, {
+          details: { a2a_task: task },
+        });
+      };
+      this.a2aLegacyDefault = adapter;
+      this.router.setDefault(adapter);
+    }
+  }
+
+  /** A 0.4.0 frame with its sealed payload opened by this agent's key (§8a);
+   *  a frame that is not sealed, or does not open, is returned as it came. */
+  private openA2AFrame(env: Envelope): Envelope {
+    if (!isA2AFrame(env) || !isSealedPayload(env.payload) || !this.encryptionSeed) return env;
+    const opened = openSealedPayload(env.payload, this.encryptionSeed);
+    return opened ? { ...env, payload: opened.payload } : env;
+  }
+
+  /** One 0.4.0 request frame (bindings/a2a.md): refused when it carries the
+   *  old envelope fields (§4), measured against the inbound cap, put through
+   *  admission (§10), then answered by the A2A side. */
+  private async handleA2AFrame(msg: Msg, env: Envelope, guarded: boolean, forPerson: boolean): Promise<void> {
+    const refusal = forbiddenFieldsRefusal(env);
+    if (refusal) {
+      const errEnv = this.newEnvelope({
+        type: "respond",
+        from: this.agentId,
+        v: A2A_WIRE_VERSION,
+        to: env.from,
+        in_reply_to: env.id,
+        trace: childSpan(env.trace),
+        error: refusal.toErrorObject(),
+      });
+      this.sendRespond(msg, env, encode(errEnv), { transportReply: guarded, tap: true });
+      return;
+    }
+    // §8a: a sealed frame is opened here, and its answers are sealed back to
+    // the sender's own published key (the reply_key must name it).
+    let sealTo: string | undefined;
+    const sealedIn = isSealedPayload(env.payload);
+    if (sealedIn) {
+      const replyKey = (env.payload as { reply_key?: string }).reply_key;
+      const opened = this.encryptionSeed ? openSealedPayload(env.payload as Parameters<typeof openSealedPayload>[0], this.encryptionSeed) : null;
+      if (opened) {
+        env = { ...env, payload: opened.payload };
+        sealTo = (await this.replySealKey(env.from, replyKey)) ?? undefined;
+      }
+    } else if (this.manifest?.sealing === "required") {
+      const errEnv = this.newEnvelope({
+        type: "respond",
+        from: this.agentId,
+        v: A2A_WIRE_VERSION,
+        to: env.from,
+        in_reply_to: env.id,
+        trace: childSpan(env.trace),
+        error: { code: ErrorCode.SEALING_REQUIRED, message: "This agent reads sealed frames only (§8.9, A2A binding §8a).", retryable: false },
+      });
+      this.sendRespond(msg, env, encode(errEnv), { transportReply: guarded, tap: true });
+      return;
+    }
+    const a2a = (env.payload as { a2a?: { method?: unknown; params?: unknown } } | undefined)?.a2a;
+    if (this.overInboundCap(a2a?.params, env, msg, guarded)) return;
+    const params = (a2a?.params ?? {}) as { message?: A2AMessage };
+    const offeringExt = params.message?.metadata?.["https://agentmessaging.ai/extensions/offering/v1"] as { offering?: unknown } | undefined;
+    const asRequest: RequestPayload = {
+      offering: typeof offeringExt?.offering === "string" ? offeringExt.offering : typeof a2a?.method === "string" ? a2a.method : "",
+      input: params,
+    };
+    // A sender this agent has not admitted is refused before any operation
+    // runs (§10, EXT-6).
+    if (this.admissionGate && (await this.admissionDoor(msg, env, asRequest, guarded, forPerson))) return;
+    // §12.3: the audience extension is A2A's name for meta.audience; a frame
+    // where the two marks disagree is treated as meant for the person.
+    if (!forPerson && isForPerson(params.message)) forPerson = true;
+    if (forPerson) {
+      const surfaced = this.surfaceToPerson(env, "request");
+      this.answerQueued(msg, env, guarded, surfaced);
+      return;
+    }
+    const frame = env;
+    await this.a2aServer().dispatch(frame, (resp) => this.sendRespond(msg, frame, encode(resp), { transportReply: guarded, tap: true }), { ...(sealTo ? { sealTo } : {}) });
+  }
+
   // ─── Service requests ──────────────────────────────────────────────
 
   /** Signed request to a bare service subject (registry-style, not an agent
@@ -3602,11 +3918,14 @@ export class AgentMesh {
     subject: string,
     payload: unknown,
     timeoutMs = 30_000,
+    /** The wire version of the request; the SDK's A2A calls send 0.4.0. */
+    opts: { v?: string } = {},
   ): Promise<unknown> {
     const env = this.newEnvelope({
       type: "request",
       from: this.agentId,
       payload,
+      ...(opts.v ? { v: opts.v } : {}),
     });
     const resp = await this.conn.request(subject, encode(env), {
       timeout: timeoutMs,
@@ -6572,6 +6891,19 @@ export class AgentMesh {
    */
   private handleInboxRespond(env: Envelope, buffered: boolean): void {
     if (env.to !== undefined && env.to !== this.agentId) return;
+    // A later event of a stream this agent reads, which the mesh delivered
+    // from MESH_TASKS (A2A binding §8). Its age is the stream's, not the
+    // delivery's, so the freshness window does not apply: the stream reader
+    // drops what it has seen by seq, and the signature was checked.
+    if (isA2AFrame(env) && env.in_reply_to === undefined) {
+      const streamId = (env.payload as { a2a?: { streamId?: unknown } } | undefined)?.a2a?.streamId;
+      const listener = typeof streamId === "string" ? this.a2aStreamListeners.get(streamId) : undefined;
+      if (listener) {
+        if (!this.rememberInboxId(env.from, env.id)) return; // §22.2
+        listener(env);
+        return;
+      }
+    }
     if (!this.freshEnough(env, buffered)) return;
     // SPEC.md §5.7: a respond marked for a person is a person's reply to a
     // message this agent's person sent. It resolves no wait (rule 1) and goes
@@ -6591,7 +6923,10 @@ export class AgentMesh {
       typeof env.in_reply_to === "string"
         ? this.pendingAgentReplies.get(env.in_reply_to)
         : undefined;
-    if (!pending) return;
+    if (!pending) {
+      this.deliverLate(env);
+      return;
+    }
     try {
       this.bindResponse(env, pending.request, { agent: pending.agentId });
     } catch {
@@ -6841,6 +7176,20 @@ export class AgentMesh {
     // has no relay waiting.
     const guarded =
       !buffered && typeof msg.subject === "string" && msg.subject.endsWith(".inbox.guarded");
+
+    // A2A over Agent Messaging (bindings/a2a.md): a 0.4.0 request carries an
+    // A2A operation, after every check above. It is answered in 0.4.0 (§14).
+    // The channel's own requests (describe, knock, the probe, advisories)
+    // travel at 0.4.0 with no a2a member and go on below as they always did,
+    // once the §4 field check has passed.
+    if (isA2AFrame(env)) {
+      const p = env.payload as Record<string, unknown> | undefined;
+      const a2aFrame = !!p && typeof p === "object" && (p.a2a !== undefined || isSealedPayload(p));
+      if (a2aFrame || forbiddenFieldsRefusal(env)) {
+        await this.handleA2AFrame(msg, env, guarded, audience === "person");
+        return;
+      }
+    }
 
     // A wire-supplied task_id ends up interpolated into the stream and update
     // subjects this agent publishes on (§18.1), and it is echoed on every reply

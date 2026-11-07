@@ -5,6 +5,21 @@ import type { Manifest, Offering } from "../../../sdk-typescript/src/types/manif
 import type { CallerKind } from "../inbound/identity-store.js";
 import { A2A_PROTOCOL_VERSION } from "./jsonrpc.js";
 import { overA2ACardExtension } from "./over-a2a.js";
+import { A2A_BINDING_URI } from "../../../sdk-typescript/src/a2a/binding.js";
+import { cardExtensions } from "../../../sdk-typescript/src/a2a/extensions.js";
+
+/**
+ * The A2A binding's interface for an agent (bindings/a2a.md §3): the mesh
+ * home, then `/agents/`, then the agent's handle or, without one, its agent
+ * ID, percent-encoded outside the URL path set.
+ */
+export function bindingInterface(meshHome: string, agent: string): { url: string; protocolBinding: string; protocolVersion: string } {
+  return {
+    url: `${meshHome.replace(/\/+$/, "")}/agents/${encodeURIComponent(agent).replace(/%40/g, "@")}`,
+    protocolBinding: A2A_BINDING_URI,
+    protocolVersion: A2A_PROTOCOL_VERSION,
+  };
+}
 
 export const BRIDGE_EXTENSION_URI = "mesh://extensions/a2a-bridge/v1";
 
@@ -228,8 +243,16 @@ export function manifestToCard(
   manifest: Manifest,
   publicBaseUrl: string,
   security: CardSecurityPolicy = { apiKey: false, anonymous: true },
+  /** The mesh home (bindings/a2a.md §3). With it, an agent that serves the
+   *  A2A binding lists the binding among its interfaces. */
+  meshHome?: string,
+  /** The binding interface's URL as the mesh home's own card names it (with
+   *  the agent's handle when the naming service confirms one); without it,
+   *  the mesh home and the agent ID. */
+  bindingUrl?: string,
 ): AgentCard {
   const base = publicBaseUrl.replace(/\/+$/, "");
+  const binding = Array.isArray(manifest.capabilities) && manifest.capabilities.includes(A2A_BINDING_URI);
   return {
     ...securityFor(security),
     name: manifest.name,
@@ -249,13 +272,21 @@ export function manifestToCard(
         protocolBinding: "HTTP+JSON",
         protocolVersion: A2A_PROTOCOL_VERSION,
       },
+      // The agent's own interface on the mesh, for a client that is on one
+      // (bindings/a2a.md §3). Listed after the HTTP ones, which are what this
+      // gateway serves.
+      ...(binding && bindingUrl
+        ? [{ ...bindingInterface(meshHome ?? "", manifest.id), url: bindingUrl }]
+        : binding && meshHome
+          ? [bindingInterface(meshHome, manifest.id)]
+          : []),
     ],
     provider: manifest.provider
       ? { organization: manifest.provider.name, url: manifest.provider.url }
       : undefined,
     documentationUrl: "https://agentmesh.ai/a2a-bridge.html",
     capabilities: {
-      streaming: manifest.offerings.some((s) => s.streaming === true),
+      streaming: binding || manifest.offerings.some((s) => s.streaming === true),
       pushNotifications: false,
       extendedAgentCard: false,
       extensions: [
@@ -272,6 +303,9 @@ export function manifestToCard(
         overA2ACardExtension(),
         // Messages for the person (§8.4): listed exactly when the agent declares it.
         ...(declaresExtension(manifest, AUDIENCE_URI) ? [{ uri: AUDIENCE_URI, description: AUDIENCE_DESCRIPTION, required: false }] : []),
+        // The binding's extensions (§12), each `required: false`, for an
+        // agent that serves it: the SDK's A2A side supports all of them.
+        ...(binding ? cardExtensions() : []),
       ],
     },
     defaultInputModes: defaulted(manifest.default_input_modes),

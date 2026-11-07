@@ -29,6 +29,7 @@ const ALLOWED = [
   [/^SUAEGDPNTWXACIF45CA23BUY36RIMWZXW5LEHSEOK2ONS5JWJ7PBC2EWBA$/, "the specification's published signing test identity"],
   [/^SUAKUHTBUGFZ3NORTJZZBQUZCETUDR5SUPVOUVYRSO7ZU5JJNZNH2POCWE$/, "the specification's published delegation vector"],
   [/^SAAJ4CG7I4PNGYI5UX35JJRPCPZIOALHKDKMKSHJ3GSIM2NWDOVUOKKENQ$/, "the published t13 fixture seed"],
+  [/^SUAKVYKT5CTPSYGY5O33NNA6Y55KPSJBUBC32V7BXOQ6JLZB4YMV32IDIY$/, "the specification's published responder test identity (Agent Emailing's conformance cases, reused by conformance/a2a-binding.json)"],
   [/^(amqp|postgres):\/\/(user:pass|user:password|mesh-core:p%40ss%20word)@/, "a placeholder in a comment or a URL-parsing test"],
 ];
 

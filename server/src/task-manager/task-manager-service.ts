@@ -10,10 +10,25 @@ import { OverdueSweep } from "./overdue-sweep.js";
 import { declaredNeedRefs, type DeclaredNeedsFn } from "./cancel.js";
 import { OriginLedger, CANCEL_SWEEP_INTERVAL_MS } from "./origin.js";
 import { OriginTap } from "./origin-tap.js";
+import { A2ATaskStore } from "./a2a-store.js";
+import { A2AFollow, A2A_FOLLOW_SUBJECT } from "./a2a-follow.js";
+import { wire030Refused, wire030RefusalError } from "../shared/wire-window.js";
+import { createEnvelope, childSpan } from "../sdk.js";
+import { A2A_STORE_SUBJECTS } from "../../../sdk-typescript/src/a2a/server.js";
 
 /** TASK_CANCEL_SETTLE_GRACE_MS: the grace period G before a cancel may be
  *  settled as "the requester did not ask" (origin.ts); a positive integer of
  *  milliseconds, else the default. */
+/** Is this update a 0.4.0 frame (the A2A binding)? Read without verifying:
+ *  the A2A store verifies what it applies. */
+function isA2AUpdate(data: Uint8Array): boolean {
+  try {
+    return (JSON.parse(new TextDecoder().decode(data)) as { v?: unknown }).v === "0.4.0";
+  } catch {
+    return false;
+  }
+}
+
 function settleGraceFromEnv(): number | undefined {
   const raw = process.env.TASK_CANCEL_SETTLE_GRACE_MS;
   if (!raw) return undefined;
@@ -43,14 +58,23 @@ export class TaskManagerService {
    *  which Task id each is bound to. Null when its store is not wired, which
    *  leaves records without `origin`. */
   private origins: OriginLedger | null;
+  /** A2A Tasks under the A2A binding (a2a-store.ts). Null when its store is
+   *  not wired, which leaves 0.4.0 Tasks unrecorded and their reads answered
+   *  by the server agents' nodes alone. */
+  private a2a: A2ATaskStore | null;
+  /** Serves Task streams to their readers from MESH_TASKS (a2a-follow.ts). */
+  private follow: A2AFollow | null = null;
+  private lastRefusalLog = 0;
 
   constructor(
     private nc: Messaging,
     private js: StorageLike,
     kv: KeyedLike,
     origins?: KeyedLike,
+    a2aTasks?: KeyedLike,
   ) {
     this.kv = keyedOf(kv, js);
+    this.a2a = a2aTasks ? new A2ATaskStore(keyedOf(a2aTasks, js)) : null;
     this.origins = origins
       ? new OriginLedger(keyedOf(origins, js), this.kv, {
           onCanceledBySettled: (record) => publishCanceledBySettled(this.nc, this.kp, record),
@@ -90,10 +114,12 @@ export class TaskManagerService {
     const kv = await storageOf(js).keyed("mesh_tasks");
     // Seven days, the Task horizon (storage/catalog.ts).
     const origins = await storageOf(js).keyed("mesh_task_origins");
+    // A2A Tasks, the Task horizon (storage/catalog.ts).
+    const a2aTasks = await storageOf(js).keyed("mesh_a2a_tasks");
     // EXT-8 §3's reported-spend rollup is not this service's: whoever
     // operates the mesh folds it from the §19.2 receipts this service
     // publishes (on AgentMesh, platform-shared/spend-rollup.ts).
-    return new TaskManagerService(messagingOf(nc), js, kv, origins);
+    return new TaskManagerService(messagingOf(nc), js, kv, origins, a2aTasks);
   }
 
   async start(): Promise<void> {
@@ -113,6 +139,23 @@ export class TaskManagerService {
 
     (async () => {
       for await (const msg of updateSub) {
+        // The A2A binding's Task changes (0.4.0 frames) go to the A2A store;
+        // 0.3.0 updates are handled as they always were.
+        if (this.a2a && isA2AUpdate(msg.data)) {
+          await this.a2a.observe(msg.subject, msg.data).catch((err) => console.error("[task-manager] a2a update:", err));
+          continue;
+        }
+        // The 0.3.0 window is over (shared/wire-window.ts): a 0.3.0 update is
+        // refused. The subject carries no reply, so it is logged, a line a
+        // minute at most.
+        if (wire030Refused()) {
+          const now = Date.now();
+          if (now - this.lastRefusalLog > 60_000) {
+            this.lastRefusalLog = now;
+            console.warn(`[task-manager] refused a 0.3.0 Task update on ${msg.subject}: MESH_WIRE_0_3_0=refuse`);
+          }
+          continue;
+        }
         try {
           await handleTaskUpdate(
             msg,
@@ -146,6 +189,7 @@ export class TaskManagerService {
       const sub = this.nc.subscribe(subject, { queue: serviceQueue(subject) });
       this.subs.push(sub);
       const tap = new OriginTap(this.origins);
+      const a2a = this.a2a;
       (async () => {
         for await (const msg of sub) {
           try {
@@ -153,8 +197,42 @@ export class TaskManagerService {
           } catch (err) {
             console.error("[task-manager] origin tap:", err);
           }
+          // The same delivery, for the A2A binding: a 0.4.0 answer whose
+          // result is a Task creates its record.
+          if (a2a) await a2a.observe(msg.subject, msg.data).catch((err) => console.error("[task-manager] a2a tap:", err));
         }
       })();
+    } else if (this.a2a) {
+      const subject = "mesh.agent.*.inbox";
+      const sub = this.nc.subscribe(subject, { queue: serviceQueue(subject) });
+      this.subs.push(sub);
+      const a2a = this.a2a;
+      (async () => {
+        for await (const msg of sub) await a2a.observe(msg.subject, msg.data).catch((err) => console.error("[task-manager] a2a tap:", err));
+      })();
+    }
+
+    // A2A binding (a2a-store.ts): the two reads a server agent's node relays
+    // for its clients.
+    if (this.a2a) {
+      const a2a = this.a2a;
+      // MESH_TASKS keeps every frame of every Task stream for the Task
+      // horizon; following a stream reads it from there (a2a-follow.ts).
+      const tasks = storageOf(this.js).stream("MESH_TASKS");
+      const usable = await tasks.ensure().catch(() => false);
+      this.follow = new A2AFollow(usable ? tasks : null, a2a, this.nc);
+      const follow = this.follow;
+      this.subs.push(
+        subscribeWithHandler(this.nc, A2A_FOLLOW_SUBJECT, this.kp, (env, msg) => follow.handle(env, msg, this.SERVICE_ID), undefined, undefined, serviceQueue(A2A_FOLLOW_SUBJECT)),
+      );
+      for (const [subject, read] of [
+        [A2A_STORE_SUBJECTS.GET, a2a.handleGet.bind(a2a)],
+        [A2A_STORE_SUBJECTS.LIST, a2a.handleList.bind(a2a)],
+      ] as const) {
+        this.subs.push(
+          subscribeWithHandler(this.nc, subject, this.kp, (env, msg) => read(env, msg, this.SERVICE_ID), undefined, undefined, serviceQueue(subject)),
+        );
+      }
     }
 
     // Request-reply for task lookup: mesh.task.get.*
@@ -163,7 +241,11 @@ export class TaskManagerService {
         this.nc,
         "mesh.task.get.*",
         this.kp,
-        (env, msg) => handleTaskGet(env, msg, this.kv, this.SERVICE_ID, this.origins ?? undefined),
+        (env, msg) =>
+          // A 0.3.0 Task read, once the 0.3.0 window is over, is refused.
+          wire030Refused()
+            ? Promise.resolve(createEnvelope({ type: "respond", from: this.SERVICE_ID, to: env.from, in_reply_to: env.id, trace: childSpan(env.trace), error: wire030RefusalError() }))
+            : handleTaskGet(env, msg, this.kv, this.SERVICE_ID, this.origins ?? undefined),
         undefined,
         undefined,
         serviceQueue("mesh.task.get.*"),
@@ -197,6 +279,7 @@ export class TaskManagerService {
       sub.unsubscribe();
     }
     this.overdueSweep?.stop();
+    this.follow?.stopAll();
     if (this.cancelSweep) clearInterval(this.cancelSweep);
     this.cancelSweep = null;
     console.log("[task-manager] service stopped");

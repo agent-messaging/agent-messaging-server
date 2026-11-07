@@ -1096,3 +1096,24 @@ export {
   type ReadableTextMeta,
   type ReadableTextCheck,
 } from "./readable-text.js";
+
+// A2A over Agent Messaging (bindings/a2a.md): wire version 0.4.0. Everything
+// under the `A2A` namespace (the A2A 1.0 types, the frames, the errors and the
+// extension helpers); the names a caller reaches for most are also here.
+export * as A2A from "./a2a/index.js";
+export {
+  A2ANamespace,
+  A2AClient,
+  A2AServerAgent,
+  A2AError,
+  A2A_BINDING_URI,
+  A2A_WIRE_VERSION,
+  A2A_ERROR_CODES,
+  type A2AHandler,
+  type A2AContext,
+  type A2AServeOptions,
+  type A2ACallOptions,
+  type A2AStreamOptions,
+  type A2AEventStream,
+  type TaskHandle as A2ATaskHandle,
+} from "./a2a/index.js";

@@ -7,6 +7,7 @@
   "files": [
     "a2a-gateway/MAPPING.md",
     "conformance/SPEC.md",
+    "conformance/a2a-binding.json",
     "conformance/accept-signal.json",
     "conformance/allowance.json",
     "conformance/audience.json",
@@ -49,6 +50,7 @@
     "conformance/core/tests/c24-mesh-object.mjs",
     "conformance/core/tests/c24b-nats-endpoints.mjs",
     "conformance/core/tests/c25-person-audience-task-updates.mjs",
+    "conformance/core/tests/c26-a2a-binding.mjs",
     "conformance/core/tests/i01-oauth-enrolls.mjs",
     "conformance/core/tests/i02-wrong-audience.mjs",
     "conformance/core/tests/i03-expired-token.mjs",
@@ -111,5 +113,12 @@
     "conformance/sow-terms.json",
     "conformance/trial.json",
     "docs/rabbitmq-binding.md"
-  ]
+  ],
+  "canonical": {
+    "about": "Where the text of some copied files is written. A change to one of these is made at its source and copied here unchanged, so the two cannot drift.",
+    "a2a-gateway/MAPPING.md": "CommonAgent/common-agent-standards: messaging/bindings/a2a-bridge.md",
+    "conformance/a2a-binding.json": "CommonAgent/common-agent-standards: messaging/conformance/a2a-binding.json",
+    "docs/rabbitmq-binding.md": "CommonAgent/common-agent-standards: messaging/bindings/rabbitmq.md",
+    "conformance/core/tests/c26-a2a-binding.mjs": "this repository (written here for the A2A binding; to be carried into the monorepo suite)"
+  }
 }

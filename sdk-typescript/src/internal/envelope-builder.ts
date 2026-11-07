@@ -36,6 +36,9 @@ export interface EnvelopeParams {
   payload?: unknown;
   artifacts?: Artifact[];
   meta?: Record<string, unknown>;
+  /** The wire version (§5.2 `v`). Default `PROTOCOL_VERSION` (0.3.0); A2A
+   *  binding frames say `0.4.0` (bindings/a2a.md §4). */
+  v?: string;
 }
 
 /** Build a valid Envelope. Auto-fills v, id, ts, trace. Validates at construction. */
@@ -58,7 +61,7 @@ export function createEnvelope(params: EnvelopeParams): Envelope {
   // propagation); otherwise it starts a new root.
   const ambient = params.trace === undefined ? currentTrace() : undefined;
   const envelope: Envelope = {
-    v: PROTOCOL_VERSION,
+    v: params.v ?? PROTOCOL_VERSION,
     id: uuid7(),
     type: params.type,
     ts: new Date().toISOString(),

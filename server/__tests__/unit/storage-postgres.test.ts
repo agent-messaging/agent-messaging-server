@@ -239,6 +239,24 @@ describe("streams on Postgres", () => {
     expect(await events.consumerState("fold")).toMatchObject({ pending: 0, ackPending: 0, ackFloor: 4 });
   });
 
+  it("keeps MESH_TASKS for a reader that follows late, and removes its consumer when done (A2A binding §8)", async () => {
+    const tasks = state.stream("MESH_TASKS");
+    expect(await tasks.ensure()).toBe(true);
+    expect((await tasks.info())!.subjects.sort()).toEqual(["mesh.task.*.stream", "mesh.task.*.update"]);
+    await tasks.append("mesh.task.t1.stream", te.encode("first"));
+    await tasks.append("mesh.task.t2.stream", te.encode("another task"));
+    await tasks.append("mesh.task.t1.update", te.encode("a change"));
+    await tasks.append("mesh.task.t1.stream", te.encode("second"));
+    // The reader's consumer is made after the frames were kept.
+    const c = await tasks.consume("a2a_follow_x", { filter: "mesh.task.t1.stream", from: "all" });
+    const got = await take(c[Symbol.asyncIterator](), 2);
+    expect(got.map((d) => td.decode(d!.data))).toEqual(["first", "second"]);
+    for (const d of got) d!.ack();
+    await c.close();
+    await tasks.removeConsumer!("a2a_follow_x");
+    await expect(tasks.consumerState("a2a_follow_x")).rejects.toThrow();
+  });
+
   it("ends a consumer when its stream is removed", async () => {
     const box = state.streams("MESH_INBOX_<agent>").member("A3");
     await box.create({ subjects: ["mesh.agent.A3.inbox"], discard: "old" });
