@@ -26,6 +26,7 @@ import {
   isA2AFrame,
   isAcceptSignal,
   isExhausted,
+  isTerminalState,
   isTrialMessage,
   readRequestPayload,
   readRespondPayload,
@@ -204,4 +205,46 @@ export function wire030State(task: { status?: { state?: unknown }; metadata?: Re
   const s = typeof task?.status?.state === "string" ? task.status.state : "TASK_STATE_UNSPECIFIED";
   if (isExhausted(task as never)) return "exhausted";
   return s.replace(/^TASK_STATE_/, "").toLowerCase();
+}
+
+/**
+ * A 0.4.0 frame shown in the 0.3.0 fields the activity tap reads
+ * (activity/activity-service.ts): a request's `payload.offering` (the
+ * resolved offering, see {@link OfferingDirectory}), `payload.input` (what
+ * the call carries, for the preview and its digest) and `task_id`; an
+ * answer's `task_id`, and `payload.status` where it says how the exchange
+ * ended (`completed`, or `failed` for a failed Task), so a §13.5 usage
+ * receipt beside `payload.a2a` on the frame that answers the call or reports
+ * the final state is lifted as on 0.3.0; the 0.4.0 accept signal as the
+ * 0.3.0 one. `inReplyTo` makes a reply (§12.9) read as the inbox-mode answer
+ * to the request it names. The frame's id, parties, `ts`, `meta` and
+ * `payload.usage` stay as they are; the view is never sent or verified.
+ * A frame that is not a 0.4.0 frame is returned as it is.
+ */
+export function activityView(env: Envelope, opts: { offering?: string; inReplyTo?: string } = {}): Envelope {
+  if (!isA2AFrame(env)) return env;
+  const payload = (env.payload && typeof env.payload === "object" ? env.payload : {}) as Record<string, unknown>;
+  if (env.type === "request") {
+    const facts = a2aRequestFacts(env);
+    if (!facts) return env;
+    const offering = opts.offering ?? facts.offering;
+    return {
+      ...env,
+      payload: { ...payload, ...(offering ? { offering } : {}), input: facts.input },
+      ...(facts.taskId ? { task_id: facts.taskId } : {}),
+      ...(opts.inReplyTo && !env.in_reply_to ? { in_reply_to: opts.inReplyTo } : {}),
+    } as Envelope;
+  }
+  if (env.type !== "respond") return env;
+  if (isAccept(env)) return { ...env, payload: { ...payload, status: "accepted" } } as Envelope;
+  const ev = a2aAnswerOf(env);
+  if (!ev) return env;
+  const taskId = str(ev.task?.id) ?? str(ev.statusUpdate?.taskId) ?? str(ev.artifactUpdate?.taskId);
+  const state = ev.task?.status?.state ?? ev.statusUpdate?.status?.state;
+  const ended = ev.message && !ev.task ? "completed" : isTerminalState(state) ? (state === "TASK_STATE_FAILED" ? "failed" : "completed") : undefined;
+  return {
+    ...env,
+    ...(taskId ? { task_id: taskId } : {}),
+    ...(ended ? { payload: { ...payload, status: ended } } : {}),
+  } as Envelope;
 }

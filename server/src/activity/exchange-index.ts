@@ -63,6 +63,8 @@ export interface ExchangeRecord {
   offering: string;
   /** The request's own `task_id`, only when the requester set one. */
   taskId?: string;
+  /** Common Agent §7.7: the call asked for trial work. */
+  trial?: true;
   /** When the tap saw the request (our clock). */
   recordedAt: string;
   /** When the exchange's first answer was counted. Once set, every later
