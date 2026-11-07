@@ -4,18 +4,22 @@
  * agent's inbox, its answers read from the respond frames that come back.
  *
  * Streams (§8): the first event arrives at this agent's inbox; every later one
- * on `mesh.task.{taskId}.stream`, numbered by `seq`. The client keeps the last
- * `seq` it delivered. An event it has seen is dropped; a gap, or a stream that
- * stays quiet, is closed by calling `SubscribeToTask`, which answers with the
- * Task's current state and the `seq` it stands at, and the stream goes on from
- * there. That is also how a client that lost its connection resumes.
+ * on `mesh.task.{taskId}.stream`, where several streams of one Task may share
+ * the subject. Each frame names its stream (`streamId`, the opening request
+ * frame's id) and its place in it (`seq`). The client reads its own stream's
+ * frames in `seq` order and drops one it has seen. This server has no
+ * durable stream behind the subject (SPEC.md §18.3), so a gap, or a stream
+ * that stays quiet, is checked with `GetTask`, and the Task as it stands is
+ * delivered as an event. A client that lost its connection calls
+ * `subscribeToTask`, which opens a new stream from the Task's current state.
  */
 import type { Envelope } from "../types/envelope.js";
 import { MeshError, ErrorCode } from "../types/errors.js";
+import { isSubjectToken } from "../internal/subjects.js";
 import {
   A2A_PROTOCOL_VERSION,
-  endsStream,
   eventEndsStream,
+  isTerminalState,
   isA2AFrame,
   readRespondPayload,
   requestPayload,
@@ -23,7 +27,7 @@ import {
   taskIdOfEvent,
 } from "./binding.js";
 import { A2AError, A2AErrors } from "./errors.js";
-import { EXT_CANCEL, cancelReasonOf, withCancelReason, type A2ACancel } from "./extensions.js";
+import { EXT_CANCEL, cancelReasonOf, isForPerson, withCancelReason, type A2ACancel } from "./extensions.js";
 import type {
   A2AMethod,
   A2AOperations,
@@ -78,18 +82,16 @@ export interface A2ACallOptions {
 }
 
 export interface A2AStreamOptions extends A2ACallOptions {
-  /** A quiet stream is checked with SubscribeToTask after this long. Default
-   *  5 seconds. */
+  /** A quiet stream is checked with GetTask after this long. Default 5
+   *  seconds. */
   idleResyncMs?: number;
-  /** For a resumed subscription: the last `seq` already delivered. Events up
-   *  to it are dropped. */
-  afterSeq?: number;
 }
 
-/** A stream of A2A events, with the Task id once it is known and the last
- *  `seq` delivered, which is what a client keeps to resume. */
+/** A stream of A2A events: the Task id once it is known, the stream's id
+ *  (its opening request frame's id) and the last `seq` delivered. */
 export interface A2AEventStream extends AsyncIterable<StreamResponse> {
   readonly taskId: string | undefined;
+  readonly streamId: string | undefined;
   readonly lastSeq: number;
 }
 
@@ -106,6 +108,10 @@ export class A2AClient {
     if (opts.extensions?.length) params2["A2A-Extensions"] = opts.extensions.join(",");
     const meta: Record<string, unknown> = { a2a: serviceParams(params2) };
     if (opts.engagement !== undefined) meta.engagement = opts.engagement;
+    // §12.3: a Message meant for the person carries meta.audience too, which
+    // is what nodes on the mesh read; the two marks agree.
+    const message = (params as { message?: Message } | undefined)?.message;
+    if (message && isForPerson(message)) meta.audience = "person";
     return this.host.frame({ to: agentId, payload: requestPayload(method, params), meta, ...(opts.seal ? { seal: true } : {}) });
   }
 
@@ -182,29 +188,37 @@ export class A2AClient {
   }
 
   /**
-   * A streaming operation (§8). The iterator yields each event once, in
-   * `seq` order, and ends after the event marked `final` (or one that puts
-   * the Task in a terminal or interrupted state, or a Message without a
-   * Task).
+   * A streaming operation (§8). The iterator yields each event of this
+   * request's stream once, in `seq` order, and ends after the event marked
+   * `final`: a terminal state, or a Message that answers without a Task. It
+   * stays open through an interrupted state, as A2A says.
    */
   private stream(agentId: string, method: "SendStreamingMessage" | "SubscribeToTask", params: unknown, opts: A2AStreamOptions): A2AEventStream {
     const self = this;
-    const state = { taskId: undefined as string | undefined, lastSeq: opts.afterSeq ?? -1 };
+    const state = { taskId: undefined as string | undefined, streamId: undefined as string | undefined, lastSeq: -1 };
     const iterate = async function* (): AsyncGenerator<StreamResponse> {
       const env = self.frameFor(agentId, method, params, opts);
-      const first = self.host.open(await self.host.call(agentId, env, opts.timeoutMs ?? 30_000));
-      if (first.error) raise(first);
-      const r = readRespondPayload(first);
-      if (!r) throw A2AErrors.invalidAgentResponse(`The answer to ${method} carried no payload.a2a.result.`);
-      const ev0 = r.result as StreamResponse;
-      state.taskId = taskIdOfEvent(ev0);
-      const seq0 = r.seq ?? 0;
-      if (seq0 > state.lastSeq) {
-        state.lastSeq = seq0;
+      state.streamId = env.id;
+      // SubscribeToTask names its Task, so the stream subject is listened to
+      // before the request leaves and no event can come first.
+      const known = method === "SubscribeToTask" ? (params as { id?: string }).id : undefined;
+      const listener = known && isSubjectToken(known) ? self.listen(agentId, known, env.id) : null;
+      try {
+        const first = self.host.open(await self.host.call(agentId, env, opts.timeoutMs ?? 30_000));
+        if (first.error) raise(first);
+        const r = readRespondPayload(first);
+        if (!r) throw A2AErrors.invalidAgentResponse(`The answer to ${method} carried no payload.a2a.result.`);
+        const ev0 = r.result as StreamResponse;
+        state.taskId = taskIdOfEvent(ev0);
+        state.lastSeq = 0;
         yield ev0;
+        if (r.final || eventEndsStream(ev0) || !state.taskId) return;
+        // A Task id becomes a subject token (§5); one that cannot is refused.
+        if (!isSubjectToken(state.taskId)) throw A2AErrors.invalidAgentResponse("The Task id is not a single subject token (A2A binding §5).");
+        yield* self.follow(agentId, state, opts, listener ?? self.listen(agentId, state.taskId, env.id), ev0);
+      } finally {
+        listener?.stop();
       }
-      if (r.final || eventEndsStream(ev0) || !state.taskId) return;
-      yield* self.follow(agentId, state, opts);
     };
     return {
       get taskId() {
@@ -213,92 +227,123 @@ export class A2AClient {
       get lastSeq() {
         return state.lastSeq;
       },
+      get streamId() {
+        return state.streamId;
+      },
       [Symbol.asyncIterator]: iterate,
     };
   }
 
-  /** The events after `state.lastSeq` on a Task's stream subject, with gaps
-   *  and silences closed by SubscribeToTask. */
+  /** Listen on a Task's stream subject for the frames of one stream. */
+  private listen(agentId: string, taskId: string, streamId: string): StreamListener {
+    const pending = new Map<number, { ev: StreamResponse; final: boolean }>();
+    const l: StreamListener = {
+      pending,
+      wake: null,
+      stop: () => sub.unsubscribe(),
+    };
+    const sub = this.host.subscribe(this.host.streamSubject(taskId), (sealed) => {
+      const env = this.host.open(sealed);
+      // Only the server agent speaks on its Tasks' streams, in 0.4.0 frames,
+      // and several streams share the subject: this one's frames only.
+      if (env.from !== agentId || !isA2AFrame(env) || env.error) return;
+      const r = readRespondPayload(env);
+      if (!r || r.streamId !== streamId || r.seq === undefined) return;
+      const ev = r.result as StreamResponse;
+      if (taskIdOfEvent(ev) !== taskId) return;
+      if (!pending.has(r.seq)) pending.set(r.seq, { ev, final: r.final || eventEndsStream(ev) });
+      const w = l.wake;
+      l.wake = null;
+      w?.();
+    });
+    return l;
+  }
+
+  /** The events after `state.lastSeq` of one stream. A gap, or a stream that
+   *  stays quiet, is checked with GetTask: a Task that moved on is delivered
+   *  as it stands, and a finished one ends the stream. */
   private async *follow(
     agentId: string,
     state: { taskId: string | undefined; lastSeq: number },
     opts: A2AStreamOptions,
+    l: StreamListener,
+    first: StreamResponse,
   ): AsyncGenerator<StreamResponse> {
     const taskId = state.taskId!;
-    const pending = new Map<number, { ev: StreamResponse; final: boolean }>();
-    let wake: (() => void) | null = null;
-    const nudge = () => {
-      const w = wake;
-      wake = null;
-      w?.();
-    };
-    const sub = this.host.subscribe(this.host.streamSubject(taskId), (sealed) => {
-      const env = this.host.open(sealed);
-      // Only the server agent speaks on its Tasks' streams, in 0.4.0 frames.
-      if (env.from !== agentId || !isA2AFrame(env) || env.error) return;
-      const r = readRespondPayload(env);
-      if (!r || r.seq === undefined || r.seq <= state.lastSeq) return;
-      const ev = r.result as StreamResponse;
-      if (taskIdOfEvent(ev) !== taskId) return;
-      pending.set(r.seq, { ev, final: r.final || eventEndsStream(ev) });
-      nudge();
-    });
     const idleMs = opts.idleResyncMs ?? 5_000;
+    let lastState: string | undefined;
+    let lastStamp: string | undefined;
+    const note = (ev: StreamResponse) => {
+      const st = ev.task?.status ?? ev.statusUpdate?.status;
+      if (st) {
+        lastState = st.state;
+        lastStamp = st.timestamp ?? lastStamp;
+      }
+    };
+    note(first);
+    // Events the server sent before this subscription existed are not kept
+    // for it (no durable stream on this server), so the first pass reads the
+    // Task once, as a quiet spell would.
+    let catchUp = true;
     try {
       for (;;) {
-        // Deliver what is next in order.
-        let next = pending.get(state.lastSeq + 1);
+        let next = l.pending.get(state.lastSeq + 1);
         while (next) {
-          pending.delete(state.lastSeq + 1);
+          l.pending.delete(state.lastSeq + 1);
           state.lastSeq += 1;
+          note(next.ev);
           yield next.ev;
           if (next.final) return;
-          next = pending.get(state.lastSeq + 1);
+          next = l.pending.get(state.lastSeq + 1);
         }
-        const gap = pending.size > 0;
-        if (!gap) {
+        for (const k of [...l.pending.keys()]) if (k <= state.lastSeq) l.pending.delete(k);
+        const gap = l.pending.size > 0;
+        if (!gap && !catchUp) {
           const woke = await new Promise<boolean>((resolve) => {
             const t = setTimeout(() => {
-              wake = null;
+              l.wake = null;
               resolve(false);
             }, idleMs);
-            wake = () => {
+            l.wake = () => {
               clearTimeout(t);
               resolve(true);
             };
           });
           if (woke) continue;
         }
-        // A gap, or nothing for a while: read the Task's current state.
-        let snap: { ev: StreamResponse; seq: number; final: boolean } | null = null;
+        // A gap, a quiet spell, or the first pass: read the Task as the store
+        // holds it.
+        catchUp = false;
+        let task: Task | null = null;
         try {
-          const env = this.frameFor(agentId, "SubscribeToTask", { id: taskId }, opts);
-          const resp = this.host.open(await this.host.call(agentId, env, opts.timeoutMs ?? 30_000));
-          if (resp.error) raise(resp);
-          const r = readRespondPayload(resp);
-          if (r) snap = { ev: r.result as StreamResponse, seq: r.seq ?? 0, final: r.final };
+          task = await this.getTask(agentId, taskId, opts);
         } catch (err) {
-          // A missing or refused Task ends the stream; a transport hiccup is
-          // tried again after the next quiet period.
           if (err instanceof A2AError) throw err;
           if (!(err instanceof MeshError) || err.code !== ErrorCode.TRANSPORT_TIMEOUT) throw err;
         }
-        if (snap && snap.seq > state.lastSeq) {
-          state.lastSeq = snap.seq;
-          for (const k of [...pending.keys()]) if (k <= snap.seq) pending.delete(k);
-          yield snap.ev;
-          if (snap.final || endsStream(snap.ev.task?.status?.state)) return;
-        } else if (gap) {
-          // The store has not caught up with the gap yet: skip to what has
-          // arrived rather than wait on an event that is gone.
-          const lowest = Math.min(...pending.keys());
-          state.lastSeq = lowest - 1;
+        // After a gap the Task holds what was lost, so it is always delivered;
+        // after a quiet spell, only when it moved on.
+        if (task && (gap || task.status.state !== lastState || (task.status.timestamp && task.status.timestamp !== lastStamp))) {
+          note({ task });
+          yield { task };
+          if (isTerminalState(task.status.state)) return;
+        }
+        if (gap) {
+          // What was lost is in the Task just delivered (or the store has not
+          // caught up): go on from what has arrived.
+          state.lastSeq = Math.min(...l.pending.keys()) - 1;
         }
       }
     } finally {
-      sub.unsubscribe();
+      l.stop();
     }
   }
+}
+
+interface StreamListener {
+  pending: Map<number, { ev: StreamResponse; final: boolean }>;
+  wake: (() => void) | null;
+  stop(): void;
 }
 
 function asSendRequest(r: SendMessageRequest | Message): SendMessageRequest {

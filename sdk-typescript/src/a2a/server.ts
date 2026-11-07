@@ -29,6 +29,7 @@ import type { Envelope, ErrorObject, TraceContext } from "../types/envelope.js";
 import { MeshError, ErrorCode } from "../types/errors.js";
 import { childSpan } from "../internal/trace.js";
 import { uuid7 } from "../internal/uuid.js";
+import { isSubjectToken } from "../internal/subjects.js";
 import {
   STREAMING_METHODS,
   activatedExtensions,
@@ -45,7 +46,11 @@ import {
 } from "./binding.js";
 import { A2AError, A2AErrors } from "./errors.js";
 import {
+  EXT_BUDGET,
   EXT_CANCEL,
+  EXT_FAILURE,
+  OVERDUE_METADATA,
+  A2A_CANCEL_REASONS,
   budgetOf,
   ceilingReachedTask,
   deadlineUnmeetableTask,
@@ -57,6 +62,7 @@ import {
   offeringOf,
   type A2AAmount,
   type A2ACancel,
+  type A2AFailure,
 } from "./extensions.js";
 import { validateStopFields } from "../cancel.js";
 import type { Budget } from "../types/envelope.js";
@@ -102,6 +108,9 @@ export interface A2AServerHost {
   }): Envelope;
   /** Publish a frame on a subject. */
   publish(subject: string, env: Envelope): void;
+  /** The subject a Task's changes travel on for the task store
+   *  (`mesh.task.{taskId}.update`, §5). */
+  updateSubject(taskId: string): string;
   /** The subject of a Task's stream (`mesh.task.{taskId}.stream`). */
   streamSubject(taskId: string): string;
   /** A signed request to a mesh service; resolves with the answer's payload. */
@@ -123,7 +132,13 @@ export interface TaskHandle {
    *  TaskArtifactUpdateEvent. */
   artifact(artifact: Artifact, opts?: { append?: boolean; lastChunk?: boolean }): void;
   complete(message?: string | Message): void;
-  fail(message?: string | Message): void;
+  /** End the Task failed, with the reason when one is stated (§12.7). */
+  fail(message?: string | Message, failure?: A2AFailure): void;
+  /** §12.2: the deadline passed while the work goes on (the overdue mark on
+   *  a status update; the state does not change). */
+  overdue(message?: string | Message): void;
+  /** §12.2: completed after the deadline (`completed_late`). */
+  completeLate(message?: string | Message): void;
   reject(message?: string | Message, metadata?: Record<string, unknown>): void;
   requireInput(message: string | Message): void;
   requireAuth(message: string | Message): void;
@@ -199,16 +214,23 @@ export interface A2AServeOptions {
   offerings?: string[];
 }
 
-interface LiveTask {
-  /** The request that created the Task came sealed: its frames are sealed to this key (§8a). */
+/** One open stream of a Task (§8): the request frame that opened it names
+ *  it, and its events count from 0. */
+interface OpenStream {
+  id: string;
+  seq: number;
+  to: string;
+  trace: TraceContext;
   sealTo?: string;
+}
+
+interface LiveTask {
   task: Task;
   requester: string;
-  seq: number;
-  /** The first event has gone to a client's inbox. */
-  announced: boolean;
-  /** The current stream has had its final event. */
-  ended: boolean;
+  /** The Task's own order of changes, as published on its update subject. */
+  version: number;
+  /** The streams open on this Task, by streamId. */
+  streams: Map<string, OpenStream>;
   trace: TraceContext;
   abort: AbortController;
   waiters: Array<(t: Task) => void>;
@@ -311,7 +333,7 @@ export class A2AServerAgent {
     const sealTo = opts.sealTo;
     const answerError = (err: A2AError | MeshError): void =>
       reply(this.frameOf({ to: env.from, in_reply_to: env.id, trace: childSpan(env.trace), error: err.toErrorObject() }, sealTo));
-    const answer = (result: unknown, stream?: { seq: number; final: boolean }): void =>
+    const answer = (result: unknown, stream?: { streamId: string; seq: number; final: boolean }): void =>
       reply(this.frameOf({ to: env.from, in_reply_to: env.id, trace: childSpan(env.trace), payload: respondPayload(result, stream) }, sealTo));
 
     if (!req) {
@@ -345,11 +367,15 @@ export class A2AServerAgent {
         case "SubscribeToTask": {
           const id = (params as { id?: unknown }).id;
           if (typeof id !== "string" || !id) throw A2AErrors.invalidParams("SubscribeToTask needs the Task's id.");
-          const { task, seq } = await this.readTask(env, id);
-          // §8: it starts from the Task's current state. The snapshot carries
-          // the seq of the last event folded into it, so the client takes the
-          // events after it from the stream subject.
-          answer({ task }, { seq, final: endsStream(task.status.state) });
+          // §8: a new stream, from the Task's current state as the store holds
+          // it. Its later events follow on the stream subject under this
+          // request's id.
+          const { task, seq, requester } = await this.readTask(env, id);
+          let live = this.live.get(id);
+          if (!live || live.version < seq) live = this.adopt(task, seq, requester ?? env.from, env.trace);
+          const final = isTerminalState(task.status.state);
+          if (!final) live.streams.set(env.id, { id: env.id, seq: 0, to: env.from, trace: env.trace, ...(sealTo ? { sealTo } : {}) });
+          answer({ task: cloneTask(live.task) }, { streamId: env.id, seq: 0, final });
           return;
         }
         case "CreateTaskPushNotificationConfig":
@@ -447,7 +473,7 @@ export class A2AServerAgent {
     if (!this.handler) {
       if (this.legacy && !existing) {
         const out = await this.legacy(offering, message, env);
-        this.answerFirst(env, reply, { message: out }, streaming ? { final: true } : undefined, sealTo);
+        this.answerFirst(env, reply, { message: out }, streaming ? { streamId: env.id, seq: 0, final: true } : undefined, sealTo);
         return;
       }
       throw A2AErrors.unsupported("A2A messages");
@@ -456,24 +482,32 @@ export class A2AServerAgent {
     let live: LiveTask | undefined = existing;
     let answered = false;
     const abort = existing?.abort ?? new AbortController();
+    const create = (task: Task): LiveTask => {
+      const l: LiveTask = { task, requester: env.from, version: 0, streams: new Map(), trace: env.trace, abort, waiters: [] };
+      this.live.set(task.id, l);
+      // The Task's first change, for the task store: the Task itself, in
+      // reply to the request that created it (§5).
+      this.publishUpdate(l, { task: cloneTask(task) }, env.id);
+      return l;
+    };
     const firstAnswer = (): void => {
       if (answered || !live) return;
       answered = true;
-      live.announced = true;
-      live.ended = false;
-      // The answer takes the next number in the Task's sequence: 0 for a new
-      // Task, the next for a message that continues one.
-      if (existing) live.seq += 1;
       const snapshot = cloneTask(live.task);
-      this.answerFirst(env, reply, { task: snapshot }, { seq: live.seq, final: streaming ? endsStream(snapshot.status.state) : false }, live.sealTo);
-      if (endsStream(snapshot.status.state)) live.ended = true;
+      if (streaming) {
+        // The stream this request opens: its first event is this answer.
+        const final = isTerminalState(snapshot.status.state);
+        if (!final) live.streams.set(env.id, { id: env.id, seq: 0, to: env.from, trace: env.trace, ...(sealTo ? { sealTo } : {}) });
+        this.answerFirst(env, reply, { task: snapshot }, { streamId: env.id, seq: 0, final }, sealTo);
+      } else {
+        this.answerFirst(env, reply, { task: snapshot }, undefined, sealTo);
+      }
     };
 
     if (existing) {
       // The client's message joins the history and the Task works again.
       existing.task.history = [...(existing.task.history ?? []), message];
       existing.trace = env.trace;
-      existing.announced = false;
     }
 
     const ctx: A2AContext = {
@@ -490,22 +524,21 @@ export class A2AServerAgent {
       signal: abort.signal,
       startTask: (init = {}) => {
         if (!live) {
+          // A Task id becomes a subject token (§5): a UUID always is one.
           const id = uuid7();
           const contextId = init.contextId ?? message.contextId ?? uuid7();
-          const task: Task = {
+          live = create({
             id,
             contextId,
             status: { state: init.state ?? "TASK_STATE_SUBMITTED", timestamp: now() },
             history: [{ ...message, taskId: id, contextId }],
             ...(init.metadata ? { metadata: init.metadata } : {}),
-          };
-          live = { task, requester: env.from, seq: 0, announced: false, ended: false, trace: env.trace, abort, waiters: [], ...(sealTo ? { sealTo } : {}) };
-          this.live.set(id, live);
+          });
         }
         const handle = this.makeHandle(live, () => {
-          // Before the first answer has gone, a status that ends the stream
-          // (terminal or interrupted) answers a blocking SendMessage now.
-          if (!answered && endsStream(live!.task.status.state)) firstAnswer();
+          // Before the first answer has gone, a terminal or interrupted state
+          // answers a blocking SendMessage now (A2A §3.1.1).
+          if (!answered && !streaming && endsStream(live!.task.status.state)) firstAnswer();
         });
         live.handle = handle;
         // A streaming call answers with the Task the moment it exists, so the
@@ -531,7 +564,11 @@ export class A2AServerAgent {
         this.makeHandle(live).fail(err instanceof Error ? err.message : String(err));
         return;
       }
-      if (live) this.live.delete(live.task.id);
+      if (live && !existing) {
+        // The client never learned of the Task: it ends as failed on the
+        // record, and the error is the answer.
+        this.makeHandle(live).fail(err instanceof Error ? err.message : String(err));
+      }
       throw err;
     }
     clearTimeout(windowTimer);
@@ -540,16 +577,14 @@ export class A2AServerAgent {
       // The handle of the call's own Task: answered below with its Task.
     } else if (isTask(result)) {
       if (!live) {
-        live = { task: cloneTask(result), requester: env.from, seq: 0, announced: false, ended: false, trace: env.trace, abort, waiters: [], ...(sealTo ? { sealTo } : {}) };
-        this.live.set(result.id, live);
-      } else if (answered && JSON.stringify(result) !== JSON.stringify(live.task)) {
+        if (!isSubjectToken(result.id)) throw A2AErrors.internal("A Task id must be a single subject token (A2A binding §5).");
+        live = create(cloneTask(result));
+      } else if (JSON.stringify(result) !== JSON.stringify(live.task)) {
         this.emit(live, { task: cloneTask(result) });
-      } else if (!answered) {
-        live.task = cloneTask(result);
       }
     } else if (isMessage(result)) {
       if (!live) {
-        this.answerFirst(env, reply, { message: result }, streaming ? { final: true } : undefined, sealTo);
+        this.answerFirst(env, reply, { message: result }, streaming ? { streamId: env.id, seq: 0, final: true } : undefined, sealTo);
         return;
       }
       // A Message from a handler that also started a Task is the Task's
@@ -566,41 +601,45 @@ export class A2AServerAgent {
     env: Envelope,
     reply: (resp: Envelope) => void,
     result: { task?: Task; message?: Message },
-    stream?: { seq?: number; final: boolean },
+    stream: { streamId: string; seq: number; final: boolean } | undefined,
     sealTo?: string,
   ): void {
-    reply(
-      this.frameOf({
-        to: env.from,
-        in_reply_to: env.id,
-        trace: childSpan(env.trace),
-        payload: respondPayload(result, stream ? { seq: stream.seq ?? 0, final: stream.final } : undefined),
-      }, sealTo),
+    reply(this.frameOf({ to: env.from, in_reply_to: env.id, trace: childSpan(env.trace), payload: respondPayload(result, stream) }, sealTo));
+  }
+
+  /** One change, published for the task store on the Task's update subject
+   *  (§5), numbered in the Task's own order. Never sealed: the task manager
+   *  reads it. */
+  private publishUpdate(live: LiveTask, ev: StreamResponse, inReplyTo?: string): void {
+    this.host.publish(
+      this.host.updateSubject(live.task.id),
+      this.host.frame({
+        to: live.requester,
+        ...(inReplyTo ? { in_reply_to: inReplyTo } : {}),
+        trace: childSpan(live.trace),
+        payload: respondPayload(ev, { seq: live.version }),
+      }),
     );
   }
 
-  /** Emit one event for a Task: fold it in, and once the client knows the
-   *  Task, publish it on the stream subject with the next seq (§8). */
+  /** Emit one event for a Task: fold it in, publish it for the task store,
+   *  and send it on every stream open on the Task with that stream's next
+   *  seq (§8). The event that ends a stream is its last. */
   private emit(live: LiveTask, ev: StreamResponse, after?: () => void): void {
     const before = live.task;
     const next = applyEvent(live.task, ev);
     if (!next || next === before) return; // a terminal Task does not move
     live.task = next;
-    if (live.announced && !live.ended) {
-      live.seq += 1;
-      const final = eventEndsStream(ev);
+    live.version += 1;
+    this.publishUpdate(live, ev);
+    const final = eventEndsStream(ev);
+    for (const st of [...live.streams.values()]) {
+      st.seq += 1;
       this.host.publish(
         this.host.streamSubject(live.task.id),
-        this.frameOf(
-          {
-            to: live.requester,
-            trace: childSpan(live.trace),
-            payload: respondPayload(ev, { seq: live.seq, final }),
-          },
-          live.sealTo,
-        ),
+        this.frameOf({ to: st.to, trace: childSpan(st.trace), payload: respondPayload(ev, { streamId: st.id, seq: st.seq, final }) }, st.sealTo),
       );
-      if (final) live.ended = true;
+      if (final) live.streams.delete(st.id);
     }
     after?.();
     if (endsStream(live.task.status.state)) {
@@ -654,7 +693,9 @@ export class A2AServerAgent {
         );
       },
       complete: (m) => status("TASK_STATE_COMPLETED", m),
-      fail: (m) => status("TASK_STATE_FAILED", m),
+      fail: (m, failure) => status("TASK_STATE_FAILED", m, failure ? { [EXT_FAILURE]: checkedFailure(failure) } : undefined),
+      overdue: (m) => status(live.task.status.state, m, { ...OVERDUE_METADATA }),
+      completeLate: (m) => status("TASK_STATE_COMPLETED", m ?? "Completed after the deadline.", { [EXT_BUDGET]: { outcome: "completed_late" } }),
       reject: (m, md) => status("TASK_STATE_REJECTED", m, md),
       requireInput: (m) => status("TASK_STATE_INPUT_REQUIRED", m),
       requireAuth: (m) => status("TASK_STATE_AUTH_REQUIRED", m),
@@ -687,15 +728,15 @@ export class A2AServerAgent {
   /** A Task read back from the store, held in memory so a message continuing
    *  it, or a cancel, has a sequence to continue. */
   private adopt(task: Task, seq: number, requester: string, trace: TraceContext): LiveTask {
+    const prior = this.live.get(task.id);
     const l: LiveTask = {
       task: cloneTask(task),
       requester,
-      seq,
-      announced: true,
-      ended: endsStream(task.status.state),
+      version: seq,
+      streams: prior?.streams ?? new Map(),
       trace,
-      abort: new AbortController(),
-      waiters: [],
+      abort: prior?.abort ?? new AbortController(),
+      waiters: prior?.waiters ?? [],
     };
     this.live.set(task.id, l);
     return l;
@@ -726,19 +767,19 @@ export class A2AServerAgent {
         // says the caller may not read it. The node's own copy decides the
         // first case, under the same rule.
         if (a2a.code === "TaskNotFoundError" && mine && mine.requester === env.from) {
-          return { task: cloneTask(mine.task), seq: mine.seq, requester: mine.requester };
+          return { task: cloneTask(mine.task), seq: mine.version, requester: mine.requester };
         }
         throw a2a;
       }
       if (!storeUnreachable(err)) throw err;
     }
     if (stored) {
-      if (mine && mine.seq >= stored.seq && mine.requester === env.from) {
-        return { task: cloneTask(mine.task), seq: mine.seq, requester: mine.requester };
+      if (mine && mine.version >= stored.seq && mine.requester === env.from) {
+        return { task: cloneTask(mine.task), seq: mine.version, requester: mine.requester };
       }
       return stored;
     }
-    if (mine && mine.requester === env.from) return { task: cloneTask(mine.task), seq: mine.seq, requester: mine.requester };
+    if (mine && mine.requester === env.from) return { task: cloneTask(mine.task), seq: mine.version, requester: mine.requester };
     throw A2AErrors.taskNotFound(taskId);
   }
 
@@ -755,7 +796,7 @@ export class A2AServerAgent {
         // The node's newer copies of Tasks the store listed.
         const tasks = out.result.tasks.map((t) => {
           const mine = this.live.get(t.id);
-          return mine && mine.requester === env.from && mine.seq >= (out.seqs?.[t.id] ?? 0)
+          return mine && mine.requester === env.from && mine.version >= (out.seqs?.[t.id] ?? 0)
             ? shapeTask(mine.task, { historyLength: p.historyLength, includeArtifacts: p.includeArtifacts })
             : t;
         });
@@ -785,10 +826,6 @@ export class A2AServerAgent {
     if (isTerminalState(state)) throw A2AErrors.taskNotCancelable(p.id, state);
     if (this.opts.onCancel) await this.opts.onCancel(cloneTask(live.task), env.from, cancel);
     live.abort.abort();
-    // The cancel ends the stream that is open, and starts one for a Task
-    // whose stream had ended at an interrupted state.
-    if (live.ended) live.ended = false;
-    live.announced = true;
     // §12.6: the reason stays on the record, under the cancel URI.
     this.makeHandle(live).status("TASK_STATE_CANCELED", "Canceled at the client's request (" + cancel.reason + ").", {
       ...(p.metadata ?? {}),
@@ -809,7 +846,7 @@ export class A2AServerAgent {
 export function cancelReasonFor(p: CancelTaskRequest, declared: boolean): A2ACancel {
   const raw = p.metadata?.[EXT_CANCEL];
   if (raw === undefined) {
-    if (declared) throw A2AErrors.invalidParams("A client that declares the cancel extension sends a reason (A2A binding §12.6).");
+    if (declared) throw A2AErrors.invalidParams("A client that declares the cancel extension sends a reason (A2A binding §12.6).", { reasons: [...A2A_CANCEL_REASONS] });
     return { reason: "user_requested" };
   }
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw A2AErrors.invalidParams("The cancel extension's data is an object with a reason.");
@@ -818,7 +855,7 @@ export function cancelReasonFor(p: CancelTaskRequest, declared: boolean): A2ACan
   try {
     validateStopFields({ reason: d.reason, note: d.note, unmet_need: unmetNeed, dependency: d.dependency }, true);
   } catch (err) {
-    throw A2AErrors.invalidParams(err instanceof Error ? err.message : String(err), { field: "metadata." + EXT_CANCEL });
+    throw A2AErrors.invalidParams(err instanceof Error ? err.message : String(err), { field: "metadata." + EXT_CANCEL, reasons: [...A2A_CANCEL_REASONS] });
   }
   return {
     reason: d.reason as A2ACancel["reason"],
@@ -826,6 +863,13 @@ export function cancelReasonFor(p: CancelTaskRequest, declared: boolean): A2ACan
     ...(typeof unmetNeed === "string" ? { unmetNeed } : {}),
     ...(typeof d.dependency === "string" ? { dependency: d.dependency } : {}),
   };
+}
+
+/** A failure reason (§12.7) checked against §10.8: the handler's own
+ *  statement, so a malformed one is the handler's bug and throws. */
+function checkedFailure(f: A2AFailure): A2AFailure {
+  validateStopFields({ reason: f.reason, unmet_need: f.unmetNeed, dependency: f.dependency }, true);
+  return { reason: f.reason, ...(f.unmetNeed ? { unmetNeed: f.unmetNeed } : {}), ...(f.dependency ? { dependency: f.dependency } : {}) };
 }
 
 /** ListTasks over a set of Tasks the caller may read: filtered, newest status

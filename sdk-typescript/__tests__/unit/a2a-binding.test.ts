@@ -6,7 +6,7 @@
  * 0.3.0 wire beside 0.4.0 (§14).
  */
 import { describe, it, expect, afterEach } from "vitest";
-import { makeBus, tick, type Bus } from "./a2a-bus.js";
+import { makeBus, tick, waitFor, type Bus } from "./a2a-bus.js";
 import { createEnvelope } from "../../src/internal/envelope-builder.js";
 import { signEnvelope } from "../../src/internal/identity.js";
 import { encode } from "../../src/internal/codec.js";
@@ -133,10 +133,14 @@ describe("SendMessage", () => {
 
     release();
     await tick(50);
-    // The later events went to the Task's stream subject, numbered from 1.
-    const stream = bus.log.filter((l) => l.subject === Subjects.taskStream(id)).map((l) => l.env.payload as { a2a: { seq: number; final?: boolean } });
-    expect(stream.map((p) => p.a2a.seq)).toEqual([1, 2]);
-    expect(stream[1].a2a.final).toBe(true);
+    // Every change went to the Task's update subject for the task store, in
+    // the Task's own order: the Task itself (in reply to the request), the
+    // artifact, the completion. No stream was open, so nothing went there.
+    const updates = bus.log.filter((l) => l.subject === Subjects.taskUpdate(id)).map((l) => l.env);
+    expect(updates.map((e) => (e.payload as { a2a: { seq: number } }).a2a.seq)).toEqual([0, 1, 2]);
+    expect(updates[0].in_reply_to).toBeDefined();
+    expect(Object.keys((updates[2].payload as { a2a: { result: object } }).a2a.result)).toEqual(["statusUpdate"]);
+    expect(bus.log.some((l) => l.subject === Subjects.taskStream(id))).toBe(false);
 
     const task = await client.a2a.getTask(server.id, id);
     expect(task.status.state).toBe("TASK_STATE_COMPLETED");
@@ -194,7 +198,9 @@ describe("SendStreamingMessage (§8)", () => {
     const { client, server } = setup();
     server.a2a.serve(async (_m, ctx) => {
       const t = ctx.startTask();
-      await tick(5);
+      // Once the client listens and has made its first read (the catch-up a
+      // stream without a durable buffer makes), every event goes live.
+      await waitFor(() => bus.log.some((l) => l.env.type === "respond" && l.env.to === client.id && (l.env.payload as { a2a?: { result?: { id?: string } } })?.a2a?.result?.id === t.id));
       t.status("TASK_STATE_WORKING");
       t.artifact({ artifactId: "a1", parts: [{ text: "part one" }] });
       t.artifact({ artifactId: "a1", parts: [{ text: "part two" }] }, { append: true, lastChunk: true });
@@ -225,7 +231,7 @@ describe("SendStreamingMessage (§8)", () => {
     expect((resp.env.payload as { a2a: { final?: boolean; seq?: number } }).a2a).toMatchObject({ final: true, seq: 0 });
   });
 
-  it("resumes after a lost frame: the gap is closed by SubscribeToTask from the Task's current state", async () => {
+  it("a lost frame: the gap is closed with the Task as the store holds it, and the stream goes on", async () => {
     const { client, server } = setup();
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
@@ -238,7 +244,7 @@ describe("SendStreamingMessage (§8)", () => {
       t.complete();
       return t;
     });
-    // The broker loses seq 1.
+    // The broker loses seq 1 of the stream.
     bus.drop = (subject, env) => subject.endsWith(".stream") && (env.payload as { a2a?: { seq?: number } })?.a2a?.seq === 1;
     const s = client.a2a.sendStreamingMessage(server.id, userMsg("go"), { idleResyncMs: 1000 });
     const events: StreamResponse[] = [];
@@ -249,16 +255,14 @@ describe("SendStreamingMessage (§8)", () => {
       }
     })();
     await done;
-    // Event 0 (the Task), then the snapshot standing at seq 2 (it holds both
-    // artifacts, the lost one included), then the completion.
+    // Event 0 (the Task), then the Task as it stands (holding the lost
+    // artifact), then the rest of the stream to its completion.
     expect(events[0].task?.status.state).toBe("TASK_STATE_WORKING");
-    const snap = events.find((e) => e.task && e.task.artifacts?.length === 2);
+    const snap = events.find((e) => e.task && e.task.artifacts?.some((a) => a.artifactId === "a1"));
     expect(snap).toBeDefined();
     const last = events.at(-1)!;
     expect(last.statusUpdate?.status.state ?? last.task?.status.state).toBe("TASK_STATE_COMPLETED");
-    // Nothing was delivered twice.
-    expect(events.filter((e) => e.artifactUpdate?.artifact.artifactId === "a2")).toHaveLength(0);
-    expect(bus.log.some((l) => (l.env.payload as { a2a?: { method?: string } })?.a2a?.method === "SubscribeToTask")).toBe(true);
+    expect(bus.log.some((l) => (l.env.payload as { a2a?: { method?: string } })?.a2a?.method === "GetTask")).toBe(true);
   });
 
   it("a quiet stream is checked, so a final event lost before the client listened still ends it", async () => {
@@ -301,7 +305,7 @@ describe("SubscribeToTask", () => {
     })();
     await done;
     expect(events[0].task?.status.state).toBe("TASK_STATE_WORKING");
-    expect(events.at(-1)?.statusUpdate?.status.state).toBe("TASK_STATE_COMPLETED");
+    expect((events.at(-1)?.statusUpdate?.status.state ?? events.at(-1)?.task?.status.state)).toBe("TASK_STATE_COMPLETED");
   });
 
   it("on a finished Task answers once, marked final", async () => {

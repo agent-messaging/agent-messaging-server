@@ -37,7 +37,7 @@ async function record(id: string): Promise<A2ATaskRecord | undefined> {
   return (await store.read(id))?.record;
 }
 
-/** The client asks, the server answers with a Task: both observed on the inboxes. */
+/** The client asks (observed on the server agent's inbox), and the node publishes the Task it created on the update subject, in reply to that request. */
 async function created(id = "t1", state = "TASK_STATE_WORKING", meta?: Record<string, unknown>): Promise<Envelope> {
   const req = frame(client, {
     type: "request",
@@ -47,7 +47,7 @@ async function created(id = "t1", state = "TASK_STATE_WORKING", meta?: Record<st
   });
   await store.observe(inbox(S), encode(req));
   const resp = frame(server, { type: "respond", to: C, in_reply_to: req.id, payload: { a2a: { result: { task: task(id, state) }, seq: 0 } } });
-  await store.observe(inbox(C), encode(resp));
+  await store.observe(`mesh.task.${id}.update`, encode(resp));
   return req;
 }
 
@@ -55,7 +55,7 @@ const stream = (seq: number, ev: unknown, from = server) =>
   encode(frame(from, { type: "respond", to: C, payload: { a2a: { result: ev, seq, ...(seq === 99 ? { final: true } : {}) } } }));
 
 describe("what fills the store", () => {
-  it("records a Task from the first answer, with its creator, its responder and the engagement beside it", async () => {
+  it("records a Task from its first change, with its creator, its responder and the engagement beside it", async () => {
     await created("t1", "TASK_STATE_WORKING", { engagement: "eng-42" });
     const r = await record("t1");
     expect(r).toMatchObject({ requester: C, responder: S, engagement: "eng-42", seq: 0 });
@@ -64,11 +64,11 @@ describe("what fills the store", () => {
     expect(Object.keys(r!.task)).not.toContain("requester");
   });
 
-  it("folds later events from the stream subject in seq order, and drops what it already has", async () => {
+  it("folds later changes from the update subject in seq order, and drops what it already has", async () => {
     await created();
-    await store.observe("mesh.task.t1.stream", stream(1, { artifactUpdate: { taskId: "t1", contextId: "ctx", artifact: { artifactId: "a", parts: [{ text: "x" }] } } }));
-    await store.observe("mesh.task.t1.stream", stream(1, { artifactUpdate: { taskId: "t1", contextId: "ctx", artifact: { artifactId: "b", parts: [] } } }));
-    await store.observe("mesh.task.t1.stream", stream(2, { statusUpdate: { taskId: "t1", contextId: "ctx", status: { state: "TASK_STATE_COMPLETED" } } }));
+    await store.observe("mesh.task.t1.update", stream(1, { artifactUpdate: { taskId: "t1", contextId: "ctx", artifact: { artifactId: "a", parts: [{ text: "x" }] } } }));
+    await store.observe("mesh.task.t1.update", stream(1, { artifactUpdate: { taskId: "t1", contextId: "ctx", artifact: { artifactId: "b", parts: [] } } }));
+    await store.observe("mesh.task.t1.update", stream(2, { statusUpdate: { taskId: "t1", contextId: "ctx", status: { state: "TASK_STATE_COMPLETED" } } }));
     const r = await record("t1");
     expect(r!.seq).toBe(2);
     expect(r!.task.artifacts?.map((a) => a.artifactId)).toEqual(["a"]);
@@ -77,34 +77,34 @@ describe("what fills the store", () => {
 
   it("a Task in a terminal state does not move again", async () => {
     await created("t1", "TASK_STATE_COMPLETED");
-    await store.observe("mesh.task.t1.stream", stream(1, { statusUpdate: { taskId: "t1", contextId: "ctx", status: { state: "TASK_STATE_WORKING" } } }));
+    await store.observe("mesh.task.t1.update", stream(1, { statusUpdate: { taskId: "t1", contextId: "ctx", status: { state: "TASK_STATE_WORKING" } } }));
     expect((await record("t1"))!.task.status.state).toBe("TASK_STATE_COMPLETED");
   });
 
   it("only the Task's responder moves it", async () => {
     await created();
-    await store.observe("mesh.task.t1.stream", stream(1, { statusUpdate: { taskId: "t1", contextId: "ctx", status: { state: "TASK_STATE_FAILED" } } }, stranger));
+    await store.observe("mesh.task.t1.update", stream(1, { statusUpdate: { taskId: "t1", contextId: "ctx", status: { state: "TASK_STATE_FAILED" } } }, stranger));
     expect((await record("t1"))!.task.status.state).toBe("TASK_STATE_WORKING");
   });
 
   it("refuses a 0.4.0 frame carrying task_id, context_id or artifacts, and ignores 0.3.0 frames", async () => {
     const bad = frame(server, { type: "respond", to: C, task_id: "t9", payload: { a2a: { result: { task: task("t9", "TASK_STATE_WORKING") } } } });
-    await store.observe(inbox(C), encode(bad));
+    await store.observe("mesh.task.t9.update", encode(bad));
     expect(await record("t9")).toBeUndefined();
     const old = signEnvelope(
       createEnvelope({ type: "respond", from: S, to: C, payload: { a2a: { result: { task: task("t8", "TASK_STATE_WORKING") } } } }),
       server as never,
     );
-    await store.observe(inbox(C), encode(old));
+    await store.observe("mesh.task.t8.update", encode(old));
     expect(await record("t8")).toBeUndefined();
   });
 
   it("a lone update creates nothing, and a forged signature is ignored", async () => {
-    await store.observe("mesh.task.t2.stream", stream(1, { statusUpdate: { taskId: "t2", contextId: "c", status: { state: "TASK_STATE_WORKING" } } }));
+    await store.observe("mesh.task.t2.update", stream(1, { statusUpdate: { taskId: "t2", contextId: "c", status: { state: "TASK_STATE_WORKING" } } }));
     expect(await record("t2")).toBeUndefined();
     const forged = frame(server, { type: "respond", to: C, payload: { a2a: { result: { task: task("t3", "TASK_STATE_WORKING") } } } });
     forged.to = X;
-    await store.observe(inbox(X), encode(forged));
+    await store.observe("mesh.task.t3.update", encode(forged));
     expect(await record("t3")).toBeUndefined();
   });
 });

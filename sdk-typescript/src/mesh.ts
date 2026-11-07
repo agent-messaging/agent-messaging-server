@@ -111,6 +111,7 @@ import { A2ANamespace } from "./a2a/index.js";
 import { A2AServerAgent, legacyInputOf, messageOfLegacyInput, outputOfParts, partsOfOutput } from "./a2a/server.js";
 import { A2A_BINDING_URI, A2A_STATE_META, A2A_WIRE_VERSION, forbiddenFieldsRefusal, isA2AFrame, isAcceptSignal, isTerminalState } from "./a2a/binding.js";
 import { A2AError } from "./a2a/errors.js";
+import { isForPerson } from "./a2a/extensions.js";
 import type { Message as A2AMessage } from "./a2a/types.js";
 import { MeshError, RejectedError, ErrorCode } from "./types/errors.js";
 import { ConnectionManager } from "./internal/connection.js";
@@ -3686,6 +3687,7 @@ export class AgentMesh {
           ...(p.sealTo && p.clearState ? { meta: { [A2A_STATE_META]: p.clearState } } : {}),
         }),
       publish: (subject, env) => this.conn.publish(subject, encode(env)),
+      updateSubject: (taskId) => Subjects.taskUpdate(taskId),
       streamSubject: (taskId) => Subjects.taskStream(taskId),
       serviceRequest: (subject, payload, timeoutMs) => this.serviceRequest(subject, payload, timeoutMs),
       offerings: () => (this.manifest?.offerings ?? []).map((o) => o.id),
@@ -3833,6 +3835,9 @@ export class AgentMesh {
     // A sender this agent has not admitted is refused before any operation
     // runs (§10, EXT-6).
     if (this.admissionGate && (await this.admissionDoor(msg, env, asRequest, guarded, forPerson))) return;
+    // §12.3: the audience extension is A2A's name for meta.audience; a frame
+    // where the two marks disagree is treated as meant for the person.
+    if (!forPerson && isForPerson(params.message)) forPerson = true;
     if (forPerson) {
       const surfaced = this.surfaceToPerson(env, "request");
       this.answerQueued(msg, env, guarded, surfaced);
@@ -7093,9 +7098,16 @@ export class AgentMesh {
 
     // A2A over Agent Messaging (bindings/a2a.md): a 0.4.0 request carries an
     // A2A operation, after every check above. It is answered in 0.4.0 (§14).
+    // The channel's own requests (describe, knock, the probe, advisories)
+    // travel at 0.4.0 with no a2a member and go on below as they always did,
+    // once the §4 field check has passed.
     if (isA2AFrame(env)) {
-      await this.handleA2AFrame(msg, env, guarded, audience === "person");
-      return;
+      const p = env.payload as Record<string, unknown> | undefined;
+      const a2aFrame = !!p && typeof p === "object" && (p.a2a !== undefined || isSealedPayload(p));
+      if (a2aFrame || forbiddenFieldsRefusal(env)) {
+        await this.handleA2AFrame(msg, env, guarded, audience === "person");
+        return;
+      }
     }
 
     // A wire-supplied task_id ends up interpolated into the stream and update

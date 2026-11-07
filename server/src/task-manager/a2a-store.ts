@@ -13,12 +13,14 @@
  * engagement it runs under, are kept BESIDE it, never inside it (§11). `seq`
  * is the number of the last stream event folded in (§8).
  *
- * What fills it. The first answer to a request reaches the client's inbox
- * (the task manager already taps `mesh.agent.*.inbox`): a 0.4.0 respond whose
- * result carries a Task creates the record. Every later event is a 0.4.0
- * respond on `mesh.task.{taskId}.stream`. Each frame's signature is checked;
- * only the recorded responder moves a Task; an event older than the record is
- * dropped; a Task in a terminal state does not move again.
+ * What fills it. The server agent's node publishes each change to a Task on
+ * `mesh.task.{taskId}.update` (binding §5, SPEC.md §7.4), numbered by
+ * `payload.a2a.seq` in the Task's own order: first the Task itself, in reply
+ * to the request that created it, then each status and artifact update. Each
+ * frame's signature is checked; only the recorded responder moves a Task; a
+ * change at or before the record's place is dropped; a Task in a terminal
+ * state does not move again. The inbox tap the task manager already runs
+ * supplies the creating request's verified sender and its engagement.
  *
  * Who reads it. The server agent's node relays a client's GetTask, ListTasks
  * or SubscribeToTask frame, signed by the client, to `mesh.task.a2a.get` or
@@ -147,9 +149,12 @@ export class A2ATaskStore {
     if (!answer) return;
     const ev = answer.result as StreamResponse;
     if (!ev || typeof ev !== "object") return;
-    const onStream = /^mesh\.task\.[^.]+\.stream$/.test(subject);
-    if (!onStream && !subject.endsWith(".inbox")) return;
-    await this.fold(env, ev, answer.seq ?? 0, onStream ? subject.split(".")[2] : undefined);
+    // Task changes travel on the Task's update subject, numbered in the
+    // Task's own order (§5). Answers on inboxes and stream events are the
+    // client's, and the store does not read them.
+    const m = /^mesh\.task\.([^.]+)\.update$/.exec(subject);
+    if (!m || answer.seq === undefined) return;
+    await this.fold(env, ev, answer.seq, m[1]);
   }
 
   private remember(id: string, seen: SeenRequest): void {

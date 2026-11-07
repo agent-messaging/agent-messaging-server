@@ -54,8 +54,8 @@ export const TERMINAL_STATES: ReadonlySet<TaskState> = new Set([
   "TASK_STATE_REJECTED",
 ]);
 
-/** A2A's interrupted states: the Task waits on the client. A stream ends on
- *  one of these as on a terminal state (§8). */
+/** A2A's interrupted states: the Task waits on the client. A blocking
+ *  SendMessage answers on one; a stream stays open through one (§8). */
 export const INTERRUPTED_STATES: ReadonlySet<TaskState> = new Set([
   "TASK_STATE_INPUT_REQUIRED",
   "TASK_STATE_AUTH_REQUIRED",
@@ -65,7 +65,8 @@ export function isTerminalState(s: unknown): boolean {
   return TERMINAL_STATES.has(s as TaskState);
 }
 
-/** Does this state end a stream (§8 termination)? */
+/** Does a blocking SendMessage answer at this state: a terminal or an
+ *  interrupted one (A2A §3.1.1)? */
 export function endsStream(s: unknown): boolean {
   return TERMINAL_STATES.has(s as TaskState) || INTERRUPTED_STATES.has(s as TaskState);
 }
@@ -77,19 +78,25 @@ export interface A2ARequestPayload {
 }
 
 export interface A2ARespondPayload {
-  a2a: { result: unknown; seq?: number; final?: boolean };
+  a2a: { result: unknown; streamId?: string; seq?: number; final?: boolean };
 }
 
 export function requestPayload(method: A2AMethod, params: unknown): A2ARequestPayload {
   return { a2a: { method, params: params ?? {} } };
 }
 
-/** A respond frame's payload. `seq` and `final` are set on stream events
- *  only (§8). */
-export function respondPayload(result: unknown, stream?: { seq: number; final: boolean }): A2ARespondPayload {
+/**
+ * A respond frame's payload. A stream event carries `streamId` (the id of the
+ * request frame that opened the stream) and `seq` (counting from 0 within
+ * that stream), and the last event `final: true` (§8). A Task update on
+ * `mesh.task.{taskId}.update` carries `seq` alone: its place in the Task's
+ * own order of changes, which the task store applies in (§5).
+ */
+export function respondPayload(result: unknown, stream?: { streamId?: string; seq: number; final?: boolean }): A2ARespondPayload {
   return {
     a2a: {
       result,
+      ...(stream?.streamId !== undefined ? { streamId: stream.streamId } : {}),
       ...(stream ? { seq: stream.seq, ...(stream.final ? { final: true } : {}) } : {}),
     },
   };
@@ -101,7 +108,7 @@ export function isA2AFrame(env: Pick<Envelope, "v">): boolean {
 }
 
 /** The envelope fields a 0.4.0 frame must not carry (§4). */
-export const FORBIDDEN_FRAME_FIELDS = ["task_id", "context_id", "artifacts"] as const;
+export const FORBIDDEN_FRAME_FIELDS = ["task_id", "context_id", "budget", "artifacts"] as const;
 
 /**
  * §4: "A receiver MUST refuse a 0.4.0 frame that carries them with
@@ -116,8 +123,8 @@ export function forbiddenFieldsRefusal(env: Envelope): MeshError | null {
   if (present.length === 0) return null;
   return new MeshError(
     ErrorCode.INVALID_ENVELOPE,
-    `A 0.4.0 frame must not carry ${present.join(", ")}: the Task id, the context id and the artifacts ` +
-      `live in the A2A object (A2A binding §4).`,
+    `A 0.4.0 frame must not carry ${present.join(", ")}: the Task id, the context id, the budget and the ` +
+      `artifacts are carried in the A2A object (A2A binding §4).`,
     { retryable: false, details: { reason: "a2a_forbidden_field", fields: present } },
   );
 }
@@ -131,12 +138,13 @@ export function readRequestPayload(env: Envelope): { method: unknown; params: un
 
 /** The A2A answer a respond frame carries, or null when the frame carries
  *  none (an error, or the channel's accept signal). */
-export function readRespondPayload(env: Envelope): { result: unknown; seq?: number; final: boolean } | null {
-  const p = env.payload as { a2a?: { result?: unknown; seq?: unknown; final?: unknown } } | undefined;
+export function readRespondPayload(env: Envelope): { result: unknown; streamId?: string; seq?: number; final: boolean } | null {
+  const p = env.payload as { a2a?: { result?: unknown; streamId?: unknown; seq?: unknown; final?: unknown } } | undefined;
   if (!p || typeof p !== "object" || !p.a2a || typeof p.a2a !== "object") return null;
   if (!("result" in p.a2a)) return null;
   return {
     result: p.a2a.result,
+    ...(typeof p.a2a.streamId === "string" && p.a2a.streamId ? { streamId: p.a2a.streamId } : {}),
     ...(typeof p.a2a.seq === "number" && Number.isInteger(p.a2a.seq) && p.a2a.seq >= 0 ? { seq: p.a2a.seq } : {}),
     final: p.a2a.final === true,
   };
@@ -214,12 +222,13 @@ export function taskIdOfEvent(ev: StreamResponse): string | undefined {
   return ev.task?.id ?? ev.statusUpdate?.taskId ?? ev.artifactUpdate?.taskId ?? ev.message?.taskId;
 }
 
-/** Does this event end its stream (§8)? A Message without a Task, a Task or
- *  status update in a terminal or interrupted state. */
+/** Does this event end its stream (§8)? As A2A says: a Message without a
+ *  Task, or a Task or status update in a terminal state. A stream stays open
+ *  through an interrupted state. */
 export function eventEndsStream(ev: StreamResponse): boolean {
   if (ev.message && !ev.task && !ev.statusUpdate && !ev.artifactUpdate) return true;
-  if (ev.task) return endsStream(ev.task.status?.state);
-  if (ev.statusUpdate) return endsStream(ev.statusUpdate.status?.state);
+  if (ev.task) return isTerminalState(ev.task.status?.state);
+  if (ev.statusUpdate) return isTerminalState(ev.statusUpdate.status?.state);
   return false;
 }
 

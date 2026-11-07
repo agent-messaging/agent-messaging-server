@@ -1,7 +1,7 @@
 /**
  * The A2A binding end to end: SDK agents on one bus, the task manager's A2A
  * store observing the inboxes and the stream subjects as it does on a mesh,
- * and the server agent's node answering GetTask and ListTasks from that store
+ * and the update subjects as it does on a mesh, and the server agent's node answering GetTask and ListTasks from that store
  * (bindings/a2a.md §5, §10), including after the node restarted and forgot
  * the Task.
  */
@@ -23,7 +23,7 @@ function withStore() {
   const store = new A2ATaskStore(memoryKv());
   const svc = nkeys.createUser();
   const tap = bus.conn();
-  for (const subject of ["mesh.agent.*.inbox", "mesh.task.*.stream"]) {
+  for (const subject of ["mesh.agent.*.inbox", "mesh.task.*.update"]) {
     tap.subscribe(subject, (m: { subject: string; data: Uint8Array }) => void store.observe(m.subject, m.data));
   }
   bus.service(A2A_STORE_SUBJECTS.GET, async (req) => signEnvelope(await store.handleGet(req, {} as never, svc.getPublicKey()), svc as never));

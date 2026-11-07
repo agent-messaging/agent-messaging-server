@@ -16,8 +16,9 @@ export const EXT_AUDIENCE = "https://agentmessaging.ai/extensions/audience/v1";
 export const EXT_ECONOMICS = "https://agentmessaging.ai/extensions/economics/v1";
 export const EXT_ARTIFACT_REFS = "https://agentmessaging.ai/extensions/artifact-refs/v1";
 export const EXT_CANCEL = "https://agentmessaging.ai/extensions/cancel/v1";
+export const EXT_FAILURE = "https://agentmessaging.ai/extensions/failure/v1";
 
-export const BINDING_EXTENSIONS = [EXT_OFFERING, EXT_BUDGET, EXT_AUDIENCE, EXT_ECONOMICS, EXT_ARTIFACT_REFS, EXT_CANCEL] as const;
+export const BINDING_EXTENSIONS = [EXT_OFFERING, EXT_BUDGET, EXT_AUDIENCE, EXT_ECONOMICS, EXT_ARTIFACT_REFS, EXT_CANCEL, EXT_FAILURE] as const;
 
 const DESCRIPTIONS: Record<string, string> = {
   [EXT_OFFERING]: "Which declared offering a message calls (Agent Messaging §8.5).",
@@ -26,6 +27,7 @@ const DESCRIPTIONS: Record<string, string> = {
   [EXT_ECONOMICS]: "Payment required, with the price and how to pay (Agent Messaging §19).",
   [EXT_ARTIFACT_REFS]: "A large Part's size and digest (Agent Messaging §7.5.1).",
   [EXT_CANCEL]: "Why a Task was canceled (Agent Messaging §10.8).",
+  [EXT_FAILURE]: "Why a Task failed (Agent Messaging §10.8, §10.8a).",
 };
 
 /** The card's `capabilities.extensions` entries for the extensions given
@@ -172,8 +174,23 @@ export function ceilingReachedTask(
   return ended(task, "TASK_STATE_INPUT_REQUIRED", text, { outcome: "ceiling_reached", spent, estimateToFinish }, EXT_BUDGET);
 }
 
-/** The four budget outcomes of §12.2. */
-export type BudgetOutcome = "insufficient" | "deadline_unmeetable" | "ceiling_reached" | "exhausted";
+/** §12.2: the work completed after the deadline. `TASK_STATE_COMPLETED` with
+ *  `{"outcome": "completed_late"}`, a marker and not a failure. */
+export function completedLateTask(task: Task, text = "Completed after the deadline."): Task {
+  return ended(task, "TASK_STATE_COMPLETED", text, { outcome: "completed_late" }, EXT_BUDGET);
+}
+
+/** §12.2: the overdue mark, on the status update event that reports the
+ *  deadline passed while the work goes on: `{"overdue": true}`. */
+export const OVERDUE_METADATA = { [EXT_BUDGET]: { overdue: true } } as const;
+
+/** Does this status update (or Task) carry the overdue mark? */
+export function isOverdue(obj: { metadata?: Record<string, unknown> } | undefined): boolean {
+  return extensionData<{ overdue?: unknown }>(obj, EXT_BUDGET)?.overdue === true;
+}
+
+/** The budget outcomes of §12.2 that put a Task in a state. */
+export type BudgetOutcome = "insufficient" | "deadline_unmeetable" | "ceiling_reached" | "exhausted" | "completed_late";
 
 /** The budget outcome on a Task (§12.2), with the fields it carries. */
 export function budgetOutcomeOf(task: Task | undefined): ({ outcome: string } & Record<string, unknown>) | undefined {
@@ -229,6 +246,20 @@ export interface A2ACancel {
 /** A CancelTask request's metadata with a reason under the cancel URI. */
 export function withCancelReason<O extends { metadata?: Record<string, unknown> }>(obj: O, cancel: A2ACancel): O {
   return withExtensionData(obj, EXT_CANCEL, cancel as unknown as Record<string, unknown>);
+}
+
+/** §12.7: why a Task failed. The reason is one of §10.8's, with `unmetNeed`
+ *  for needs_not_furnished and `dependency` for dependency_failed. */
+export interface A2AFailure {
+  reason: A2ACancelReason;
+  unmetNeed?: string;
+  dependency?: string;
+}
+
+/** The failure reason on a failed Task (§12.7), if it states one. */
+export function failureReasonOf(task: { metadata?: Record<string, unknown> } | undefined): A2AFailure | undefined {
+  const d = extensionData<Record<string, unknown>>(task, EXT_FAILURE);
+  return d && typeof d.reason === "string" ? (d as unknown as A2AFailure) : undefined;
 }
 
 /** The cancel reason on a CancelTask request or a canceled Task (§12.6). */

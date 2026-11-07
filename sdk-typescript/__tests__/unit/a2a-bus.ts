@@ -117,3 +117,12 @@ export function makeBus(): Bus {
 }
 
 export const tick = (ms = 20) => new Promise((r) => setTimeout(r, ms));
+
+/** Wait until a condition holds, checking every 5 ms, for at most 3 seconds. */
+export async function waitFor(cond: () => boolean, ms = 3000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error("waitFor: condition never held");
+    await tick(5);
+  }
+}

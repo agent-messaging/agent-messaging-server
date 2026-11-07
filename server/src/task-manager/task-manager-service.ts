@@ -16,6 +16,16 @@ import { A2A_STORE_SUBJECTS } from "../../../sdk-typescript/src/a2a/server.js";
 /** TASK_CANCEL_SETTLE_GRACE_MS: the grace period G before a cancel may be
  *  settled as "the requester did not ask" (origin.ts); a positive integer of
  *  milliseconds, else the default. */
+/** Is this update a 0.4.0 frame (the A2A binding)? Read without verifying:
+ *  the A2A store verifies what it applies. */
+function isA2AUpdate(data: Uint8Array): boolean {
+  try {
+    return (JSON.parse(new TextDecoder().decode(data)) as { v?: unknown }).v === "0.4.0";
+  } catch {
+    return false;
+  }
+}
+
 function settleGraceFromEnv(): number | undefined {
   const raw = process.env.TASK_CANCEL_SETTLE_GRACE_MS;
   if (!raw) return undefined;
@@ -123,6 +133,12 @@ export class TaskManagerService {
 
     (async () => {
       for await (const msg of updateSub) {
+        // The A2A binding's Task changes (0.4.0 frames) go to the A2A store;
+        // 0.3.0 updates are handled as they always were.
+        if (this.a2a && isA2AUpdate(msg.data)) {
+          await this.a2a.observe(msg.subject, msg.data).catch((err) => console.error("[task-manager] a2a update:", err));
+          continue;
+        }
         try {
           await handleTaskUpdate(
             msg,
@@ -179,16 +195,10 @@ export class TaskManagerService {
       })();
     }
 
-    // A2A binding (a2a-store.ts): every later event of a Task, on its stream
-    // subject, and the two reads a server agent's node relays for its clients.
+    // A2A binding (a2a-store.ts): the two reads a server agent's node relays
+    // for its clients.
     if (this.a2a) {
       const a2a = this.a2a;
-      const streamSubject = "mesh.task.*.stream";
-      const streamSub = this.nc.subscribe(streamSubject, { queue: serviceQueue(streamSubject) });
-      this.subs.push(streamSub);
-      (async () => {
-        for await (const msg of streamSub) await a2a.observe(msg.subject, msg.data).catch((err) => console.error("[task-manager] a2a stream:", err));
-      })();
       for (const [subject, read] of [
         [A2A_STORE_SUBJECTS.GET, a2a.handleGet.bind(a2a)],
         [A2A_STORE_SUBJECTS.LIST, a2a.handleList.bind(a2a)],
