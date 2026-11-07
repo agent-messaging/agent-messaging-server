@@ -17,7 +17,7 @@
  * not deliver streams it subscribes to the subject itself and reads the Task
  * once after it starts listening.
  */
-import type { Envelope } from "../types/envelope.js";
+import type { Envelope, TraceContext } from "../types/envelope.js";
 import { MeshError, ErrorCode } from "../types/errors.js";
 import { isSubjectToken } from "../internal/subjects.js";
 import {
@@ -104,6 +104,26 @@ export interface A2ACallOptions {
    * the result, or the A2AError or MeshError it carried. Kept for a day.
    */
   onLateAnswer?: (answer: { result: unknown } | { error: A2AError | MeshError }, requestId: string) => void;
+  /**
+   * Handed the signed request frame once it is made, before it is sent, so a
+   * caller can record its id and trace even when the call then fails (a
+   * queued request, a timeout). For streams, the frame that opens the stream.
+   */
+  onRequestFrame?: (frame: Envelope) => void;
+}
+
+/** A call's answer with the frames it travelled in (`callWithFrames`). */
+export interface A2ACallResult<R = unknown> {
+  /** The A2A response object, as `call` returns it. */
+  result: R;
+  /** The request frame's id: what the answer's `in_reply_to`, the receipts
+   *  and the meter events derived from the answer name. */
+  requestId: string;
+  /** The request frame's trace. */
+  trace: TraceContext;
+  /** The signed request frame, and the answer as it arrived (opened, when it
+   *  came sealed). */
+  frames: { request: Envelope; response: Envelope };
 }
 
 export interface A2AStreamOptions extends A2ACallOptions {
@@ -137,7 +157,9 @@ export class A2AClient {
     // is what nodes on the mesh read; the two marks agree.
     const message = (params as { message?: Message } | undefined)?.message;
     if (message && isForPerson(message)) meta.audience = "person";
-    return this.host.frame({ to: agentId, payload: requestPayload(method, params), meta, ...(opts.seal ? { seal: true } : {}) });
+    const env = this.host.frame({ to: agentId, payload: requestPayload(method, params), meta, ...(opts.seal ? { seal: true } : {}) });
+    opts.onRequestFrame?.(env);
+    return env;
   }
 
   /** Any operation, by name: one request frame, its one answer. */
@@ -147,6 +169,21 @@ export class A2AClient {
     params: A2AOperations[M]["params"],
     opts: A2ACallOptions = {},
   ): Promise<A2AOperations[M]["result"]> {
+    return (await this.callWithFrames(agentId, method, params, opts)).result;
+  }
+
+  /**
+   * `call`, answered with the frames it travelled in: the result, the request
+   * frame's id and trace, and the request and response frames themselves. A
+   * failed call throws as `call` does; `opts.onRequestFrame` sees the request
+   * frame first.
+   */
+  async callWithFrames<M extends A2AMethod>(
+    agentId: string,
+    method: M,
+    params: A2AOperations[M]["params"],
+    opts: A2ACallOptions = {},
+  ): Promise<A2ACallResult<A2AOperations[M]["result"]>> {
     const env = this.frameFor(agentId, method, params, opts);
     const onLateAnswer = opts.onLateAnswer;
     const onLate = onLateAnswer
@@ -164,11 +201,16 @@ export class A2AClient {
     if (resp.error) raise(resp);
     const r = readRespondPayload(resp);
     if (!r) throw A2AErrors.invalidAgentResponse(`The answer to ${method} carried no payload.a2a.result.`);
-    return r.result as A2AOperations[M]["result"];
+    return { result: r.result as A2AOperations[M]["result"], requestId: env.id, trace: env.trace, frames: { request: env, response: resp } };
   }
 
   sendMessage(agentId: string, request: SendMessageRequest | Message, opts?: A2ACallOptions): Promise<SendMessageResponse> {
     return this.call(agentId, "SendMessage", asSendRequest(request), opts);
+  }
+
+  /** `sendMessage`, answered with the frames it travelled in (`callWithFrames`). */
+  sendMessageWithFrames(agentId: string, request: SendMessageRequest | Message, opts?: A2ACallOptions): Promise<A2ACallResult<SendMessageResponse>> {
+    return this.callWithFrames(agentId, "SendMessage", asSendRequest(request), opts);
   }
 
   sendStreamingMessage(agentId: string, request: SendMessageRequest | Message, opts?: A2AStreamOptions): A2AEventStream {
@@ -391,7 +433,7 @@ export class A2AClient {
         if (gap) {
           // A gap the subscription cannot close: a new stream from the Task's
           // current state (§8). Its frames are listened for before it is asked.
-          const env = this.frameFor(agentId, "SubscribeToTask", { id: taskId }, opts);
+          const env = this.frameFor(agentId, "SubscribeToTask", { id: taskId }, { ...opts, onRequestFrame: undefined });
           const l2 = await this.listen(agentId, taskId, env);
           let resp: Envelope;
           try {
@@ -419,7 +461,7 @@ export class A2AClient {
         catchUp = false;
         let task: Task | null = null;
         try {
-          task = await this.getTask(agentId, taskId, opts);
+          task = await this.getTask(agentId, taskId, { ...opts, onRequestFrame: undefined });
         } catch (err) {
           if (err instanceof A2AError) throw err;
           if (!(err instanceof MeshError) || err.code !== ErrorCode.TRANSPORT_TIMEOUT) throw err;

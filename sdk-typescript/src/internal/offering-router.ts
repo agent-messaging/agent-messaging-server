@@ -131,6 +131,11 @@ export class OfferingRouter {
     this.defaultHandler = handler;
   }
 
+  /** Remove the default handler, when it is still `handler`. */
+  clearDefault(handler: OfferingHandler): void {
+    if (this.defaultHandler === handler) this.defaultHandler = null;
+  }
+
   resolve(offeringId: string): OfferingHandler | null {
     return this.handlers.get(offeringId) ?? this.defaultHandler;
   }
