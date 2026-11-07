@@ -17,7 +17,14 @@ export const EXT_ECONOMICS = "https://agentmessaging.ai/extensions/economics/v1"
 export const EXT_ARTIFACT_REFS = "https://agentmessaging.ai/extensions/artifact-refs/v1";
 export const EXT_CANCEL = "https://agentmessaging.ai/extensions/cancel/v1";
 export const EXT_FAILURE = "https://agentmessaging.ai/extensions/failure/v1";
+export const EXT_TRIAL = "https://agentmessaging.ai/extensions/trial/v1";
+export const EXT_REPLY = "https://agentmessaging.ai/extensions/reply/v1";
+/** EXT-15, already an A2A extension under its own URI (§12.10). */
+export const EXT_RECEIPTS = "mesh://extensions/receipts/v1";
 
+/** The extensions a card lists by default. Trial work, replies and receipts
+ *  (§12.8 to §12.10) are left out: a card lists them only for an agent whose
+ *  node does what they ask. */
 export const BINDING_EXTENSIONS = [EXT_OFFERING, EXT_BUDGET, EXT_AUDIENCE, EXT_ECONOMICS, EXT_ARTIFACT_REFS, EXT_CANCEL, EXT_FAILURE] as const;
 
 const DESCRIPTIONS: Record<string, string> = {
@@ -28,6 +35,9 @@ const DESCRIPTIONS: Record<string, string> = {
   [EXT_ARTIFACT_REFS]: "A large Part's size and digest (Agent Messaging §7.5.1).",
   [EXT_CANCEL]: "Why a Task was canceled (Agent Messaging §10.8).",
   [EXT_FAILURE]: "Why a Task failed (Agent Messaging §10.8, §10.8a).",
+  [EXT_TRIAL]: "A request for trial work, and a trial refusal (Common Agent §7.7).",
+  [EXT_REPLY]: "Which message a new call answers (Agent Messaging §17.5).",
+  [EXT_RECEIPTS]: "A signed receipt for the call (EXT-15).",
 };
 
 /** The card's `capabilities.extensions` entries for the extensions given
@@ -341,4 +351,92 @@ export function artifactRefOf(part: Part): { ref: string; size: number; digest?:
     ...(part.mediaType ? { mediaType: part.mediaType } : {}),
     ...(part.filename ? { filename: part.filename } : {}),
   };
+}
+
+// ─── §12.8 Trial work ───────────────────────────────────────────────
+
+/** The Message that starts trial work: `{"trial": true}` under the trial
+ *  URI. A trial carries no budget (Common Agent §7.7). */
+export function withTrial(message: Message): Message {
+  return usesExtension(withExtensionData(message, EXT_TRIAL, { trial: true }), EXT_TRIAL);
+}
+
+/** Does this Message ask for trial work (§12.8)? */
+export function isTrialMessage(message: Message | undefined): boolean {
+  return extensionData<{ trial?: unknown }>(message, EXT_TRIAL)?.trial === true;
+}
+
+/** A trial refusal's fixed fields (§12.8; Common Agent §7.7): the reason,
+ *  the limit where there is one, and the other fields §7.7 lists. */
+export interface A2ATrialRefusal {
+  refusal: "TRIAL_REFUSED";
+  reason: string;
+  limit?: number;
+  [field: string]: unknown;
+}
+
+/** §12.8: a trial the node refused. `TASK_STATE_REJECTED` with the refusal
+ *  under the trial URI and a status message saying so. */
+export function trialRefusedTask(task: Task, refusal: Omit<A2ATrialRefusal, "refusal">, text = "This trial was refused."): Task {
+  return ended(task, "TASK_STATE_REJECTED", text, { ...refusal, refusal: "TRIAL_REFUSED" }, EXT_TRIAL);
+}
+
+/** The trial refusal on a rejected Task (§12.8), if it carries one. */
+export function trialRefusalOf(task: Task | undefined): A2ATrialRefusal | undefined {
+  if (task?.status?.state !== "TASK_STATE_REJECTED") return undefined;
+  const d = extensionData<Record<string, unknown>>(task, EXT_TRIAL);
+  return d?.refusal === "TRIAL_REFUSED" && typeof d.reason === "string" ? (d as A2ATrialRefusal) : undefined;
+}
+
+/** Was this Task started as trial work: does the first Message from the
+ *  client in its history ask for one (§12.8)? */
+export function isTrialTask(task: Task | undefined): boolean {
+  const first = task?.history?.find((m) => m.role === "ROLE_USER");
+  return isTrialMessage(first);
+}
+
+// ─── §12.9 Replies ──────────────────────────────────────────────────
+
+/** A new call that answers a received Message: the received Message's
+ *  `contextId`, and `{"inReplyTo": <its messageId>}` under the reply URI. */
+export function withReplyTo(message: Message, answers: Pick<Message, "messageId" | "contextId">): Message {
+  const m = withExtensionData(message, EXT_REPLY, { inReplyTo: answers.messageId });
+  return usesExtension(answers.contextId ? { ...m, contextId: answers.contextId } : m, EXT_REPLY);
+}
+
+/** The messageId a Message answers (§12.9), or undefined. */
+export function replyToOf(message: Message | undefined): string | undefined {
+  const v = extensionData<{ inReplyTo?: unknown }>(message, EXT_REPLY)?.inReplyTo;
+  return typeof v === "string" && v ? v : undefined;
+}
+
+// ─── §12.10 Receipts (EXT-15 §8.3) ──────────────────────────────────
+
+/** The receipt levels a starting Message may ask for. */
+export type A2AReceiptLevel = "none" | "summary" | "full";
+const RECEIPT_ASKS: readonly string[] = ["none", "summary", "full"];
+
+/** The Message that starts the work, asking for a receipt:
+ *  `{"receipt": level}` under the receipts URI. List the URI in
+ *  `A2A-Extensions` too (§12.10). */
+export function withReceiptRequest(message: Message, level: A2AReceiptLevel): Message {
+  return usesExtension(withExtensionData(message, EXT_RECEIPTS, { receipt: level }), EXT_RECEIPTS);
+}
+
+/** The receipt level a Message asks for, or null when it asks for none in
+ *  particular. A value outside the three is null: a receiver never guesses. */
+export function receiptRequestOf(message: Message | undefined): A2AReceiptLevel | null {
+  const v = extensionData<{ receipt?: unknown }>(message, EXT_RECEIPTS)?.receipt;
+  return typeof v === "string" && RECEIPT_ASKS.includes(v) ? (v as A2AReceiptLevel) : null;
+}
+
+/** A copy of the Task carrying a signed receipt in its `metadata` under the
+ *  receipts URI (EXT-15 §8.2). A newer receipt replaces the older one. */
+export function withReceipt<T extends Task>(task: T, receipt: Record<string, unknown>): T {
+  return { ...task, metadata: { ...(task.metadata ?? {}), [EXT_RECEIPTS]: receipt } };
+}
+
+/** The receipt a Task carries (EXT-15 §8.2), or undefined. */
+export function receiptOf(task: Task | undefined): Record<string, unknown> | undefined {
+  return extensionData<Record<string, unknown>>(task, EXT_RECEIPTS);
 }

@@ -153,9 +153,15 @@ export type SignedCallReceipt<T extends CallReceiptDocument = CallReceiptDocumen
 
 /** Read the receipt level a request asked for, or null when it asked for
  *  none in particular (the caller's standing default applies). A value
- *  outside the three is null too: a receiver never guesses. */
+ *  outside the three is null too: a receiver never guesses.
+ *
+ *  Both wire forms: `payload.config.receipt` on a 0.3.0 request, and on a
+ *  0.4.0 frame `{"receipt": level}` under this extension's URI in the
+ *  starting Message's `metadata` (EXT-15 §8.3, A2A binding §12.10). */
 export function receiptLevelOf(payload: unknown): ReceiptLevel | null {
-  const v = (payload as { config?: { receipt?: unknown } } | null)?.config?.receipt;
+  const p = payload as { config?: { receipt?: unknown }; a2a?: { params?: { message?: { metadata?: Record<string, unknown> } } } } | null;
+  const asked = p?.a2a?.params?.message?.metadata?.[RECEIPTS_EXTENSION_URI] as { receipt?: unknown } | undefined;
+  const v = p?.config?.receipt ?? (asked && typeof asked === "object" ? asked.receipt : undefined);
   return typeof v === "string" && (RECEIPT_LEVELS as readonly string[]).includes(v) ? (v as ReceiptLevel) : null;
 }
 
