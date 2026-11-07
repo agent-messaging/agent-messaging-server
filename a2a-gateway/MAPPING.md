@@ -1,10 +1,10 @@
 # The A2A gateway: normative mapping between Agent Messaging and A2A
 
-**Version:** 0.8.0-draft
+**Version:** 0.9.0-draft
 **Status:** Working Draft
 **Date:** 2026-07-14
-**Revised:** 2026-10-29 (see §15)
-**Applies to:** Agent Messaging 0.2 (SPEC.md) · Agent2Agent (A2A) Protocol v1.0, JSON-RPC and HTTP+JSON bindings · PACT 1.0 (§14)
+**Revised:** 2026-11-07 (§4.0: agents that serve the A2A binding)
+**Applies to:** Agent Messaging 0.2 (SPEC.md) · Agent2Agent (A2A) Protocol v1.0, JSON-RPC and HTTP+JSON bindings · A2A over Agent Messaging (bindings/a2a.md) 0.3.0-draft, wire version 0.4.0 · PACT 1.0 (§14)
 
 > This document specifies the translation between Agent Messaging and the
 > A2A protocol. It is the normative artifact: any bridge implementation — ours or
@@ -97,6 +97,12 @@ signs nothing, and the rules below do not apply to it. For bridged traffic:
   `{"protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"}` at
   `.../agents/<agent-id>`. A client picks by binding and version, not by
   position.
+- A generated card for an agent that serves the A2A binding (§4.0) also
+  lists the binding's own interface:
+  `{"url": "<mesh home>/agents/<handle or agent-id>", "protocolBinding":
+  "https://agentmessaging.ai/bindings/a2a/v1", "protocolVersion": "1.0"}`
+  (bindings/a2a.md §3), after the two HTTP interfaces this bridge serves. The
+  mesh home is the bridge's configured `MESH_HOME`, or its `CORE_API_URL`.
 - Requests carrying an `A2A-Version` header the bridge does not support MUST
   receive `VersionNotSupportedError` (`-32009` on JSON-RPC, reason
   `VERSION_NOT_SUPPORTED` on HTTP+JSON). PACT routes are the one exception
@@ -105,7 +111,48 @@ signs nothing, and the rules below do not apply to it. For bridged traffic:
 
 ## 4. Method Mapping
 
+### 4.0. Agents That Serve the A2A Binding
+
+An agent whose manifest lists `https://agentmessaging.ai/bindings/a2a/v1` in
+`capabilities` speaks A2A 1.0's own operations and objects in 0.4.0 frames
+(bindings/a2a.md). For such an agent the bridge translates no A2A object:
+
+- Every A2A operation (all eleven) from JSON-RPC or HTTP+JSON is sent to the
+  agent as one 0.4.0 `request` frame whose `payload.a2a` is
+  `{"method", "params"}`, with the A2A request object as `params`
+  unchanged. The bridge's hosted identity for the caller signs it (§9), so the
+  agent's own access rule (bindings/a2a.md §10) answers `GetTask`,
+  `ListTasks`, `SubscribeToTask` and `CancelTask` for that caller alone.
+- The A2A result in the respond frame is the JSON-RPC `result`, or the
+  HTTP+JSON body, unchanged. Its state names are A2A 1.0's (`TASK_STATE_*`)
+  whatever version the caller asked for.
+- `SendStreamingMessage` and `SubscribeToTask` answer with Server-Sent
+  Events, one per stream event of the binding (bindings/a2a.md §8), in `seq`
+  order, ending with the stream.
+- An A2A error in a respond frame (bindings/a2a.md §9) becomes the JSON-RPC
+  error with the integer `details.a2a.code` carries, the frame's message, and
+  `details.a2a.data` as `data` (left out when empty). A channel error keeps
+  §7's mapping: `-32603` with `data.agentmesh_code`.
+- The caller's `A2A-Extensions` header, and any other `A2A-` header, travel
+  as service parameters in the frame's `meta.a2a` (bindings/a2a.md §7).
+- During the transition window a caller may still name the offering with the
+  older metadata keys (`agentmesh.offering`, `agentmesh.skill`): the bridge
+  adds the offering extension's key with the same value before the frame is
+  signed, and refuses the two keys disagreeing with `-32602` listing the
+  agent's offerings (§4.5).
+- §4.2's refusals do not apply: the agent answers each operation itself
+  (push notifications with `PushNotificationNotSupportedError`, an extended
+  card it does not have with `ExtendedAgentCardNotConfiguredError`).
+- Identity mapping (§9), exposure (§2.1 rule 4), pricing (§9.1), Agent
+  Messaging over A2A (EXT-14) and the knock are unchanged and run before the
+  frame is sent.
+
+Agents that do not list the binding keep the translation of §4.1 to §7 during
+the transition window (bindings/a2a.md §14).
+
 ### 4.1. Implemented Methods (Inbound)
+
+For an agent on the 0.3.0 wire (one that does not list the binding, §4.0):
 
 | A2A JSON-RPC method | AgentMesh operation | Notes |
 |---|---|---|
@@ -115,6 +162,9 @@ signs nothing, and the rules below do not apply to it. For bridged traffic:
 | `CancelTask` | `cancel` composed operation (SPEC.md §10.7) | `request` with `payload.offering: "task.cancel"` |
 
 ### 4.2. Unimplemented Methods (Inbound)
+
+For an agent on the 0.3.0 wire; an agent that serves the binding answers
+these itself (§4.0).
 
 A bridge MUST answer these with the exact error shown, not with silence or
 HTTP-level errors:
@@ -270,6 +320,7 @@ Served per exposed agent at
 | `provider.name` / `provider.url` | `provider.organization` / `provider.url` |
 | `id` (mesh public key) | carried in the interface URL path and in the bridge extension params |
 | — | `supportedInterfaces`: `[{url: https://<bridge-host>/agents/<agent-id>/rpc, protocolBinding: "JSONRPC", protocolVersion: "1.0"}, {url: https://<bridge-host>/agents/<agent-id>, protocolBinding: "HTTP+JSON", protocolVersion: "1.0"}]` (§3, §13) |
+| `capabilities` lists `https://agentmessaging.ai/bindings/a2a/v1` | a third interface, `{url: <mesh home>/agents/<agent-id>, protocolBinding: "https://agentmessaging.ai/bindings/a2a/v1", protocolVersion: "1.0"}` (§3, bindings/a2a.md §3); `capabilities.streaming: true`; and the binding's extensions (offering, budget, audience, economics, artifact-refs, cancel, failure) in `capabilities.extensions`, each `required: false` (bindings/a2a.md §12) |
 | `offerings[].id/name/description/tags` | `skills[].id/name/description/tags` |
 | `offerings[].examples[]` (`{input, output}` objects) | `skills[].examples[]` (each input serialized to a JSON string) |
 | `offerings[].input_modes` / `output_modes` | `skills[].inputModes` / `outputModes` (default `["application/json", "text/plain"]`) |
@@ -609,7 +660,9 @@ already holds.
 ## 11. Out of Scope (This Version)
 
 Stated so nobody discovers them the hard way: A2A push notifications
-(webhooks), `ListTasks`/`SubscribeToTask`, extended agent cards, FileParts,
+(webhooks), `ListTasks`/`SubscribeToTask` for agents on the 0.3.0 wire
+(an agent that serves the A2A binding answers them, §4.0), extended agent
+cards for agents on the 0.3.0 wire, FileParts,
 the gRPC binding, multi-turn `input-required` conversations in the outbound
 direction (a remote A2A server that asks a mesh caller for more input: the
 state maps, but the bridge does not yet relay the mesh caller's answer;
@@ -620,7 +673,8 @@ except PACT's delegated authority on the inbound leg (§14.8).
 ## 12. Conformance
 
 An implementation may claim conformance with this mapping if it implements:
-§2 (node model + both trust rules 1–2, plus 3–5 where applicable), §3, the
+§2 (node model + both trust rules 1–2, plus 3–5 where applicable), §3, §4.0
+for agents that serve the A2A binding, the
 §4.1 methods with §4.2 rejections, §5 totally, §6, §7 (including
 `data.agentmesh_code` preservation), §8 including the §8.3 marker, §9.2 where
 it charges a fee, and — if it implements the outbound direction — §10 steps
@@ -637,7 +691,9 @@ signed and unsigned callers, a forged message, the state spellings with
 `exhausted`, the answer on an existing task, the knock and the reading of a
 queued acknowledgement, and readable text. An implementation reads it in its
 own tests, and `conformance/lib/check-a2a-bridge-fixture.mjs` checks it
-against reference readings. `conformance/cross-transport/` runs one quote
+against reference readings. `conformance/a2a-binding.json` is the fixture
+set for the A2A binding (bindings/a2a.md §15), with each operation as frames
+and as the bridge's HTTP+JSON call. `conformance/cross-transport/` runs one quote
 over a broker, email and this bridge with the same checks.
 
 ## 13. The HTTP+JSON Binding
@@ -658,8 +714,8 @@ relative to it.
 | `POST message:stream` | `SendStreamingMessage` (§4.4) | `200` `text/event-stream`; each `data:` line is one A2A `StreamResponse` object with no JSON-RPC wrapper |
 | `GET tasks/{id}` | `GetTask` | `200` `Task`, or `TASK_NOT_FOUND` |
 | `POST tasks/{id}:cancel` | `CancelTask` | `200` `Task`, or `TASK_NOT_FOUND` / `TASK_NOT_CANCELABLE` |
-| `GET tasks` | `ListTasks` | `UNSUPPORTED_OPERATION` (§4.2) |
-| `POST tasks/{id}:subscribe` | `SubscribeToTask` | `UNSUPPORTED_OPERATION` |
+| `GET tasks` | `ListTasks` | `UNSUPPORTED_OPERATION` (§4.2); for an agent that serves the binding (§4.0), `200` `ListTasksResponse`, the request read from the query (`contextId`, `status`, `pageSize`, `pageToken`, `historyLength`, `statusTimestampAfter`, `includeArtifacts`) |
+| `POST tasks/{id}:subscribe` | `SubscribeToTask` | `UNSUPPORTED_OPERATION`; for an agent that serves the binding, `200` `text/event-stream` |
 | `GET` or `POST tasks/{id}/pushNotificationConfigs`, `GET` or `DELETE tasks/{id}/pushNotificationConfigs/{configId}` | push configuration | `PUSH_NOTIFICATION_NOT_SUPPORTED` |
 | `GET extendedAgentCard` | `GetExtendedAgentCard` | `EXTENDED_AGENT_CARD_NOT_CONFIGURED` |
 
