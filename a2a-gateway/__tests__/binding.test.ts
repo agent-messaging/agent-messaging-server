@@ -1,5 +1,5 @@
 /**
- * The gateway's A2A binding path (MAPPING.md §4.0; bindings/a2a.md §13): an
+ * The gateway's A2A binding path (MAPPING.md §4.1; bindings/a2a.md §13): an
  * HTTP A2A caller reaches a mesh agent served by the SDK's `mesh.a2a.serve`,
  * and the A2A objects pass between JSON-RPC (or HTTP+JSON) and 0.4.0 frames
  * unchanged. The bridge's node hosts real SDK agents on an in-memory bus.

@@ -705,7 +705,7 @@ async function handleRpc(
 
   // Unimplemented methods answer with their exact mapped error (§4.2), for
   // an agent on the 0.3.0 wire. An agent that serves the A2A binding answers
-  // every A2A operation itself (MAPPING.md §4.0).
+  // every A2A operation itself (MAPPING.md §4.1).
   const bindingAgent = bindingMethod(rpc.method) !== null && servesBinding(await bridge.exposableManifest(agentId));
   if (!bindingAgent) switch (rpc.method) {
     case "ListTasks":
@@ -834,7 +834,7 @@ async function handleRpc(
   // and registers the §2.1 rule 2 marker manifest, both once per caller.
   const requester = await bridge.identityFor(callerKey);
 
-  // The A2A binding (MAPPING.md §4.0): the A2A request goes into a 0.4.0
+  // The A2A binding (MAPPING.md §4.1): the A2A request goes into a 0.4.0
   // frame as it is, and the A2A result comes back as it is. A knock stays the
   // gateway's own (EXT-14 §9).
   const passMethod = bindingMethod(rpc.method);

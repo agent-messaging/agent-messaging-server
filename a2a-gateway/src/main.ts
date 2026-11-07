@@ -120,7 +120,7 @@ async function main(): Promise<void> {
     meshUrl: process.env.MESH_URL ?? "ws://localhost:4443",
     ...(proofs ? { proofs } : {}),
     ...(coreUrl ? { coreUrl } : {}),
-    // The mesh home a generated card names for the A2A binding (MAPPING.md §3).
+    // The mesh home a generated card names for the A2A binding (MAPPING.md §8.1).
     ...(process.env.MESH_HOME?.trim() ? { meshHome: process.env.MESH_HOME.trim() } : {}),
     publicBaseUrl: process.env.PUBLIC_BASE_URL ?? `http://localhost:${PORT}`,
     port: PORT,

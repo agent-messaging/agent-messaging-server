@@ -841,7 +841,7 @@ export class A2AServerAgent {
  * The reason a CancelTask carries (§12.6), checked against SPEC.md §10.8: a
  * reason from the closed list, a note that is a string, and the field each
  * qualified reason needs (`unmetNeed` with needs_not_furnished, `dependency`
- * with dependency_failed; the snake_case spellings are read too). A client
+ * with dependency_failed, spelled as the binding spells them). A client
  * that does not declare the extension may send none, which is recorded as
  * user_requested; one that declares it must send one.
  */
@@ -853,7 +853,10 @@ export function cancelReasonFor(p: CancelTaskRequest, declared: boolean): A2ACan
   }
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw A2AErrors.invalidParams("The cancel extension's data is an object with a reason.");
   const d = raw as Record<string, unknown>;
-  const unmetNeed = d.unmetNeed ?? d.unmet_need;
+  // CancelTask is always a 0.4.0 frame, so the A2A spelling alone (binding
+  // §12.6); `unmet_need` belongs to a 0.3.0 cancel's input.
+  if (d.unmet_need !== undefined) throw A2AErrors.invalidParams("The cancel extension spells it unmetNeed (A2A binding §12.6).", { reasons: [...A2A_CANCEL_REASONS] });
+  const unmetNeed = d.unmetNeed;
   try {
     validateStopFields({ reason: d.reason, note: d.note, unmet_need: unmetNeed, dependency: d.dependency }, true);
   } catch (err) {

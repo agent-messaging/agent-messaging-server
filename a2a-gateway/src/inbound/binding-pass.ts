@@ -1,5 +1,5 @@
 /**
- * The gateway's A2A binding path (bindings/a2a.md §13; MAPPING.md §4.0).
+ * The gateway's A2A binding path (bindings/a2a.md §13; MAPPING.md §4.1).
  *
  * A mesh agent that serves the A2A binding (its manifest lists the binding
  * URI in `capabilities`) speaks A2A 1.0's own operations and objects in 0.4.0
