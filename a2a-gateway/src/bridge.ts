@@ -99,6 +99,10 @@ export interface BridgeConfig {
    *  identities as their platform address, so an agent's own admission can
    *  store its roster there. */
   coreUrl?: string;
+  /** The mesh home (SPEC.md §18.10): the HTTPS origin a generated card names
+   *  in the A2A binding's interface (bindings/a2a.md §3). Defaults to
+   *  `coreUrl`. */
+  meshHome?: string;
 }
 
 /** The front the current call came in by, read when an envelope is signed,

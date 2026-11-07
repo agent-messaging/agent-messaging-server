@@ -96,6 +96,7 @@ import { validateBudget } from "../../../sdk-typescript/src/budget.js";
 import type { Budget } from "../../../sdk-typescript/src/types/envelope.js";
 import { handleHttpsFront, handleMcp, protectedResourceMetadata } from "./fronts.js";
 import { presentedCredential, ProofRefused } from "./proofs.js";
+import { bindingMethod, passThroughBinding, serviceParamsFromHeaders, servesBinding } from "./binding-pass.js";
 
 const BODY_LIMIT = 1024 * 1024; // 1 MB
 const SUPPORTED_A2A_VERSIONS = new Set(["1.0", "0.3"]);
@@ -336,10 +337,15 @@ async function handle(
     const manifest = await bridge.exposableManifest(cardMatch[1]);
     if (!manifest) return json(res, 404, { error: "agent not found" });
     if (!isExposed(manifest)) return json(res, 403, meshOnly(cardMatch[1]));
-    const card = manifestToCard(manifest, bridge.config.publicBaseUrl, {
-      apiKey: bridge.apiKeyRequired,
-      anonymous: bridge.anonymousAllowed,
-    });
+    const card = manifestToCard(
+      manifest,
+      bridge.config.publicBaseUrl,
+      {
+        apiKey: bridge.apiKeyRequired,
+        anonymous: bridge.anonymousAllowed,
+      },
+      bridge.config.meshHome ?? bridge.config.coreUrl,
+    );
     // Generated from the agent's Descriptor where it published one (EXT-14
     // §10): the Descriptor is the one description, the card a projection.
     const described = await bridge.agentDescriptorBytes(manifest.id);
@@ -442,12 +448,34 @@ async function handleRest(
     params = { id: route.id };
   } else if (route.op === "subscribe") {
     params = { id: route.id };
+  } else if (route.op === "listTasks") {
+    // A2A §11.3: ListTasks takes its request as query parameters.
+    params = listTasksQuery(url);
   }
 
   const rpc: JsonRpcRequest = { jsonrpc: "2.0", id: 1, method: REST_METHOD[route.op], ...(params !== undefined ? { params } : {}) };
   const capture = new ReshapedResponse(res, restShaper(route.op === "getTask" || route.op === "cancelTask"));
   await handleRpc(bridge, req, capture as unknown as ServerResponse, agentId, manager, rpc);
   capture.finish();
+}
+
+/** ListTasksRequest from an HTTP+JSON query string (A2A §11.3). Numbers and
+ *  booleans are read as such; anything unreadable is left out, and the agent
+ *  answers what the rest asks. */
+function listTasksQuery(url: URL): Record<string, unknown> {
+  const q = url.searchParams;
+  const out: Record<string, unknown> = {};
+  for (const k of ["contextId", "status", "pageToken", "statusTimestampAfter"]) {
+    const v = q.get(k);
+    if (v) out[k] = v;
+  }
+  for (const k of ["pageSize", "historyLength"]) {
+    const v = q.get(k);
+    if (v && /^\d+$/.test(v)) out[k] = Number(v);
+  }
+  const ia = q.get("includeArtifacts");
+  if (ia === "true" || ia === "false") out.includeArtifacts = ia === "true";
+  return out;
 }
 
 /** How a {@link ReshapedResponse} rewrites what the shared handler wrote. */
@@ -675,8 +703,11 @@ async function handleRpc(
   }
   const callerKey = admitted.key;
 
-  // Unimplemented methods answer with their exact mapped error (§4.2).
-  switch (rpc.method) {
+  // Unimplemented methods answer with their exact mapped error (§4.2), for
+  // an agent on the 0.3.0 wire. An agent that serves the A2A binding answers
+  // every A2A operation itself (MAPPING.md §4.0).
+  const bindingAgent = bindingMethod(rpc.method) !== null && servesBinding(await bridge.exposableManifest(agentId));
+  if (!bindingAgent) switch (rpc.method) {
     case "ListTasks":
     case "SubscribeToTask":
       return json(res, 200, rpcError(id, RpcCode.UNSUPPORTED_OPERATION, `${rpc.method} is not supported by this bridge (BRIDGE-A2A.md 4.2)`));
@@ -802,6 +833,17 @@ async function handleRpc(
   // vouch for. Awaited: on first sight this reads the caller's durable record
   // and registers the §2.1 rule 2 marker manifest, both once per caller.
   const requester = await bridge.identityFor(callerKey);
+
+  // The A2A binding (MAPPING.md §4.0): the A2A request goes into a 0.4.0
+  // frame as it is, and the A2A result comes back as it is. A knock stays the
+  // gateway's own (EXT-14 §9).
+  const passMethod = bindingMethod(rpc.method);
+  if (passMethod && servesBinding(manifest) && overA2AMetadata(sendParams?.message)?.knock === undefined) {
+    const startedAt = Date.now();
+    const outcome = await passThroughBinding(res, id, passMethod, rpc.params, requester, manifest.id, serviceParamsFromHeaders(req.headers), json);
+    tapInbound(bridge, callerKey, { responder: manifest.id, offering: passMethod, outcome, startedAt });
+    return;
+  }
 
   switch (rpc.method) {
     case "SendMessage":

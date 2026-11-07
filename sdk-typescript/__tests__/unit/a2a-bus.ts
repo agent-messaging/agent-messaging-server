@@ -8,11 +8,12 @@
  */
 import { vi } from "vitest";
 import { nkeys } from "nats.ws";
-import type { KeyPair } from "nats.ws";
 import { AgentMesh } from "../../src/mesh.js";
 import type { ConnectionManager } from "../../src/internal/connection.js";
 import { decodeUnverified, encode } from "../../src/internal/codec.js";
 import { MeshError, ErrorCode } from "../../src/types/errors.js";
+
+type KeyPair = ReturnType<typeof nkeys.createUser>;
 import type { Envelope } from "../../src/types/envelope.js";
 
 type Handler = (msg: { subject: string; data: Uint8Array; reply?: string; respond: (d: Uint8Array) => boolean }) => void;
