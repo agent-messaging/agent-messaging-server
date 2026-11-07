@@ -1,7 +1,8 @@
 /**
  * The A2A card at the mesh home (A2A binding §3): `GET
  * /agents/{handle or agent id}/agent-card.json`, served by the core's mesh API
- * (keychain/mesh-api.ts) for every listed agent that serves the binding.
+ * (keychain/mesh-api.ts) for every agent that serves the binding and is not
+ * private or sandboxed.
  *
  * The card's interface URL is the mesh home, `/agents/`, then the agent's
  * handle when it has one, else its agent ID. A handle is learned from the
@@ -11,8 +12,10 @@
  * naming service, agents are found by their agent ID only.
  *
  * Public and unauthenticated, like the registry's documents: a card says what
- * an agent's operator published. Private, unlisted and sandboxed agents, and
- * agents that do not serve the binding, are not found.
+ * an agent's operator published. An unlisted agent has a card: unlisted keeps an
+ * agent out of listings, and it still answers anyone who addresses it directly
+ * (SPEC §8.6), which fetching the card at its own address is. Private and
+ * sandboxed agents, and agents that do not serve the binding, are not found.
  */
 import { storageOf, type KeyedStore, type StorageLike } from "../storage/index.js";
 import type { Manifest } from "../sdk.js";
@@ -93,7 +96,7 @@ export function agentCards(js: StorageLike, opts: AgentCardOptions) {
       } catch {
         return notFound;
       }
-      if (manifest.visibility === "private" || manifest.visibility === "unlisted" || manifest.sandbox) return notFound;
+      if (manifest.visibility === "private" || manifest.sandbox) return notFound;
       if (!servesA2ABinding(manifest)) return notFound;
       const card = a2aCardFromManifest(manifest, { meshHome: opts.meshHome, agent: handle ?? id });
       return {

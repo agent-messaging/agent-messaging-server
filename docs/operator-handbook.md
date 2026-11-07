@@ -682,7 +682,8 @@ What the server keeps for it:
   or while it was away, is not lost. A delivery that sees nothing for six
   hours (`A2A_FOLLOW_IDLE_MS`) lets go, and the client asking again resumes it
   where it stopped.
-- **Cards at the mesh home.** Every listed agent that serves the binding has
+- **Cards at the mesh home.** Every agent that serves the binding and is not
+  private or sandboxed (an unlisted agent included) has
   its A2A card at `<mesh home>/agents/<handle or agent id>/agent-card.json`,
   where the mesh home is `MESH_PUBLIC_URL` (or `API_BASE_URL`). The handle is
   used when the naming service (`PAN_URL`) knows one; a handle is accepted in
