@@ -30,6 +30,7 @@ import { ensureEventsStream, EVENTS_STREAM } from "./events-stream.js";
 import { ensureFeedStream } from "./feed-stream.js";
 import { ensureMeteringStream } from "./metering-stream.js";
 import { ensureTraceStream } from "./trace-stream.js";
+import { ensureTasksStream } from "./tasks-stream.js";
 
 /** What a stream needs from the binding: the manager, and the client for
  *  consumers. Both asked for only when a call needs them. */
@@ -170,6 +171,11 @@ export class JetStreamStream implements StreamStore {
     return (await consumer.consume()) as unknown as StreamConsumer;
   }
 
+  async removeConsumer(durable: string): Promise<void> {
+    const jsm = await this.access.manager();
+    await jsm.consumers.delete(this.name, durable).catch(() => undefined);
+  }
+
   async consumerState(durable: string): Promise<ConsumerState> {
     const jsm = await this.access.manager();
     const ci = await jsm.consumers.info(this.name, durable);
@@ -197,6 +203,7 @@ const ENSURE: Record<SingleStreamName, (jsm: JetStreamManager) => Promise<boolea
     await ensureTraceStream(jsm);
     return true;
   },
+  MESH_TASKS: ensureTasksStream,
 };
 
 export class JetStreamSingleStream extends JetStreamStream implements SingleStream {

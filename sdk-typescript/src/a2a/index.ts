@@ -45,6 +45,7 @@ export * from "./binding.js";
 export * from "./errors.js";
 export * from "./extensions.js";
 export * from "./readings.js";
+export * from "./card.js";
 export {
   A2AClient,
   type A2AClientHost,

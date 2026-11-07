@@ -86,6 +86,9 @@ import type {
 export const A2A_STORE_SUBJECTS = {
   GET: "mesh.task.a2a.get",
   LIST: "mesh.task.a2a.list",
+  /** A reader asks for one stream's frames, delivered to its inbox from the
+   *  first (A2A binding §8; server/src/task-manager/a2a-follow.ts). */
+  FOLLOW: "mesh.task.a2a.follow",
 } as const;
 
 /** ListTasks page size: A2A's default and its bounds. */

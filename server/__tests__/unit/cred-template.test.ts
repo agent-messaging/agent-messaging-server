@@ -402,6 +402,7 @@ describe("sandboxPermissions", () => {
       "mesh.rooms.usage",
       "mesh.task.*.stream",
       "mesh.task.*.update",
+      "mesh.task.a2a.follow",
       "mesh.task.a2a.get",
       "mesh.task.a2a.list",
       "mesh.task.get.*",

@@ -108,7 +108,7 @@ import type {
 } from "./types/options.js";
 import { PROTOCOL_VERSION } from "./types/envelope.js";
 import { A2ANamespace } from "./a2a/index.js";
-import { A2AServerAgent, legacyInputOf, messageOfLegacyInput, outputOfParts, partsOfOutput } from "./a2a/server.js";
+import { A2AServerAgent, A2A_STORE_SUBJECTS, legacyInputOf, messageOfLegacyInput, outputOfParts, partsOfOutput } from "./a2a/server.js";
 import { A2A_BINDING_URI, A2A_STATE_META, A2A_WIRE_VERSION, forbiddenFieldsRefusal, isA2AFrame, isAcceptSignal, isTerminalState } from "./a2a/binding.js";
 import { A2AError } from "./a2a/errors.js";
 import { isForPerson } from "./a2a/extensions.js";
@@ -3608,6 +3608,10 @@ export class AgentMesh {
 
   // ─── A2A over Agent Messaging (bindings/a2a.md) ────────────────────
 
+  /** Streams this agent reads that the mesh delivers to its inbox, by
+   *  streamId (A2A binding §8). */
+  private readonly a2aStreamListeners = new Map<string, (env: Envelope) => void>();
+
   /** @internal The node's A2A side, made on first use. */
   private a2aServerCache: A2AServerAgent | null = null;
   private a2aCache: A2ANamespace | null = null;
@@ -3662,6 +3666,22 @@ export class AgentMesh {
             return { unsubscribe: () => sub.unsubscribe() };
           },
           streamSubject: (taskId) => Subjects.taskStream(taskId),
+          follow: async (taskId, opening) => {
+            try {
+              await this.serviceRequest(A2A_STORE_SUBJECTS.FOLLOW, { frame: opening, taskId }, 10_000, { v: A2A_WIRE_VERSION });
+              return true;
+            } catch (err) {
+              const a2a = err instanceof MeshError ? A2AError.fromErrorObject(err.toErrorObject()) : null;
+              if (a2a) throw a2a;
+              return false; // no task manager here, or it holds no MESH_TASKS
+            }
+          },
+          onStreamFrame: (streamId, onFrame) => {
+            this.a2aStreamListeners.set(streamId, onFrame);
+            return () => {
+              if (this.a2aStreamListeners.get(streamId) === onFrame) this.a2aStreamListeners.delete(streamId);
+            };
+          },
         },
         this.a2aServer(),
         () => this.onA2AServe(),
@@ -3689,7 +3709,7 @@ export class AgentMesh {
       publish: (subject, env) => this.conn.publish(subject, encode(env)),
       updateSubject: (taskId) => Subjects.taskUpdate(taskId),
       streamSubject: (taskId) => Subjects.taskStream(taskId),
-      serviceRequest: (subject, payload, timeoutMs) => this.serviceRequest(subject, payload, timeoutMs),
+      serviceRequest: (subject, payload, timeoutMs) => this.serviceRequest(subject, payload, timeoutMs, { v: A2A_WIRE_VERSION }),
       offerings: () => (this.manifest?.offerings ?? []).map((o) => o.id),
     });
     // §14: a 0.4.0 SendMessage to an agent with only 0.3.0 handlers reaches
@@ -3856,11 +3876,14 @@ export class AgentMesh {
     subject: string,
     payload: unknown,
     timeoutMs = 30_000,
+    /** The wire version of the request; the SDK's A2A calls send 0.4.0. */
+    opts: { v?: string } = {},
   ): Promise<unknown> {
     const env = this.newEnvelope({
       type: "request",
       from: this.agentId,
       payload,
+      ...(opts.v ? { v: opts.v } : {}),
     });
     const resp = await this.conn.request(subject, encode(env), {
       timeout: timeoutMs,
@@ -6826,6 +6849,19 @@ export class AgentMesh {
    */
   private handleInboxRespond(env: Envelope, buffered: boolean): void {
     if (env.to !== undefined && env.to !== this.agentId) return;
+    // A later event of a stream this agent reads, which the mesh delivered
+    // from MESH_TASKS (A2A binding §8). Its age is the stream's, not the
+    // delivery's, so the freshness window does not apply: the stream reader
+    // drops what it has seen by seq, and the signature was checked.
+    if (isA2AFrame(env) && env.in_reply_to === undefined) {
+      const streamId = (env.payload as { a2a?: { streamId?: unknown } } | undefined)?.a2a?.streamId;
+      const listener = typeof streamId === "string" ? this.a2aStreamListeners.get(streamId) : undefined;
+      if (listener) {
+        if (!this.rememberInboxId(env.from, env.id)) return; // §22.2
+        listener(env);
+        return;
+      }
+    }
     if (!this.freshEnough(env, buffered)) return;
     // SPEC.md §5.7: a respond marked for a person is a person's reply to a
     // message this agent's person sent. It resolves no wait (rule 1) and goes

@@ -26,6 +26,7 @@ run the same command with `kubectl -n agent-messaging exec deploy/server --`.
 13. Limits, and where they are set
 14. When something is wrong
 15. Bring your own identity
+16. A2A between agents, and ending the 0.3.0 wire
 
 ## 1. What runs, and on which ports
 
@@ -658,3 +659,56 @@ working after that many days.
 event, signed by an issuer the tenant trusts and naming a workload, pauses
 every agent of the tenant holding that identity and cuts its connections.
 `credentials restore --agent <AGENT>` lifts it, as for any stop.
+
+## 16. A2A between agents, and ending the 0.3.0 wire
+
+From server 0.5.0 agents call each other with A2A 1.0's own operations, in
+signed frames at wire version 0.4.0 (the binding "A2A over Agent Messaging",
+https://agentmessaging.ai/bindings/a2a/v1). Nothing needs setting up for it.
+What the server keeps for it:
+
+- **A2A Tasks** in the keyed store `mesh_a2a_tasks` (seven days), apart from
+  the 0.3.0 records in `mesh_tasks`. The task manager fills it from the
+  changes each agent publishes on `mesh.task.{taskId}.update`, and answers an
+  agent's node when it reads a Task for a client.
+- **Task streams** in the stream `MESH_TASKS`, which holds
+  `mesh.task.*.stream` and `mesh.task.*.update` for seven days (on NATS a
+  JetStream stream, at most `MESH_TASKS_MAX_BYTES`, 1 GiB by default; on
+  RabbitMQ a Postgres-backed stream, filled like the others). The server makes
+  it at start. A client that reads a stream asks the task manager to follow
+  it (`mesh.task.a2a.follow`). The task manager checks that the client opened
+  that stream and created the Task, then delivers the stream's frames to the
+  client's inbox from the first, so an event sent before the client listened,
+  or while it was away, is not lost. A delivery that sees nothing for six
+  hours (`A2A_FOLLOW_IDLE_MS`) lets go, and the client asking again resumes it
+  where it stopped.
+- **Cards at the mesh home.** Every listed agent that serves the binding has
+  its A2A card at `<mesh home>/agents/<handle or agent id>/agent-card.json`,
+  where the mesh home is `MESH_PUBLIC_URL` (or `API_BASE_URL`). The handle is
+  used when the naming service (`PAN_URL`) knows one; a handle is accepted in
+  the path only when the naming service's answer for that agent names the
+  same handle. Route the `/agents/` path from your edge to the mesh API if you
+  want the cards served publicly.
+
+### Ending the 0.3.0 window
+
+Agents on older SDKs still make 0.3.0 calls (`request`, `onRequest`, task
+updates and reads), and the server serves them during a transition window.
+End the window when every agent you care about runs SDK 0.66 or later and
+uses its A2A calls:
+
+```
+MESH_WIRE_0_3_0=refuse
+```
+
+It is off by default (`accept`). Set on the server and restart. With it set:
+
+- the task manager refuses 0.3.0 Task updates (a log line a minute names
+  them) and answers a 0.3.0 Task read (`mesh.task.get.*`) with
+  `INVALID_VERSION`, saying the window has ended and what to use instead;
+- credentials minted from then on grant no subscribe on `mesh.task.>`, so a
+  Task's stream reaches only the readers the task manager delivers it to.
+  Credentials already issued keep their grants until they are renewed.
+
+The channel's own requests (registry, rooms, admission and the rest) are not
+calls between agents, and are served at either wire version.

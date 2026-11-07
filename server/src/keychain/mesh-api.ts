@@ -12,6 +12,9 @@
  * 10a): GET /v1/agents/:key/descriptor, /v1/descriptors/:digest,
  * /v1/agents/:key/eval-record, /v1/eval-records/:digest, /v1/gateway-check/:key.
  *
+ * and each A2A agent's card, GET /agents/{handle or id}/agent-card.json
+ * (registry/agent-card-http.ts, A2A binding §3),
+ *
  * and the capabilities answer, GET /v1/capabilities (shared/capabilities.ts):
  * what this mesh offers, with the platform's entries on top when it runs
  * beside it. `GET /v1/capabilities?core=1` is the core's own answer alone,
@@ -84,6 +87,7 @@ import { IdentitySourceStore, WorkloadBindingStore } from "./identity-records.js
 import { adminTrust } from "../admin/admin-trust.js";
 import { stopSignals, type StopSignalReceiver } from "./stop-signals.js";
 import { meshHome } from "../shared/capabilities.js";
+import { agentCards } from "../registry/agent-card-http.js";
 import { registryDocuments, registryDocumentRoute, type RawAnswer, type RegistryDocuments } from "../registry/documents-http.js";
 import { adminUsage } from "../admin/admin-usage.js";
 import { adminStreams } from "../admin/admin-streams.js";
@@ -288,6 +292,8 @@ export class MeshApi {
     const api = new MeshApi(doors, platform, opts.port ?? Number(env.MESH_API_PORT ?? 3005), opts.host ?? env.MESH_API_HOST ?? "127.0.0.1", env, admin, auth, docs);
     api.storage = js;
     api.rosters = rosterDoor(admissionStore);
+    // The A2A card of each agent that serves the binding (A2A binding §3).
+    api.cards = agentCards(js, { meshHome: meshHome(env) });
     // Stop signals (§4.12, RFC 8935): a tenant's identity provider stops one of its workloads.
     api.signals = stopSignals({
       anchors: () => trust.all(),
@@ -352,6 +358,8 @@ export class MeshApi {
   private signals: StopSignalReceiver | null = null;
   /** The admission roster's own door (admission/roster-door.ts). */
   private rosters: RosterDoor | null = null;
+  /** GET /agents/{handle or id}/agent-card.json (registry/agent-card-http.ts). */
+  private cards: ReturnType<typeof agentCards> | null = null;
   /** Writes the usage store's last batch, when the Monitor routes opened it. */
   private closeUsage: () => Promise<void> = async () => {};
 
@@ -404,6 +412,10 @@ export class MeshApi {
         const answer = await this.rosters(method, path, () => readJson(req));
         if (answer) return send(res, answer);
       }
+      // An agent's A2A card, at its interface URL on the mesh home (A2A
+      // binding §3): the handle when it has one, else its agent ID.
+      const card = /^\/agents\/([^/]+)\/agent-card\.json$/.exec(path);
+      if (method === "GET" && card && this.cards) return sendRaw(res, await this.cards.card(card[1]!));
       const doc = this.docs ? await registryDocumentRoute(this.docs, method, path) : null;
       if (doc) return sendRaw(res, doc);
       if (path === "/admin" || path.startsWith("/admin/")) return send(res, await this.adminRoute(req, method, path, url.searchParams));

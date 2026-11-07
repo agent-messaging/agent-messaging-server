@@ -238,6 +238,9 @@ describe("SendStreamingMessage (§8)", () => {
     server.a2a.serve(async (_m, ctx) => {
       const t = ctx.startTask({ state: "TASK_STATE_WORKING" });
       await gate;
+      // After the client's first read of the Task (this bus delivers no
+      // stream from MESH_TASKS, so the client reads it once on listening).
+      await waitFor(() => bus.log.some((l) => l.env.to === client.id && (l.env.payload as { a2a?: { result?: { id?: string } } })?.a2a?.result?.id === t.id));
       t.artifact({ artifactId: "a1", parts: [{ text: "one" }] });
       t.artifact({ artifactId: "a2", parts: [{ text: "two" }] });
       await tick(20);

@@ -67,6 +67,7 @@
  * the subject here with a comment saying which call needs it — not to widen a
  * wildcard, and never to go back to `{}`.
  */
+import { wire030Refused } from "../shared/wire-window.js";
 
 /** JetStream stream holding one agent's offline mail. Must match
  *  `server/src/registry/inbox-buffer.ts` `inboxStreamName`. Duplicated rather
@@ -330,6 +331,20 @@ const NEVER = [
  * touch the board, cannot publish a feed, and cannot reach JetStream, because
  * the mailbox belongs to the supervisor.
  */
+/**
+ * Subscribe grants on Task subjects, for as long as the 0.3.0 window is open
+ * (shared/wire-window.ts). A 0.3.0 client reads `mesh.task.{id}.update` and
+ * `.stream` directly, and a Task id is not derived from any key, so the grant
+ * cannot be scoped to the client. A 0.4.0 reader needs none of it: the task
+ * manager serves it its stream after checking it may read the Task
+ * (task-manager/a2a-follow.ts, A2A binding §8, SPEC.md §14.3). Once the window
+ * is over (`MESH_WIRE_0_3_0=refuse`) these grants are left out, so only the
+ * nodes the platform delivers to receive a Task's stream.
+ */
+function taskSubscriptions(...subjects: string[]): string[] {
+  return wire030Refused() ? [] : subjects;
+}
+
 export function jobWorkerPermissions(agentKey: string, { sends = false }: { sends?: boolean } = {}): CredPermissions {
   return {
     pub: {
@@ -361,7 +376,7 @@ export function jobWorkerPermissions(agentKey: string, { sends = false }: { send
       allow: [
         // Replies to what it sent, and task updates for the task it is doing.
         "_INBOX.>",
-        "mesh.task.>",
+        ...taskSubscriptions("mesh.task.>"),
       ],
       deny: [
         ...NEVER,
@@ -493,7 +508,7 @@ export function durableAgentPermissions(agentKey: string): CredPermissions {
         // Subscribed events and updates for tasks it initiated. Not
         // self-scopeable; see the note above.
         "mesh.event.>",
-        "mesh.task.>",
+        ...taskSubscriptions("mesh.task.>"),
         // Any agent's feeds (§6.6a): open broadcast by design, like events.
         // Exactly four tokens, so this can never receive `mesh.feed.get`
         // requests, which have three.
@@ -580,7 +595,7 @@ export function nodePermissions(nodeKey: string, agentKeys: string[]): CredPermi
   const subAllow: string[] = [
     // Broadcast planes — not self-scopeable (see the durable template).
     "mesh.event.>",
-    "mesh.task.>",
+    ...taskSubscriptions("mesh.task.>"),
     // Any agent's feeds (§6.6a) — same width and rationale as events.
     "mesh.feed.*.*",
     // Reply inboxes for the node's own requests: the liveness verdict on
@@ -790,7 +805,7 @@ export function consoleReaderPermissions(key: string): CredPermissions {
         `mesh.agent.${key}.inbox`,
         "mesh.event.>",
         "mesh.heartbeat.>",
-        "mesh.task.*.update",
+        ...taskSubscriptions("mesh.task.*.update"),
       ],
       deny: [...CONSOLE_NEVER],
     },
@@ -934,6 +949,7 @@ export function sandboxPermissions(agentKey: string): SandboxPermissions {
         "mesh.task.*.update",
         // The A2A binding's reads (task-manager/a2a-store.ts): a node relays
         // its clients' GetTask, ListTasks and SubscribeToTask here.
+        "mesh.task.a2a.follow",
         "mesh.task.a2a.get",
         "mesh.task.a2a.list",
         "mesh.task.get.*",
@@ -959,7 +975,7 @@ export function sandboxPermissions(agentKey: string): SandboxPermissions {
         // Broadcast planes, not self-scopeable (see the durable template).
         "mesh.event.>",
         "mesh.heartbeat.>",
-        "mesh.task.*.stream",
+        ...taskSubscriptions("mesh.task.*.stream"),
       ],
       deny: [...SANDBOX_NEVER],
     },

@@ -11,6 +11,9 @@ import { declaredNeedRefs, type DeclaredNeedsFn } from "./cancel.js";
 import { OriginLedger, CANCEL_SWEEP_INTERVAL_MS } from "./origin.js";
 import { OriginTap } from "./origin-tap.js";
 import { A2ATaskStore } from "./a2a-store.js";
+import { A2AFollow, A2A_FOLLOW_SUBJECT } from "./a2a-follow.js";
+import { wire030Refused, wire030RefusalError } from "../shared/wire-window.js";
+import { createEnvelope, childSpan } from "../sdk.js";
 import { A2A_STORE_SUBJECTS } from "../../../sdk-typescript/src/a2a/server.js";
 
 /** TASK_CANCEL_SETTLE_GRACE_MS: the grace period G before a cancel may be
@@ -59,6 +62,9 @@ export class TaskManagerService {
    *  not wired, which leaves 0.4.0 Tasks unrecorded and their reads answered
    *  by the server agents' nodes alone. */
   private a2a: A2ATaskStore | null;
+  /** Serves Task streams to their readers from MESH_TASKS (a2a-follow.ts). */
+  private follow: A2AFollow | null = null;
+  private lastRefusalLog = 0;
 
   constructor(
     private nc: Messaging,
@@ -139,6 +145,17 @@ export class TaskManagerService {
           await this.a2a.observe(msg.subject, msg.data).catch((err) => console.error("[task-manager] a2a update:", err));
           continue;
         }
+        // The 0.3.0 window is over (shared/wire-window.ts): a 0.3.0 update is
+        // refused. The subject carries no reply, so it is logged, a line a
+        // minute at most.
+        if (wire030Refused()) {
+          const now = Date.now();
+          if (now - this.lastRefusalLog > 60_000) {
+            this.lastRefusalLog = now;
+            console.warn(`[task-manager] refused a 0.3.0 Task update on ${msg.subject}: MESH_WIRE_0_3_0=refuse`);
+          }
+          continue;
+        }
         try {
           await handleTaskUpdate(
             msg,
@@ -199,6 +216,15 @@ export class TaskManagerService {
     // for its clients.
     if (this.a2a) {
       const a2a = this.a2a;
+      // MESH_TASKS keeps every frame of every Task stream for the Task
+      // horizon; following a stream reads it from there (a2a-follow.ts).
+      const tasks = storageOf(this.js).stream("MESH_TASKS");
+      const usable = await tasks.ensure().catch(() => false);
+      this.follow = new A2AFollow(usable ? tasks : null, a2a, this.nc);
+      const follow = this.follow;
+      this.subs.push(
+        subscribeWithHandler(this.nc, A2A_FOLLOW_SUBJECT, this.kp, (env, msg) => follow.handle(env, msg, this.SERVICE_ID), undefined, undefined, serviceQueue(A2A_FOLLOW_SUBJECT)),
+      );
       for (const [subject, read] of [
         [A2A_STORE_SUBJECTS.GET, a2a.handleGet.bind(a2a)],
         [A2A_STORE_SUBJECTS.LIST, a2a.handleList.bind(a2a)],
@@ -215,7 +241,11 @@ export class TaskManagerService {
         this.nc,
         "mesh.task.get.*",
         this.kp,
-        (env, msg) => handleTaskGet(env, msg, this.kv, this.SERVICE_ID, this.origins ?? undefined),
+        (env, msg) =>
+          // A 0.3.0 Task read, once the 0.3.0 window is over, is refused.
+          wire030Refused()
+            ? Promise.resolve(createEnvelope({ type: "respond", from: this.SERVICE_ID, to: env.from, in_reply_to: env.id, trace: childSpan(env.trace), error: wire030RefusalError() }))
+            : handleTaskGet(env, msg, this.kv, this.SERVICE_ID, this.origins ?? undefined),
         undefined,
         undefined,
         serviceQueue("mesh.task.get.*"),
@@ -249,6 +279,7 @@ export class TaskManagerService {
       sub.unsubscribe();
     }
     this.overdueSweep?.stop();
+    this.follow?.stopAll();
     if (this.cancelSweep) clearInterval(this.cancelSweep);
     this.cancelSweep = null;
     console.log("[task-manager] service stopped");

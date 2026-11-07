@@ -105,6 +105,9 @@ export const SINGLE_STREAMS = {
   MESH_METERING: { holds: "mesh.event.metering.usage" },
   /** Trace spans (`mesh.trace.>`), a short buffer, only when TRACE_STREAM_ENABLED=1. */
   MESH_TRACE: { holds: "mesh.trace.>" },
+  /** Task streams and Task updates (`mesh.task.*.stream`, `mesh.task.*.update`),
+   *  kept seven days so a late or reconnecting reader loses nothing (A2A binding §8). */
+  MESH_TASKS: { holds: "mesh.task.*.stream mesh.task.*.update" },
 } as const;
 
 export type SingleStreamName = keyof typeof SINGLE_STREAMS;

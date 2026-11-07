@@ -256,6 +256,9 @@ export interface StreamStore {
   consume(durable: string, opts?: ConsumeOptions): Promise<StreamConsumer>;
   /** Where a durable consumer stands. Throws when there is no such consumer. */
   consumerState(durable: string): Promise<ConsumerState>;
+  /** Remove a durable consumer that is done (a Task stream that ended). No
+   *  error when there is none. A binding without it keeps the consumer. */
+  removeConsumer?(durable: string): Promise<void>;
 }
 
 /** A stream the layer makes itself, with fixed settings (MESH_EVENTS and the

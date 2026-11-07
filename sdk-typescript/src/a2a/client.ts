@@ -7,13 +7,15 @@
  * on `mesh.task.{taskId}.stream`, where several streams of one Task may share
  * the subject. Each frame names its stream (`streamId`, the opening request
  * frame's id) and its place in it (`seq`). The client reads its own stream's
- * frames in `seq` order and drops one it has seen. A gap is closed with
- * `SubscribeToTask`, which opens a new stream from the Task's current state,
- * and reading goes on there. This server has no durable stream behind the
- * subject (SPEC.md §18.3), so events sent before the client listened are not
- * kept for it: the client reads the Task once with `GetTask` after it starts
- * listening, and again after a quiet spell, and delivers the Task as an event
- * when it moved on.
+ * frames in `seq` order and drops one it has seen. The mesh keeps every
+ * stream frame (MESH_TASKS, SPEC.md §18.3) and, once it has checked the client
+ * may read the Task, delivers that stream's frames to the client's inbox from
+ * the first (`mesh.task.a2a.follow`), so an event sent before the client
+ * listened is not lost. A gap is closed with `SubscribeToTask`, which opens a
+ * new stream from the Task's current state. Only as a safety net, the client
+ * reads the Task with `GetTask` after a long quiet spell; on a mesh that does
+ * not deliver streams it subscribes to the subject itself and reads the Task
+ * once after it starts listening.
  */
 import type { Envelope } from "../types/envelope.js";
 import { MeshError, ErrorCode } from "../types/errors.js";
@@ -66,6 +68,15 @@ export interface A2AClientHost {
   subscribe(subject: string, onFrame: (env: Envelope) => void): { unsubscribe(): void };
   /** The subject of a Task's stream. */
   streamSubject(taskId: string): string;
+  /** Ask the mesh to deliver one stream's frames to this agent's inbox, from
+   *  the first, after it checks this agent may read the Task (A2A binding §8,
+   *  the task manager's `mesh.task.a2a.follow`). True when it will; false when
+   *  the mesh does not offer it (the client then subscribes itself). An A2A
+   *  error (the Task is not this agent's) is thrown. */
+  follow?(taskId: string, opening: Envelope): Promise<boolean>;
+  /** Frames of one stream that reach this agent's inbox. Returns the way to
+   *  stop listening. */
+  onStreamFrame?(streamId: string, onFrame: (env: Envelope) => void): () => void;
 }
 
 export interface A2ACallOptions {
@@ -204,7 +215,7 @@ export class A2AClient {
       // SubscribeToTask names its Task, so the stream subject is listened to
       // before the request leaves and no event can come first.
       const known = method === "SubscribeToTask" ? (params as { id?: string }).id : undefined;
-      const listener = known && isSubjectToken(known) ? self.listen(agentId, known, env.id) : null;
+      const listener = known && isSubjectToken(known) ? await self.listen(agentId, known, env) : null;
       try {
         const first = self.host.open(await self.host.call(agentId, env, opts.timeoutMs ?? 30_000));
         if (first.error) raise(first);
@@ -217,7 +228,7 @@ export class A2AClient {
         if (r.final || eventEndsStream(ev0) || !state.taskId) return;
         // A Task id becomes a subject token (§5); one that cannot is refused.
         if (!isSubjectToken(state.taskId)) throw A2AErrors.invalidAgentResponse("The Task id is not a single subject token (A2A binding §5).");
-        yield* self.follow(agentId, state, opts, listener ?? self.listen(agentId, state.taskId, env.id), ev0);
+        yield* self.follow(agentId, state, opts, listener ?? (await self.listen(agentId, state.taskId, env)), ev0);
       } finally {
         listener?.stop();
       }
@@ -236,15 +247,28 @@ export class A2AClient {
     };
   }
 
-  /** Listen on a Task's stream subject for the frames of one stream. */
-  private listen(agentId: string, taskId: string, streamId: string): StreamListener {
+  /**
+   * Listen for the frames of one stream, opened by `opening`. The mesh
+   * delivers them to this agent's inbox from the first (`durable`), after it
+   * checks this agent may read the Task; a mesh that does not offer that is
+   * read by subscribing to the Task's stream subject, where only events after
+   * the subscription arrive.
+   */
+  private async listen(agentId: string, taskId: string, opening: Envelope): Promise<StreamListener> {
+    const streamId = opening.id;
     const pending = new Map<number, { ev: StreamResponse; final: boolean }>();
+    let off: (() => void) | null = null;
+    let sub: { unsubscribe(): void } | null = null;
     const l: StreamListener = {
       pending,
       wake: null,
-      stop: () => sub.unsubscribe(),
+      durable: false,
+      stop: () => {
+        off?.();
+        sub?.unsubscribe();
+      },
     };
-    const sub = this.host.subscribe(this.host.streamSubject(taskId), (sealed) => {
+    const onFrame = (sealed: Envelope) => {
       const env = this.host.open(sealed);
       // Only the server agent speaks on its Tasks' streams, in 0.4.0 frames,
       // and several streams share the subject: this one's frames only.
@@ -257,7 +281,17 @@ export class A2AClient {
       const w = l.wake;
       l.wake = null;
       w?.();
-    });
+    };
+    if (this.host.onStreamFrame) off = this.host.onStreamFrame(streamId, onFrame);
+    if (this.host.follow && off) {
+      try {
+        l.durable = await this.host.follow(taskId, opening);
+      } catch (err) {
+        off();
+        throw err;
+      }
+    }
+    if (!l.durable) sub = this.host.subscribe(this.host.streamSubject(taskId), onFrame);
     return l;
   }
 
@@ -273,7 +307,9 @@ export class A2AClient {
   ): AsyncGenerator<StreamResponse> {
     const taskId = state.taskId!;
     let l = listener;
-    const idleMs = opts.idleResyncMs ?? 5_000;
+    // A stream the mesh delivers loses nothing, so a quiet spell is only
+    // checked now and then; one read from the subject is checked sooner.
+    const idleMs = opts.idleResyncMs ?? (l.durable ? 30_000 : 5_000);
     let lastState: string | undefined;
     let lastStamp: string | undefined;
     const note = (ev: StreamResponse) => {
@@ -287,7 +323,7 @@ export class A2AClient {
     // Events the server sent before this subscription existed are not kept
     // for it (no durable stream on this server), so the first pass reads the
     // Task once, as a quiet spell would.
-    let catchUp = true;
+    let catchUp = !l.durable;
     try {
       for (;;) {
         let next = l.pending.get(state.lastSeq + 1);
@@ -321,7 +357,7 @@ export class A2AClient {
           // A gap the subscription cannot close: a new stream from the Task's
           // current state (§8). Its frames are listened for before it is asked.
           const env = this.frameFor(agentId, "SubscribeToTask", { id: taskId }, opts);
-          const l2 = this.listen(agentId, taskId, env.id);
+          const l2 = await this.listen(agentId, taskId, env);
           let resp: Envelope;
           try {
             resp = this.host.open(await this.host.call(agentId, env, opts.timeoutMs ?? 30_000));
@@ -369,6 +405,8 @@ export class A2AClient {
 interface StreamListener {
   pending: Map<number, { ev: StreamResponse; final: boolean }>;
   wake: (() => void) | null;
+  /** The mesh delivers this stream from its first event (MESH_TASKS). */
+  durable: boolean;
   stop(): void;
 }
 

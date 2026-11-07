@@ -72,6 +72,9 @@ const SINGLE_SPECS: Record<SingleStreamName, () => (StreamSpec & { enabled: bool
     const days = Number(process.env.METERING_MAX_AGE_DAYS ?? "");
     return { subjects: ["mesh.event.metering.usage"], maxAgeMs: (Number.isFinite(days) && days > 0 ? days : 400) * 86_400_000, discard: "old", enabled: true };
   },
+  // A2A binding §8: every event of a Task's streams and every change to it,
+  // for the Task horizon, so a late or reconnecting reader loses nothing.
+  MESH_TASKS: () => ({ subjects: ["mesh.task.*.stream", "mesh.task.*.update"], maxAgeMs: 7 * 86_400_000, discard: "old", enabled: true }),
   MESH_TRACE: () => ({
     subjects: ["mesh.trace.>"],
     maxAgeMs: Number(process.env.TRACE_STREAM_MAX_AGE_MS ?? 6 * 3600_000),
@@ -270,6 +273,11 @@ export class PostgresStream implements StreamStore {
       if (running.get(`${this.name}\u0000${durable}`) === consumer) running.delete(`${this.name}\u0000${durable}`);
     });
     return consumer;
+  }
+
+  async removeConsumer(durable: string): Promise<void> {
+    running.get(`${this.name}\u0000${durable}`)?.stop();
+    await this.sql.query("delete from ams_stream_consumers where stream = $1 and durable = $2", [this.name, durable]);
   }
 
   async consumerState(durable: string): Promise<ConsumerState> {
