@@ -105,8 +105,10 @@ export default {
         meta: { a2a: { "A2A-Version": "1.0" } },
       }), kpQ);
       raw.publish(`mesh.agent.${server.id}.inbox`, te.encode(JSON.stringify(opening)));
-      for (let i = 0; i < 50 && !inbox.some((e) => e.in_reply_to === opening.id); i++) await sleep(100);
-      const first = inbox.find((e) => e.in_reply_to === opening.id);
+      // The accept signal (a channel frame, binding §4) comes first and carries no a2a member; the first answer is the first frame that does.
+      const isAnswer = (e) => e.in_reply_to === opening.id && e.payload?.a2a !== undefined;
+      for (let i = 0; i < 50 && !inbox.some(isAnswer); i++) await sleep(100);
+      const first = inbox.find(isAnswer);
       const streamTask = first?.payload?.a2a?.result?.task?.id;
       if (!streamTask || first.payload.a2a.streamId !== opening.id || first.payload.a2a.seq !== 0) {
         fails.push(`the stream's first answer: ${JSON.stringify(first?.payload?.a2a ?? first?.error ?? null).slice(0, 200)}`);
