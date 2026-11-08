@@ -1113,7 +1113,10 @@ export {
   type A2AContext,
   type A2AServeOptions,
   type A2ACallOptions,
+  type A2ACallResult,
   type A2AStreamOptions,
   type A2AEventStream,
+  type A2ATaskState,
+  type A2ATaskStateStore,
   type TaskHandle as A2ATaskHandle,
 } from "./a2a/index.js";

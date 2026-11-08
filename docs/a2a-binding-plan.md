@@ -201,6 +201,51 @@ The server and the gateway build against the SDK folder, so 0.5.1 carries
 the fix. `conformance/a2a-binding.json` is the 0.4.2-draft fixture. Nothing is
 published, tagged or released here.
 
+## Server 0.5.3 and SDK 0.68.0
+
+What moving AgentMesh to wire 0.4.0 found missing.
+
+- **Overdue** (task-manager/overdue-sweep.ts). The sweep walks
+  `mesh_a2a_tasks` too. A Task not in a terminal A2A state whose budget
+  deadline passed is marked `overdue` and `overdue_at` beside the Task, never
+  inside it, and its A2A state is left alone. The requester is notified as on
+  0.3.0, in the binding's form (SPEC.md §7.7, binding §12.2): a 0.4.0 respond
+  frame signed by the task manager on `mesh.task.{taskId}.update`, addressed
+  to the requester, whose result is a status update with the Task's own state
+  and `{"overdue": true}` under the budget URI, with `meta.overdue` and
+  `meta.deadline`. It carries no `seq`, so the store does not fold it. No
+  lifecycle event, as on 0.3.0.
+- **Exhausted Tasks keep their cancel fields.** `cancel_reason` (only one the
+  Task or a CancelTask states: exhaustion is not a cancel a party asked for),
+  the reason's `unmet_need` or `dependency`, and `canceled_by` are written on
+  the record and carried on `mesh.event.task.exhausted`. As on 0.3.0, an
+  exhausted Task gets no canceled or trial receipt.
+- **Inputs.** The record keeps the creating Message's parts as
+  `inputs: {message_id, parts, parts_omitted?}`: whole while they fit 16 KiB
+  of JSON, past that each part as `{omitted, kind, size, digest, mediaType?,
+  filename?}`, at most 64 parts. A Message that continues a Task does not
+  change them. The admin API serves them with the rest of the record.
+- **Problem reports.** While a Task waits in `TASK_STATE_INPUT_REQUIRED`,
+  `waiting_on` holds the well-formed reports of its status message's
+  `{"problems": [...]}` data part (SPEC.md §6.5), as sent; a later update in
+  the same wait that carries reports replaces them, and they go when the Task
+  moves on.
+- **The responder's own read.** `mesh.task.a2a.get` with only `{id}` (no
+  client frame) answers the Task's recorded responder, so a node that
+  restarted can take up a Task it handed back (SDK `mesh.a2a.taskHandle`).
+- **SDK 0.68.0.** `callWithFrames` and `sendMessageWithFrames` (the request
+  frame's id and trace and both frames) and `onRequestFrame`;
+  `A2AServeOptions.claimUnhandledOfferings` (default true); `ctx.reportMeter`
+  on the A2A context, the receipt as `payload.usage` beside `payload.a2a` on
+  the answering Message or the frames that finish the Task;
+  `A2AServeOptions.taskState` and `mesh.a2a.taskHandle(id)`, with finished
+  Tasks let go of past `keepFinished` (256). The CHANGELOG has the detail.
+- **The fixture.** `conformance/a2a-binding.json`'s top-level `extensions`
+  block names five of binding §12's nine URIs (not cancel, failure, trial or
+  reply). The copy matches the standards repository; the SDK suite now reads
+  the block against the SDK's URIs. Completing it is a change to the
+  standards repository.
+
 ### Left open
 
 - **The receipt issuer is not in this repository.** EXT-15 receipts are
@@ -211,10 +256,6 @@ published, tagged or released here.
   only the server agent's frames move (§7.3). Until it does, a `GetTask`
   answered from the store returns the receipt only when the server agent
   itself put it there.
-- **Overdue.** The 0.3.0 overdue sweep marks a record and notifies the
-  requester with a 0.3.0 update. On 0.4.0 the mark is `{"overdue": true}` on
-  the status update the server agent sends (§12.2), and the task manager,
-  which never publishes A2A frames, does not sweep A2A Tasks.
 - **Budget revisions.** On 0.3.0 the task manager checks and rebroadcasts a
   revision and emits `task.budget_rejected`; on 0.4.0 a revision is a
   Message the server agent judges, and the task manager only records a
@@ -238,4 +279,5 @@ published, tagged or released here.
 
 SDK 0.65.1 to 0.66.0, server and gateway 0.4.10 to 0.5.0, with the SDK's
 CHANGELOG entry; then SDK 0.67.0 and server and gateway 0.5.1, as the
-section above says. Nothing is published, tagged or released here.
+section above says; then SDK 0.68.0 and server and gateway 0.5.3 (additive:
+nothing a deployment acts on). Nothing is published, tagged or released here.

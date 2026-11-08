@@ -148,7 +148,9 @@ export function adminViews(deps: AdminViewDeps) {
    * beside it what the platform keeps (SPEC.md §7.1): `requester`,
    * `responder`, `offering`, `engagement`, `origin`, `canceled_by`, the
    * cancel or failure reason and attribution, `trial`, `budget`,
-   * `reported_spend`, `created_at`, `updated_at`, `seq` and `frames`.
+   * `reported_spend`, `inputs` (the creating Message's parts), `waiting_on`
+   * (the problem reports of an input wait), `overdue`, `created_at`,
+   * `updated_at`, `seq` and `frames`.
    * A sibling of /tasks, so a reader of the 0.3.0 rows sees them as before.
    */
   const a2aTasks = (q: URLSearchParams) => taskList("mesh_a2a_tasks", q, { wire: "0.4.0" });

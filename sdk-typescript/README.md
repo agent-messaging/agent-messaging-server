@@ -188,6 +188,10 @@ for await (const event of mesh.a2a.sendStreamingMessage(agentId, message)) conso
 | `a2a.getTask`, `a2a.listTasks`, `a2a.subscribeToTask` | Read Tasks this agent created, from the mesh's task store. | §5, §10 |
 | `a2a.cancelTask(agentId, id, { cancel })` | Cancel a Task, with a reason. | §5, §12.6 |
 | `a2a.createTaskPushNotificationConfig` and the other three, `a2a.getExtendedAgentCard` | The remaining operations. | §5 |
+| `a2a.callWithFrames`, `a2a.sendMessageWithFrames`, option `onRequestFrame` | The same calls, answered with the request frame's id and trace and both frames. | §4 |
+| `ctx.reportMeter(meter, quantity)` | Report usage from an A2A handler; the receipt rides as `payload.usage` beside `payload.a2a`. | SPEC §13.5 |
+| `a2a.taskHandle(taskId)`, option `taskState` | Take up a Task this agent handed back, also after a restart. | §5 |
+| option `claimUnhandledOfferings: false` | Keep the 0.3.0 router as it is, so an offering with no handler is refused `OFFERING_NOT_FOUND`. | §14 |
 | `A2A.withOffering`, `A2A.withBudget`, `A2A.forPerson`, `A2A.artifactRefPart`, `A2A.withCancelReason` | Write an extension's data in `metadata`. | §12 |
 | `A2A.budgetReading`, `A2A.isExhausted`, `A2A.cancelReasonOf`, `A2A.failureReasonOf` | Read what a Task says about its budget, cancel or failure. | §12 |
 

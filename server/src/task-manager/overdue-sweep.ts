@@ -4,6 +4,8 @@ import { idOf, sealEnvelope, type ServiceIdentity } from "../shared/handler.js";
 import { keyedOf, type KeyedLike, type KeyedStore, type StorageLike } from "../storage/index.js";
 import { deadlinePassed, type BudgetTask, type BudgetEnvelope } from "./budget.js";
 import { rewriteTask } from "./task-write.js";
+import type { A2ARecordLike } from "./a2a-outputs.js";
+import { A2A_WIRE_VERSION, OVERDUE_METADATA, isTerminalState } from "../../../sdk-typescript/src/a2a/index.js";
 
 /** Same cadence as the presence sweep (registry/heartbeat-monitor.ts). A
  *  deadline is second-granularity under a five-minute skew tolerance (§7.7,
@@ -49,12 +51,26 @@ export type LoadTaskEntries = () => Promise<Map<string, TaskEntryLike>>;
  * (`overdue: true` is a constant write), the duplicate is advisory, and the
  * queue group on the update subject does not help a timer. The same trade the
  * presence sweep makes, accepted for the same reason.
+ *
+ * A2A Tasks (wire 0.4.0, `mesh_a2a_tasks`, a2a-store.ts) are swept the same
+ * way: a Task that is not in a terminal A2A state, whose budget (the one the
+ * starting Message set, or a higher revision) has a deadline that passed, is
+ * marked `overdue` beside the Task, never inside it, and its A2A state is not
+ * touched. The notice is the 0.3.0 one in the binding's form (SPEC.md §7.7,
+ * A2A binding §12.2): a 0.4.0 respond frame signed by this service on the
+ * Task's update subject, addressed to the requester, whose result is a status
+ * update with the Task's own state and `{"overdue": true}` under the budget
+ * extension's URI, and `meta.overdue` and `meta.deadline` as on 0.3.0. It
+ * carries no `seq`, so the A2A store (which folds only the server agent's
+ * numbered changes) leaves the Task as it is.
  */
 export class OverdueSweep {
   private timer: ReturnType<typeof setInterval> | null = null;
   private readonly loadEntries: LoadTaskEntries;
+  private readonly loadA2AEntries: LoadTaskEntries | null;
 
   private kv: KeyedStore;
+  private a2a: KeyedStore | null;
 
   constructor(
     private nc: Messaging,
@@ -63,10 +79,15 @@ export class OverdueSweep {
     private serviceId: ServiceIdentity,
     /** Test seam: replaces the KV snapshot as the source of task entries. */
     loadEntries?: LoadTaskEntries,
+    /** The A2A Task store, and a test seam for its entries. */
+    a2a?: { store?: KeyedStore; loadEntries?: LoadTaskEntries },
   ) {
     this.kv = keyedOf(kv, js);
     this.loadEntries =
       loadEntries ?? (async () => (await this.kv.list()).entries);
+    this.a2a = a2a?.store ?? null;
+    const a2aStore = this.a2a;
+    this.loadA2AEntries = a2a?.loadEntries ?? (a2aStore ? async () => (await a2aStore.list()).entries : null);
   }
 
   start(): void {
@@ -140,6 +161,62 @@ export class OverdueSweep {
       console.log(`[task-manager] task ${task.id}: overdue (deadline ${deadline})`);
     }
 
+    if (this.a2a && this.loadA2AEntries) marked.push(...(await this.sweepA2A(this.a2a, this.loadA2AEntries, nowMs)));
+    return marked;
+  }
+
+  /** The same pass over the A2A Tasks (see the class comment). */
+  private async sweepA2A(store: KeyedStore, load: LoadTaskEntries, nowMs: number): Promise<string[]> {
+    const marked: string[] = [];
+    for (const [key, entry] of await load()) {
+      let record: A2ARecordLike;
+      try {
+        record = entry.json<A2ARecordLike>();
+      } catch {
+        console.warn(`[task-manager] overdue sweep: unparseable A2A task record '${key}', skipped`);
+        continue;
+      }
+      if (!record?.task?.status || isTerminalState(record.task.status.state)) continue;
+      if (record.overdue) continue;
+      const deadline = record.budget?.deadline;
+      if (!deadline || !deadlinePassed(deadline, nowMs)) continue;
+
+      const at = new Date(nowMs).toISOString();
+      const written = await rewriteTask<A2ARecordLike>(store, key, (current) => {
+        if (!current?.task?.status || isTerminalState(current.task.status.state) || current.overdue) return false;
+        current.overdue = true;
+        current.overdue_at = at;
+        current.updated_at = at;
+        return true;
+      });
+      if (!written) continue;
+
+      const t = written.task;
+      const notice = createEnvelope({
+        type: "respond",
+        v: A2A_WIRE_VERSION,
+        from: idOf(this.serviceId),
+        to: written.requester,
+        payload: {
+          a2a: {
+            result: {
+              statusUpdate: {
+                taskId: t.id,
+                contextId: t.contextId ?? "",
+                // The Task's own state, unchanged: overdue is a mark (§7.2).
+                status: { state: t.status.state, timestamp: at },
+                metadata: { ...OVERDUE_METADATA },
+              },
+            },
+          },
+        },
+        meta: { overdue: true, deadline },
+      });
+      this.nc.publish(Subjects.taskUpdate(t.id), sealEnvelope(notice, this.serviceId));
+
+      marked.push(t.id);
+      console.log(`[task-manager] A2A task ${t.id}: overdue (deadline ${deadline})`);
+    }
     return marked;
   }
 }

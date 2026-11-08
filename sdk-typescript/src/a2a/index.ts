@@ -38,6 +38,21 @@ export class A2ANamespace extends A2AClient {
   task(taskId: string): TaskHandle | undefined {
     return this.server.handleFor(taskId);
   }
+
+  /**
+   * The handle of a Task this agent answers, also after a restart: the one
+   * held in memory, else rebuilt from `A2AServeOptions.taskState` (with its
+   * open streams) and the mesh's task store, whichever is further along.
+   * Undefined when neither knows the Task, or it is not this agent's.
+   *
+   * ```ts
+   * const task = await mesh.a2a.taskHandle(savedId);
+   * task?.complete("Done after the restart.");
+   * ```
+   */
+  taskHandle(taskId: string): Promise<TaskHandle | undefined> {
+    return this.server.resumeTask(taskId);
+  }
 }
 
 export * from "./types.js";
@@ -50,6 +65,7 @@ export {
   A2AClient,
   type A2AClientHost,
   type A2ACallOptions,
+  type A2ACallResult,
   type A2AStreamOptions,
   type A2AEventStream,
 } from "./client.js";
@@ -69,5 +85,7 @@ export {
   type A2AContext,
   type A2AAdmission,
   type A2AServeOptions,
+  type A2ATaskState,
+  type A2ATaskStateStore,
   type TaskHandle,
 } from "./server.js";

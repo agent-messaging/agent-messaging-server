@@ -68,6 +68,8 @@ import {
   type A2AFailure,
 } from "./extensions.js";
 import { validateStopFields } from "../cancel.js";
+import { MeterUsageLedger, type UsageEntry } from "../internal/meter-usage.js";
+import { newTraceContext } from "../internal/trace.js";
 import { routeOffering } from "./readings.js";
 import type { Budget } from "../types/envelope.js";
 import type {
@@ -127,6 +129,43 @@ export interface A2AServerHost {
   /** The offering a Message naming none goes to, when the agent declares
    *  several and names a default (§12.1). */
   defaultOffering?(): string | undefined;
+  /** Add a declared meter quantity to the usage receipt kept under `key`
+   *  (SPEC.md §13.5). Absent: the node keeps the receipts itself. */
+  reportMeter?(key: string, meter: string, quantity: number): void;
+  /** The usage receipt kept under `key`, forgotten as it is handed over;
+   *  null when nothing was reported. */
+  takeUsage?(key: string): UsageEntry[] | null;
+}
+
+/** What a server agent keeps of a Task it handed back, so that after a
+ *  restart it can still move it (`A2AServeOptions.taskState`). */
+export interface A2ATaskState {
+  /** The Task as it stands. */
+  task: Task;
+  /** The agent that created it: the one its frames go to. */
+  requester: string;
+  /** The Task's place in its own order of changes (§5). */
+  version: number;
+  /** The streams open on it: each one's id (its opening frame's id), the
+   *  last `seq` sent, and the client it goes to. */
+  streams: Array<{ id: string; seq: number; to: string; sealTo?: string }>;
+  trace: TraceContext;
+  /** The keys the Task's usage receipt is kept under (`ctx.reportMeter`). */
+  usageKeys?: string[];
+}
+
+/**
+ * Where a server agent keeps its Tasks' state across restarts: a file, a
+ * database, anything that outlives the process. `save` is called after every
+ * change to a Task that is not finished, `remove` when it finishes, and
+ * `load` when the agent takes up a Task it does not hold in memory
+ * (`mesh.a2a.taskHandle`). Each may return a promise; a failure is logged and
+ * never stops the Task.
+ */
+export interface A2ATaskStateStore {
+  save(state: A2ATaskState): void | Promise<void>;
+  load(taskId: string): A2ATaskState | null | undefined | Promise<A2ATaskState | null | undefined>;
+  remove(taskId: string): void | Promise<void>;
 }
 
 /** One Task this agent runs, as its handle shows it to the handler. */
@@ -207,6 +246,14 @@ export interface A2AContext {
   /** Present when the node admitted this call as trial work (Common Agent
    *  §7.7, the trial extension §12.8): the work keeps inside its caps. */
   readonly trial?: TrialContext;
+  /**
+   * Report a declared meter quantity for this call's usage receipt (SPEC.md
+   * §13.5), as `ctx.reportMeter` does for a 0.3.0 handler: additive per
+   * meter. The receipt rides as `payload.usage` beside `payload.a2a` on the
+   * frame that answers the call with a Message, or on the frames that bring
+   * its Task to a terminal state. Throws INPUT_INVALID on a malformed report.
+   */
+  reportMeter(meter: string, quantity: number): void;
   /** Create this call's Task (or, for a message that continues one, take its
    *  handle). The Task starts in `TASK_STATE_SUBMITTED` unless told otherwise,
    *  with the client's message in its history. */
@@ -250,7 +297,26 @@ export interface A2AServeOptions {
    * call's wire-neutral view.
    */
   admit?: (ctx: RequestContext) => void | Promise<void>;
+  /**
+   * Whether 0.3.0 requests that no `onRequest` handler takes reach the A2A
+   * handler (§14), as Messages naming the offering they asked for. Default
+   * true, as before 0.68.0, so an agent that serves only A2A still answers
+   * clients on the 0.3.0 wire. False keeps the 0.3.0 router as it is: a
+   * request for an offering with no handler is refused OFFERING_NOT_FOUND,
+   * and `onDefault` decides the rest.
+   */
+  claimUnhandledOfferings?: boolean;
+  /** Keep the state of each Task this agent hands back here, so that after a
+   *  restart `mesh.a2a.taskHandle(id)` gives it back with its open streams.
+   *  Without it a restarted agent rebuilds the handle from the mesh's task
+   *  store, and the clients' open streams catch up by reading the Task. */
+  taskState?: A2ATaskStateStore;
+  /** How many finished Tasks stay in memory for reads (the store answers
+   *  for the rest). Default 256. */
+  keepFinished?: number;
 }
+
+const KEEP_FINISHED_DEFAULT = 256;
 
 /** One open stream of a Task (§8): the request frame that opened it names
  *  it, and its events count from 0. */
@@ -273,6 +339,12 @@ interface LiveTask {
   abort: AbortController;
   waiters: Array<(t: Task) => void>;
   handle?: TaskHandle;
+  /** The keys this Task's usage receipt is kept under: one per call that
+   *  worked on it. */
+  usageKeys: string[];
+  /** The receipt, once taken at the terminal state: carried on every frame
+   *  that shows that state. */
+  finalUsage?: UsageEntry[];
 }
 
 const agentMessage = (content: string | Message, task: Task): Message =>
@@ -328,6 +400,10 @@ export class A2AServerAgent {
   private handler: A2AHandler | null = null;
   private opts: A2AServeOptions = {};
   private readonly live = new Map<string, LiveTask>();
+  /** Finished Tasks still held, oldest first (`keepFinished`). */
+  private readonly finished: string[] = [];
+  /** Usage receipts, for a host that keeps none itself. */
+  private readonly ownUsage = new MeterUsageLedger();
   /** Answers 0.4.0 SendMessage for an agent with no A2A handler: its 0.3.0
    *  handlers (§14), wired by AgentMesh. */
   legacy: ((offering: string | undefined, message: Message, env: Envelope, admitted?: A2AAdmission) => Promise<Message>) | null = null;
@@ -358,6 +434,110 @@ export class A2AServerAgent {
   handleFor(taskId: string): TaskHandle | undefined {
     const l = this.live.get(taskId);
     return l ? this.makeHandle(l) : undefined;
+  }
+
+  /**
+   * The handle of a Task this agent answers, rebuilt when the node does not
+   * hold it: from `taskState` (with its open streams), and from the mesh's
+   * task store, which answers the Task's own server agent (a2a-store.ts),
+   * taking whichever is further along. Undefined when neither knows it, or
+   * the store says it is not this agent's.
+   */
+  async resumeTask(taskId: string): Promise<TaskHandle | undefined> {
+    const held = this.live.get(taskId);
+    if (held) return this.makeHandle(held);
+    let saved: A2ATaskState | null | undefined = null;
+    try {
+      saved = (await this.opts.taskState?.load(taskId)) ?? null;
+    } catch (err) {
+      console.warn(`[a2a] could not load the saved state of task ${taskId}:`, err instanceof Error ? err.message : err);
+    }
+    let stored: { task: Task; seq: number; requester?: string } | null = null;
+    try {
+      const out = (await this.host.serviceRequest(A2A_STORE_SUBJECTS.GET, { id: taskId }, this.opts.storeTimeoutMs ?? 5_000)) as { task?: Task; seq?: number; requester?: string };
+      if (out && isTask(out.task)) stored = { task: out.task, seq: typeof out.seq === "number" ? out.seq : 0, ...(out.requester ? { requester: out.requester } : {}) };
+    } catch (err) {
+      const a2a = a2aErrorOf(err);
+      if (a2a && a2a.code === "TaskNotFoundError" && !saved) return undefined;
+      if (!a2a && !storeUnreachable(err)) throw err;
+    }
+    // A Task taken up while this call waited is already held.
+    const raced = this.live.get(taskId);
+    if (raced) return this.makeHandle(raced);
+    let l: LiveTask;
+    if (saved && saved.task?.id === taskId && (!stored || saved.version >= stored.seq)) {
+      l = this.adopt(saved.task, saved.version, saved.requester, saved.trace ?? newTraceContext());
+      for (const st of saved.streams ?? []) {
+        l.streams.set(st.id, { id: st.id, seq: st.seq, to: st.to, trace: saved.trace ?? newTraceContext(), ...(st.sealTo ? { sealTo: st.sealTo } : {}) });
+      }
+      l.usageKeys = [...(saved.usageKeys ?? [])];
+    } else if (stored && (stored.requester ?? saved?.requester)) {
+      l = this.adopt(stored.task, stored.seq, (stored.requester ?? saved?.requester)!, saved?.trace ?? newTraceContext());
+      for (const st of saved?.streams ?? []) {
+        l.streams.set(st.id, { id: st.id, seq: st.seq, to: st.to, trace: l.trace, ...(st.sealTo ? { sealTo: st.sealTo } : {}) });
+      }
+      l.usageKeys = [...(saved?.usageKeys ?? [])];
+    } else {
+      return undefined;
+    }
+    if (isTerminalState(l.task.status.state)) this.finish(l);
+    return this.makeHandle(l);
+  }
+
+  // ─── Usage, state, memory ─────────────────────────────────────────
+
+  private reportMeterFor(key: string, meter: string, quantity: number): void {
+    if (this.host.reportMeter) this.host.reportMeter(key, meter, quantity);
+    else this.ownUsage.report(key, meter, quantity);
+  }
+
+  /** The receipts kept under `keys`, summed per meter and forgotten. */
+  private takeUsage(keys: string[]): UsageEntry[] | undefined {
+    const sum = new Map<string, number>();
+    for (const key of new Set(keys)) {
+      const got = this.host.takeUsage ? this.host.takeUsage(key) : this.ownUsage.take(key);
+      for (const e of got ?? []) sum.set(e.meter, (sum.get(e.meter) ?? 0) + e.quantity);
+    }
+    if (!sum.size) return undefined;
+    return [...sum.entries()].sort(([a], [b]) => (a < b ? -1 : 1)).map(([meter, quantity]) => ({ meter, quantity }));
+  }
+
+  /** What `taskState` keeps of a Task. */
+  private saveState(l: LiveTask): void {
+    const store = this.opts.taskState;
+    if (!store) return;
+    const state: A2ATaskState = {
+      task: cloneTask(l.task),
+      requester: l.requester,
+      version: l.version,
+      streams: [...l.streams.values()].map((s) => ({ id: s.id, seq: s.seq, to: s.to, ...(s.sealTo ? { sealTo: s.sealTo } : {}) })),
+      trace: l.trace,
+      ...(l.usageKeys.length ? { usageKeys: [...l.usageKeys] } : {}),
+    };
+    void Promise.resolve()
+      .then(() => store.save(state))
+      .catch((err) => console.warn(`[a2a] could not save the state of task ${l.task.id}:`, err instanceof Error ? err.message : err));
+  }
+
+  /** A Task reached a terminal state: its saved state goes, and of the
+   *  finished Tasks only the newest `keepFinished` stay in memory. */
+  private finish(l: LiveTask): void {
+    const id = l.task.id;
+    const store = this.opts.taskState;
+    if (store) {
+      void Promise.resolve()
+        .then(() => store.remove(id))
+        .catch((err) => console.warn(`[a2a] could not remove the state of task ${id}:`, err instanceof Error ? err.message : err));
+    }
+    const at = this.finished.indexOf(id);
+    if (at >= 0) this.finished.splice(at, 1);
+    this.finished.push(id);
+    const keep = Math.max(0, this.opts.keepFinished ?? KEEP_FINISHED_DEFAULT);
+    while (this.finished.length > keep) {
+      const old = this.finished.shift()!;
+      const held = this.live.get(old);
+      if (held && isTerminalState(held.task.status.state)) this.live.delete(old);
+    }
   }
 
   /**
@@ -412,7 +592,10 @@ export class A2AServerAgent {
           let live = this.live.get(id);
           if (!live || live.version < seq) live = this.adopt(task, seq, requester ?? env.from, env.trace);
           const final = isTerminalState(task.status.state);
-          if (!final) live.streams.set(env.id, { id: env.id, seq: 0, to: env.from, trace: env.trace, ...(sealTo ? { sealTo } : {}) });
+          if (!final) {
+            live.streams.set(env.id, { id: env.id, seq: 0, to: env.from, trace: env.trace, ...(sealTo ? { sealTo } : {}) });
+            this.saveState(live);
+          }
           answer({ task: cloneTask(live.task) }, { streamId: env.id, seq: 0, final });
           return;
         }
@@ -510,10 +693,15 @@ export class A2AServerAgent {
       }
     }
 
+    // The key this call's usage receipt is kept under: the one the node's
+    // gates accounted the call under, so a 0.3.0 handler's ctx.reportMeter
+    // and an A2A handler's land in the same receipt.
+    const usageKey = admitted?.taskId ?? env.id;
+
     if (!this.handler) {
       if (this.legacy && !existing) {
         const out = await this.legacy(offering, message, env, admitted);
-        this.answerFirst(env, reply, { message: out }, streaming ? { streamId: env.id, seq: 0, final: true } : undefined, sealTo);
+        this.answerFirst(env, reply, { message: out }, streaming ? { streamId: env.id, seq: 0, final: true } : undefined, sealTo, this.takeUsage([usageKey]));
         return;
       }
       throw A2AErrors.unsupported("A2A messages");
@@ -523,24 +711,34 @@ export class A2AServerAgent {
     let answered = false;
     const abort = existing?.abort ?? new AbortController();
     const create = (task: Task): LiveTask => {
-      const l: LiveTask = { task, requester: env.from, version: 0, streams: new Map(), trace: env.trace, abort, waiters: [] };
+      const l: LiveTask = { task, requester: env.from, version: 0, streams: new Map(), trace: env.trace, abort, waiters: [], usageKeys: [usageKey] };
       this.live.set(task.id, l);
       // The Task's first change, for the task store: the Task itself, in
-      // reply to the request that created it (§5).
-      this.publishUpdate(l, { task: cloneTask(task) }, env.id);
+      // reply to the request that created it (§5). A Task born finished
+      // carries the call's usage receipt.
+      const done = isTerminalState(task.status.state);
+      if (done) l.finalUsage = this.takeUsage(l.usageKeys);
+      this.publishUpdate(l, { task: cloneTask(task) }, env.id, l.finalUsage);
+      if (done) this.finish(l);
+      else this.saveState(l);
       return l;
     };
     const firstAnswer = (): void => {
       if (answered || !live) return;
       answered = true;
       const snapshot = cloneTask(live.task);
+      // A Task already finished answers with its usage receipt.
+      const usage = isTerminalState(snapshot.status.state) ? live.finalUsage : undefined;
       if (streaming) {
         // The stream this request opens: its first event is this answer.
         const final = isTerminalState(snapshot.status.state);
-        if (!final) live.streams.set(env.id, { id: env.id, seq: 0, to: env.from, trace: env.trace, ...(sealTo ? { sealTo } : {}) });
-        this.answerFirst(env, reply, { task: snapshot }, { streamId: env.id, seq: 0, final }, sealTo);
+        if (!final) {
+          live.streams.set(env.id, { id: env.id, seq: 0, to: env.from, trace: env.trace, ...(sealTo ? { sealTo } : {}) });
+          this.saveState(live);
+        }
+        this.answerFirst(env, reply, { task: snapshot }, { streamId: env.id, seq: 0, final }, sealTo, usage);
       } else {
-        this.answerFirst(env, reply, { task: snapshot }, undefined, sealTo);
+        this.answerFirst(env, reply, { task: snapshot }, undefined, sealTo, usage);
       }
     };
 
@@ -548,6 +746,7 @@ export class A2AServerAgent {
       // The client's message joins the history and the Task works again.
       existing.task.history = [...(existing.task.history ?? []), message];
       existing.trace = env.trace;
+      if (!existing.usageKeys.includes(usageKey)) existing.usageKeys.push(usageKey);
     }
 
     const ctx: A2AContext = {
@@ -564,6 +763,7 @@ export class A2AServerAgent {
       signal: abort.signal,
       ...(admitted?.request.call ? { call: admitted.request.call } : {}),
       ...(admitted?.request.trial ? { trial: admitted.request.trial } : {}),
+      reportMeter: (meter, quantity) => this.reportMeterFor(usageKey, meter, quantity),
       startTask: (init = {}) => {
         if (!live) {
           // A Task id becomes a subject token (§5): a UUID always is one.
@@ -626,7 +826,7 @@ export class A2AServerAgent {
       }
     } else if (isMessage(result)) {
       if (!live) {
-        this.answerFirst(env, reply, { message: result }, streaming ? { streamId: env.id, seq: 0, final: true } : undefined, sealTo);
+        this.answerFirst(env, reply, { message: result }, streaming ? { streamId: env.id, seq: 0, final: true } : undefined, sealTo, this.takeUsage([usageKey]));
         return;
       }
       // A Message from a handler that also started a Task is the Task's
@@ -645,21 +845,22 @@ export class A2AServerAgent {
     result: { task?: Task; message?: Message },
     stream: { streamId: string; seq: number; final: boolean } | undefined,
     sealTo?: string,
+    usage?: UsageEntry[],
   ): void {
-    reply(this.frameOf({ to: env.from, in_reply_to: env.id, trace: childSpan(env.trace), payload: respondPayload(result, stream) }, sealTo));
+    reply(this.frameOf({ to: env.from, in_reply_to: env.id, trace: childSpan(env.trace), payload: withUsage(respondPayload(result, stream), usage) }, sealTo));
   }
 
   /** One change, published for the task store on the Task's update subject
    *  (§5), numbered in the Task's own order. Never sealed: the task manager
    *  reads it. */
-  private publishUpdate(live: LiveTask, ev: StreamResponse, inReplyTo?: string): void {
+  private publishUpdate(live: LiveTask, ev: StreamResponse, inReplyTo?: string, usage?: UsageEntry[]): void {
     this.host.publish(
       this.host.updateSubject(live.task.id),
       this.host.frame({
         to: live.requester,
         ...(inReplyTo ? { in_reply_to: inReplyTo } : {}),
         trace: childSpan(live.trace),
-        payload: respondPayload(ev, { seq: live.version }),
+        payload: withUsage(respondPayload(ev, { seq: live.version }), usage),
       }),
     );
   }
@@ -673,16 +874,23 @@ export class A2AServerAgent {
     if (!next || next === before) return; // a terminal Task does not move
     live.task = next;
     live.version += 1;
-    this.publishUpdate(live, ev);
+    // The change that finishes the Task carries its usage receipt (§13.5),
+    // on the update and on every stream it ends.
+    const done = isTerminalState(next.status.state) && !isTerminalState(before.status.state);
+    if (done) live.finalUsage = this.takeUsage(live.usageKeys);
+    const usage = done ? live.finalUsage : undefined;
+    this.publishUpdate(live, ev, undefined, usage);
     const final = eventEndsStream(ev);
     for (const st of [...live.streams.values()]) {
       st.seq += 1;
       this.host.publish(
         this.host.streamSubject(live.task.id),
-        this.frameOf({ to: st.to, trace: childSpan(st.trace), payload: respondPayload(ev, { streamId: st.id, seq: st.seq, final }) }, st.sealTo),
+        this.frameOf({ to: st.to, trace: childSpan(st.trace), payload: withUsage(respondPayload(ev, { streamId: st.id, seq: st.seq, final }), usage) }, st.sealTo),
       );
       if (final) live.streams.delete(st.id);
     }
+    if (done) this.finish(live);
+    else this.saveState(live);
     after?.();
     if (endsStream(live.task.status.state)) {
       const waiters = live.waiters.splice(0);
@@ -779,6 +987,8 @@ export class A2AServerAgent {
       trace,
       abort: prior?.abort ?? new AbortController(),
       waiters: prior?.waiters ?? [],
+      usageKeys: prior?.usageKeys ?? [],
+      ...(prior?.finalUsage ? { finalUsage: prior.finalUsage } : {}),
     };
     this.live.set(task.id, l);
     return l;
@@ -908,6 +1118,12 @@ export function cancelReasonFor(p: CancelTaskRequest, declared: boolean): A2ACan
     ...(typeof unmetNeed === "string" ? { unmetNeed } : {}),
     ...(typeof d.dependency === "string" ? { dependency: d.dependency } : {}),
   };
+}
+
+/** A respond payload with the usage receipt beside `a2a` (binding §4,
+ *  SPEC.md §13.5), when there is one. */
+function withUsage<P extends object>(payload: P, usage: UsageEntry[] | undefined): P | (P & { usage: UsageEntry[] }) {
+  return usage?.length ? { ...payload, usage } : payload;
 }
 
 /** A failure reason (§12.7) checked against §10.8: the handler's own

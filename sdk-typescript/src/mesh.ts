@@ -3757,6 +3757,11 @@ export class AgentMesh {
       serviceRequest: (subject, payload, timeoutMs) => this.serviceRequest(subject, payload, timeoutMs, { v: A2A_WIRE_VERSION }),
       offerings: () => (this.manifest?.offerings ?? []).map((o) => o.id),
       defaultOffering: () => this.manifest?.default_offering,
+      // One ledger for both wires: what a handler reports through
+      // ctx.reportMeter, or the host through reportMeterUsage, under the key
+      // the gates accounted the call under.
+      reportMeter: (key, meter, quantity) => this.reportMeterUsage(key, meter, quantity),
+      takeUsage: (key) => this.meterUsage.take(key),
     });
     // §14: a 0.4.0 SendMessage to an agent with only 0.3.0 handlers reaches
     // the handler for the offering it names, and comes back as a Message.
@@ -3802,6 +3807,14 @@ export class AgentMesh {
   private onA2AServe(): void {
     // Serving means receiving: the inbox is listened to even before register.
     this.listenInbox();
+    // `claimUnhandledOfferings: false`: the 0.3.0 router stays as the agent
+    // set it, so a request for an offering with no handler is refused
+    // OFFERING_NOT_FOUND. An adapter an earlier `serve` installed goes.
+    if (this.a2aServer().options.claimUnhandledOfferings === false) {
+      if (this.a2aLegacyDefault) this.router.clearDefault(this.a2aLegacyDefault);
+      this.a2aLegacyDefault = null;
+      return;
+    }
     if (!this.router.hasDefault) {
       const server = this.a2aServer();
       const adapter: OfferingHandler = async (input, ctx) => {
@@ -3828,8 +3841,14 @@ export class AgentMesh {
             details: resp.error.details,
           });
         }
-        const result = (resp.payload as { a2a?: { result?: { message?: A2AMessage; task?: { id: string; status: { state: string }; artifacts?: { parts: A2AMessage["parts"] }[] } } } })
-          .a2a?.result;
+        const answered = resp.payload as { usage?: unknown; a2a?: { result?: { message?: A2AMessage; task?: { id: string; status: { state: string }; artifacts?: { parts: A2AMessage["parts"] }[] } } } };
+        // The usage the A2A handler reported rides the 0.3.0 answer instead.
+        if (Array.isArray(answered.usage)) {
+          for (const e of answered.usage as Array<{ meter?: unknown; quantity?: unknown }>) {
+            if (typeof e?.meter === "string" && typeof e.quantity === "number") ctx.reportMeter(e.meter, e.quantity);
+          }
+        }
+        const result = answered.a2a?.result;
         if (result?.message) return outputOfParts(result.message.parts);
         let task = result?.task;
         if (task && !isTerminalState(task.status.state)) task = (await server.handleFor(task.id)?.settled()) ?? task;

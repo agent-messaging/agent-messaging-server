@@ -14,7 +14,10 @@
  *     `exhausted` (shared/a2a-frames.ts `wire030State`);
  *   - the cancel reason: the cancel extension on the canceled Task's
  *     `metadata` (§12.6), else on the CancelTask request the task manager
- *     saw, else `user_requested`, as §12.6 records a cancel without one;
+ *     saw, else `user_requested`, as §12.6 records a cancel without one; an
+ *     exhausted Task carries the cancel fields too (its event, its record
+ *     and who canceled it), with only a reason it states, and gets no
+ *     canceled receipt, as on 0.3.0;
  *   - the failure reason, `unmet_need` and `dependency`: the failure
  *     extension on the failed Task (§12.7), camelCase there, snake_case here;
  *   - the attribution of §10.8a: computed by the platform against the
@@ -27,8 +30,10 @@
  *   - the reported spend: `payload.cost` beside `payload.a2a` on the
  *     responder's frames (SPEC.md §13.5, §19.3).
  */
+import { createHash } from "node:crypto";
 import type { Envelope, TaskCanceledBy, TaskOrigin } from "../sdk.js";
 import { createEnvelope, Subjects } from "../sdk.js";
+import { checkInputProblem, type InputProblem } from "../../../sdk-typescript/src/problems.js";
 import type { KeyedStore, Messaging } from "../storage/index.js";
 import { idOf, sealEnvelope, type ServiceIdentity } from "../shared/handler.js";
 import { observedTaskTerminal, publishMeterEvents } from "../shared/metering.js";
@@ -47,6 +52,8 @@ import {
   isValidCancelObject,
   isValidFailureObject,
   type A2ACancel,
+  type Message,
+  type Part,
   type Task,
 } from "../../../sdk-typescript/src/a2a/index.js";
 
@@ -72,14 +79,129 @@ export interface A2APlatformFields {
   attribution?: Attribution;
   unmet_need_declared?: boolean;
   completed_late?: boolean;
+  /** SPEC.md §7.7: the deadline passed while the Task was not finished, on
+   *  this service's clock (overdue-sweep.ts). A mark, never a state. */
+  overdue?: boolean;
+  overdue_at?: string;
   stranded?: true;
   stranded_at?: string;
+  /** The parts of the Message that created the Task, as the client sent
+   *  them, so a reader need not dig them out of the Task's history (which
+   *  the server agent writes). Large parts are kept as references. */
+  inputs?: A2AInputs;
+  /** While the Task waits in TASK_STATE_INPUT_REQUIRED: the problem reports
+   *  of the latest pause, exactly as the server agent sent them (SPEC.md
+   *  §6.5, a `{"problems": [...]}` data part in the status message). Gone
+   *  once the Task moves on. */
+  waiting_on?: InputProblem[];
   /** The signed frames that changed the Task, for audit (§7.1), newest last,
    *  at most MAX_FRAMES. */
   frames?: Envelope[];
 }
 
 export const MAX_FRAMES = 50;
+
+/** A part of the creating Message too large to keep whole: what it was, how
+ *  big, and the SHA-256 of its bytes (the decoded bytes of a `raw` part, the
+ *  UTF-8 of a `text` or `url` part, the JSON of a `data` part). */
+export interface A2AInputRef {
+  omitted: true;
+  kind: "text" | "raw" | "url" | "data";
+  size: number;
+  digest: string;
+  mediaType?: string;
+  filename?: string;
+}
+
+/** The creating Message's parts, kept beside the Task. */
+export interface A2AInputs {
+  message_id: string;
+  parts: Array<Part | A2AInputRef>;
+  /** Parts past the count kept, not listed. */
+  parts_omitted?: number;
+}
+
+/** How much of the creating Message is kept whole, in bytes of JSON; parts
+ *  past it are kept as references. */
+export const INPUTS_INLINE_MAX = 16 * 1024;
+/** How many parts are listed at most. */
+export const INPUTS_PARTS_MAX = 64;
+
+function inputRef(part: Part): A2AInputRef {
+  let kind: A2AInputRef["kind"];
+  let bytes: Uint8Array;
+  if (typeof part.raw === "string") {
+    kind = "raw";
+    bytes = Buffer.from(part.raw, "base64");
+  } else if (typeof part.text === "string") {
+    kind = "text";
+    bytes = Buffer.from(part.text, "utf8");
+  } else if (typeof part.url === "string") {
+    kind = "url";
+    bytes = Buffer.from(part.url, "utf8");
+  } else {
+    kind = "data";
+    bytes = Buffer.from(JSON.stringify(part.data ?? null), "utf8");
+  }
+  return {
+    omitted: true,
+    kind,
+    size: bytes.length,
+    digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`,
+    ...(typeof part.mediaType === "string" ? { mediaType: part.mediaType } : {}),
+    ...(typeof part.filename === "string" ? { filename: part.filename } : {}),
+  };
+}
+
+/** What the record keeps of a creating Message: its parts in order, whole
+ *  while they fit INPUTS_INLINE_MAX, each one past it as a reference, at most
+ *  INPUTS_PARTS_MAX of them. Undefined for a Message with no id or parts. */
+export function inputsOf(message: Message | undefined): A2AInputs | undefined {
+  if (!message || typeof message.messageId !== "string" || !Array.isArray(message.parts)) return undefined;
+  let room = INPUTS_INLINE_MAX;
+  const parts: A2AInputs["parts"] = [];
+  for (const part of message.parts.slice(0, INPUTS_PARTS_MAX)) {
+    if (!part || typeof part !== "object") continue;
+    const size = Buffer.byteLength(JSON.stringify(part), "utf8");
+    if (size <= room) {
+      parts.push(part);
+      room -= size;
+    } else {
+      parts.push(inputRef(part));
+    }
+  }
+  const omitted = Math.max(0, message.parts.length - INPUTS_PARTS_MAX);
+  return { message_id: message.messageId, parts, ...(omitted ? { parts_omitted: omitted } : {}) };
+}
+
+/** The problem reports a status message carries (SPEC.md §6.5): the
+ *  well-formed entries of its `{"problems": [...]}` data part, as sent. A
+ *  malformed entry is dropped, never repaired. */
+export function problemsOf(task: Task): InputProblem[] {
+  for (const part of task.status?.message?.parts ?? []) {
+    const list = (part?.data as { problems?: unknown } | undefined)?.problems;
+    if (!Array.isArray(list)) continue;
+    const ok = list.filter((p): p is InputProblem => checkInputProblem(p).length === 0);
+    if (ok.length) return ok;
+  }
+  return [];
+}
+
+/**
+ * Keep `waiting_on` with the Task's state (mutates `record`): the problem
+ * reports of the latest pause while it waits in TASK_STATE_INPUT_REQUIRED, and
+ * nothing once it moves on. A pause entered without reports has none; a later
+ * status update in the same pause that carries reports replaces them.
+ */
+export function applyWaitingOn(record: A2ARecordLike, prevState: string | null): void {
+  if (record.task.status?.state !== "TASK_STATE_INPUT_REQUIRED") {
+    delete record.waiting_on;
+    return;
+  }
+  const problems = problemsOf(record.task);
+  if (problems.length) record.waiting_on = problems;
+  else if (prevState !== "input_required") delete record.waiting_on;
+}
 
 /** The record as these functions read it. */
 export interface A2ARecordLike extends A2APlatformFields {
@@ -152,12 +274,20 @@ export async function applyStateFields(
   seenCancel?: A2ACancel,
 ): Promise<void> {
   const task = record.task;
-  if (state === "canceled") {
+  // An exhausted Task is TASK_STATE_CANCELED with the budget extension's
+  // `exhausted` outcome (SPEC.md §7.7), so it carries the cancel fields too.
+  // Exhaustion is not a cancellation a party asked for, so its reason is only
+  // the one the Task or a CancelTask states, never the `user_requested` a
+  // bare cancel is recorded as.
+  if (state === "canceled" || state === "exhausted") {
     const own = extensionData<Record<string, unknown>>(task, EXT_CANCEL);
-    const cancel: A2ACancel = own && isValidCancelObject(own) ? own : seenCancel && isValidCancelObject(seenCancel) ? seenCancel : { reason: "user_requested" };
-    record.cancel_reason = cancel.reason;
-    if (cancel.unmetNeed !== undefined) record.unmet_need = cancel.unmetNeed;
-    if (cancel.dependency !== undefined) record.dependency = cancel.dependency;
+    const stated = own && isValidCancelObject(own) ? own : seenCancel && isValidCancelObject(seenCancel) ? seenCancel : undefined;
+    const cancel: A2ACancel | undefined = stated ?? (state === "canceled" ? { reason: "user_requested" } : undefined);
+    if (cancel) {
+      record.cancel_reason = cancel.reason;
+      if (cancel.unmetNeed !== undefined) record.unmet_need = cancel.unmetNeed;
+      if (cancel.dependency !== undefined) record.dependency = cancel.dependency;
+    }
     record.canceled_by = await canceledBy(record as never, env, taskId, deps.origins);
   }
   if (state === "failed") {
@@ -200,6 +330,7 @@ export function publishStateOutputs(record: A2ARecordLike, state: string, env: E
   const taskId = record.task.id;
   const offering = record.offering ?? "";
   const failed = state === "failed";
+  const stopped = state === "canceled" || state === "exhausted";
   emit(deps, `task.${state}`, "task", state, {
     task_id: taskId,
     state,
@@ -208,8 +339,8 @@ export function publishStateOutputs(record: A2ARecordLike, state: string, env: E
     offering,
     ...(record.origin ? { origin: broadcastOrigin(record.origin) } : {}),
     ...(state === "completed" && record.completed_late ? { completed_late: true, code: BudgetCode.DEADLINE_EXCEEDED } : {}),
-    ...(state === "canceled" && record.cancel_reason ? { cancel_reason: record.cancel_reason } : {}),
-    ...(state === "canceled" && record.canceled_by ? { canceled_by: record.canceled_by } : {}),
+    ...(stopped && record.cancel_reason ? { cancel_reason: record.cancel_reason } : {}),
+    ...(stopped && record.canceled_by ? { canceled_by: record.canceled_by } : {}),
     ...(failed
       ? {
           ...(record.failure_reason ? { failure_reason: record.failure_reason } : {}),
