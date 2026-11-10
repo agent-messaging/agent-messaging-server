@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- **Learning a message was picked up later.** `mesh.onLateRespond(listener)`
+  hands the listener each respond that names a request this agent no longer
+  waits on: the wait timed out, or ended in a queued acknowledgement, and the
+  receiver acknowledged or answered later, typically when it picked the
+  message up from its mailbox. Before, such a respond was dropped in silence,
+  so a sender could not tell a message still waiting from one already picked
+  up. Each comes once, after the addressing, freshness and `(from, id)`
+  checks; the listener checks the binding (`in_reply_to` names the request,
+  `from` should be the agent it went to). A late answer to a call made with
+  `onLate` or `onLateAnswer` still goes there. Returns a function that stops
+  listening. Nothing existing changes behaviour.
+
 ## 0.68.0 (2026-11-07)
 
 What a platform moving its agents to wire 0.4.0 (A2A over Agent Messaging)

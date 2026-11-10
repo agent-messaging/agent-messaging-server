@@ -3641,16 +3641,51 @@ export class AgentMesh {
   private deliverLate(env: Envelope): void {
     const id = env.in_reply_to;
     const late = typeof id === "string" ? this.lateAnswers.get(id) : undefined;
-    if (!late || env.from !== late.agentId) return;
-    if (this.queuedAckOf(env)) return;
-    if (!env.error && ((env.payload as RespondPayload | undefined)?.status === "accepted" || (isA2AFrame(env) && isAcceptSignal(env)))) return;
-    if (!this.rememberInboxId(env.from, env.id)) return; // §22.2
-    this.lateAnswers.delete(id as string);
-    try {
-      late.onLate(env);
-    } catch {
-      /* the hook's problem */
+    const ack = this.queuedAckOf(env) !== null
+      || (!env.error && ((env.payload as RespondPayload | undefined)?.status === "accepted" || (isA2AFrame(env) && isAcceptSignal(env))));
+    if (late && env.from === late.agentId && !ack) {
+      if (!this.rememberInboxId(env.from, env.id)) return; // §22.2
+      this.lateAnswers.delete(id as string);
+      try {
+        late.onLate(env);
+      } catch {
+        /* the hook's problem */
+      }
+      return;
     }
+    // Nothing waits for it: an acknowledgement (or an answer) that came after
+    // its send stopped waiting, for instance when the receiver picked the
+    // message up from its mailbox. Handed to whoever listens, so a sender can
+    // learn its message was picked up; dropped in silence otherwise.
+    if (typeof id !== "string" || this.lateRespondListeners.size === 0) return;
+    if (!this.rememberInboxId(env.from, env.id)) return; // §22.2
+    for (const fn of this.lateRespondListeners) {
+      try {
+        fn(env);
+      } catch {
+        /* the listener's problem */
+      }
+    }
+  }
+
+  private readonly lateRespondListeners = new Set<(env: Envelope) => void>();
+
+  /**
+   * Listen for responds that name a request this agent sent but no longer
+   * waits on: the wait timed out, or ended in a queued acknowledgement, and
+   * the receiver answered or acknowledged later, typically when it picked the
+   * message up from its mailbox (§16.4). Each comes once, after the
+   * addressing, freshness and `(from, id)` checks; its binding to a request is
+   * the listener's to check (`in_reply_to` names the request's id, and `from`
+   * should be the agent the request went to). A late answer to a call made
+   * with `onLate` or `onLateAnswer` goes there instead. Returns a function
+   * that stops listening.
+   */
+  onLateRespond(listener: (env: Envelope) => void): () => void {
+    this.lateRespondListeners.add(listener);
+    return () => {
+      this.lateRespondListeners.delete(listener);
+    };
   }
 
   /** Streams this agent reads that the mesh delivers to its inbox, by
