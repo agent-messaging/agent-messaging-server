@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.69.0 (2026-11-10)
 
 - **Learning a message was picked up later.** `mesh.onLateRespond(listener)`
   hands the listener each respond that names a request this agent no longer
