@@ -96,7 +96,7 @@ const claimsOf = (jwt: string) => JSON.parse(Buffer.from(jwt.split(".")[1]!, "ba
 describe("the pass door (§21.15, §21.16)", () => {
   it("issues a one-hour pass bound to the visitor's own key, after asking its home", async () => {
     const r = rig();
-    const a = await r.door.visit(r.body(), "1.2.3.4");
+    const a = await r.door.visit(r.body(), "192.0.2.1");
     expect(a.status, JSON.stringify(a.body)).toBe(200);
     const c = claimsOf(a.body.jwt as string);
     expect(c.sub).toBe(r.key);
@@ -114,7 +114,7 @@ describe("the pass door (§21.15, §21.16)", () => {
 
   it("refuses a request signed for another mesh, so it cannot be replayed", async () => {
     const r = rig();
-    const a = await r.door.visit(r.body("https://mesh-c.example"), "1.2.3.4");
+    const a = await r.door.visit(r.body("https://mesh-c.example"), "192.0.2.1");
     expect(a.status).toBe(401);
     expect(r.asked).toEqual([]);
   });
@@ -128,7 +128,7 @@ describe("the pass door (§21.15, §21.16)", () => {
     ];
     for (const [endpoint, status] of cases) {
       const r = rig({ card: (key) => ({ handle: HANDLE, endpoints: [endpoint(key)] }) });
-      const a = await r.door.visit(r.body(), "1.2.3.4");
+      const a = await r.door.visit(r.body(), "192.0.2.1");
       expect(a.body.code).toBe("visitor_card_invalid");
       expect(a.status).toBe(status);
     }
@@ -136,41 +136,41 @@ describe("the pass door (§21.15, §21.16)", () => {
 
   it("refuses a card whose naming signature does not verify", async () => {
     const r = rig({ badSig: true });
-    const a = await r.door.visit(r.body(), "1.2.3.4");
+    const a = await r.door.visit(r.body(), "192.0.2.1");
     expect(a.body.code).toBe("visitor_card_invalid");
   });
 
   it("takes a card signed by a key its naming service rotated to since it last asked", async () => {
     const reg = { kp: nkeys.createAccount() };
     const r = rig({ reg });
-    expect((await r.door.visit(r.body(), "1.2.3.4")).status).toBe(200);
+    expect((await r.door.visit(r.body(), "192.0.2.1")).status).toBe(200);
     reg.kp = nkeys.createAccount();
-    const again = await r.door.visit(r.body(), "1.2.3.4");
+    const again = await r.door.visit(r.body(), "192.0.2.1");
     expect(again.status, JSON.stringify(again.body)).toBe(200);
   });
 
   it("resolves only at a naming service this mesh trusts", async () => {
     const r = rig();
-    const a = await r.door.visit({ ...r.body(), registrar: "https://evil.example" }, "1.2.3.4");
+    const a = await r.door.visit({ ...r.body(), registrar: "https://evil.example" }, "192.0.2.1");
     expect(a.status).toBe(403);
     expect(a.body.code).toBe("visitor_card_invalid");
   });
 
   it("refuses when the home holds no account for the key", async () => {
     const r = rig({ enrolled: false });
-    expect((await r.door.visit(r.body(), "1.2.3.4")).body.code).toBe("visitor_not_in_standing");
+    expect((await r.door.visit(r.body(), "192.0.2.1")).body.code).toBe("visitor_not_in_standing");
   });
 
   it("refuses a key its home revoked or stopped", async () => {
     const a = rig({ check: { revoked: true } });
-    expect((await a.door.visit(a.body(), "1.2.3.4")).body.code).toBe("visitor_key_revoked");
+    expect((await a.door.visit(a.body(), "192.0.2.1")).body.code).toBe("visitor_key_revoked");
     const b = rig({ check: { revoked: false, stopped: "paused" } });
-    expect((await b.door.visit(b.body(), "1.2.3.4")).body.code).toBe("visitor_key_revoked");
+    expect((await b.door.visit(b.body(), "192.0.2.1")).body.code).toBe("visitor_key_revoked");
   });
 
   it("refuses rather than issues when the home cannot be asked", async () => {
     const r = rig({ homeDown: true });
-    const a = await r.door.visit(r.body(), "1.2.3.4");
+    const a = await r.door.visit(r.body(), "192.0.2.1");
     expect(a.status).toBe(503);
     expect(a.body.code).toBe("visitor_check_unavailable");
     expect(await r.visitors.get(r.key)).toBeNull();
@@ -178,18 +178,18 @@ describe("the pass door (§21.15, §21.16)", () => {
 
   it("refuses a home its operator barred", async () => {
     const r = rig({ deps: { barred: ["mesh-a.example"] } });
-    expect((await r.door.visit(r.body(), "1.2.3.4")).body.code).toBe("visitor_home_barred");
+    expect((await r.door.visit(r.body(), "192.0.2.1")).body.code).toBe("visitor_home_barred");
   });
 
   it("asks this mesh's own records too, as every issuing door does (§4.8)", async () => {
     const r = rig({ deps: { localRefusal: async () => ({ status: 403, code: "visitor_key_revoked", error: "revoked here" }) } });
-    expect((await r.door.visit(r.body(), "1.2.3.4")).body.code).toBe("visitor_key_revoked");
+    expect((await r.door.visit(r.body(), "192.0.2.1")).body.code).toBe("visitor_key_revoked");
   });
 
   it("takes no more visitors than its setting", async () => {
     const r = rig({ deps: { maxVisitors: 1 } });
     await r.visitors.put({ key: "UOTHER", handle: "x", home_mesh: HOME, first_at: "", last_at: "", pass_expires_at: new Date().toISOString(), passes: 1 });
-    expect((await r.door.visit(r.body(), "1.2.3.4")).body.code).toBe("visitor_capacity");
+    expect((await r.door.visit(r.body(), "192.0.2.1")).body.code).toBe("visitor_capacity");
   });
 });
 
@@ -215,7 +215,7 @@ describe("late answers wait, then the mailbox goes (§21.19)", () => {
   it("keeps a finished visitor through the grace, then removes an empty mailbox", async () => {
     let t = Date.now();
     const r = rig({ deps: { now: () => t } });
-    await r.door.visit(r.body(), "1.2.3.4");
+    await r.door.visit(r.body(), "192.0.2.1");
     t += 3600_000 + VISITOR_GRACE_MS - 60_000;
     expect(await r.door.sweep()).toBe(0);
     t += 120_000;
@@ -227,7 +227,7 @@ describe("late answers wait, then the mailbox goes (§21.19)", () => {
   it("keeps a mailbox with mail in it until its retention ends", async () => {
     let t = Date.now();
     const r = rig({ deps: { now: () => t } });
-    await r.door.visit(r.body(), "1.2.3.4");
+    await r.door.visit(r.body(), "192.0.2.1");
     r.boxes.set(r.key, 2);
     t += 3600_000 + VISITOR_GRACE_MS + 60_000;
     expect(await r.door.sweep()).toBe(0);
