@@ -5,8 +5,10 @@
  *   POST /v1/bootstrap   POST /v1/node-credential   POST /v1/credential/revoke-own
  *   POST /v1/agent-key/revoke-own   GET /v1/key-check/:key   GET /health
  *   POST /v1/key-standing (whether an account holds the caller's own agent key;
- *   the adapter asks it on a mesh that offers no naming, so AgentMesh's edge
- *   does not route it)
+ *   the adapter asks it on a mesh that offers no naming, and a mesh a visitor
+ *   visits asks it of the visitor's home, SPEC §21.16)
+ *   POST /v1/visit (a visitor from another public mesh asks for a pass,
+ *   keychain/visit.ts, SPEC §21.15; only when MESH_VISITS=on)
  *
  * and the registry's documents over HTTPS (registry/documents-http.ts, step
  * 10a): GET /v1/agents/:key/descriptor, /v1/descriptors/:digest,
@@ -78,6 +80,7 @@ import { connectBrokerAdmin, liveRevokeConfig } from "./live-revoke.js";
 import { meshInfo } from "./mesh-object.js";
 import { loopbackPlatformSteps, PlatformStepUnavailable } from "./platform-steps.js";
 import { customerMintSeed } from "./split-keys.js";
+import { visitDoor, visitSettings, VisitorStore, type VisitDoor } from "./visit.js";
 import { StopStore } from "./stop-store.js";
 import { TenantLimitStore } from "./tenant-limits.js";
 import { TrustAnchorStore } from "./trust-anchors.js";
@@ -306,6 +309,28 @@ export class MeshApi {
       replay: new ReplayCache(),
     });
     api.closeUsage = async () => { await streamRoutes.close(); if (usageStore) await usageStore.close(); };
+    // Visitors from other public meshes (SPEC §21.14 to §21.20), when MESH_VISITS=on.
+    const visitOn = visitSettings(env);
+    if (visitOn) {
+      const mailboxes = new InboxBuffer(js);
+      api.visits = visitDoor({
+        ...visitOn,
+        visitors: await VisitorStore.create(js),
+        mintSeed: () => customerMintSeed(env),
+        issuerAccount: env.ROOMS_MINT_ISSUER_ACCOUNT,
+        meshInfo: () => meshInfo(env),
+        mailbox: mailboxes,
+        localRefusal: async (key) => {
+          if (await keyRevocations.get(key)) return { status: 403, code: "visitor_key_revoked", error: "This mesh has this signing key on record as revoked." };
+          const found = (await doors.stopsFor([key])).get(key);
+          if (found) return { status: 403, code: "visitor_key_revoked", error: `This mesh has this agent stopped (${found.action}).` };
+          const st = await agentStatus.get(key);
+          if (st) return { status: 403, code: "visitor_key_revoked", error: `This mesh has this agent ${st.status}.` };
+          return null;
+        },
+      });
+      console.log(`[mesh-api] visitors: on at ${visitOn.self}/v1/visit, names resolved at ${visitOn.registrars.join(", ") || "nowhere (every visit is refused)"}, passes of ${visitOn.passSeconds}s`);
+    }
     return api;
   }
 
@@ -324,6 +349,12 @@ export class MeshApi {
     });
     await new Promise<void>((resolve) => this.server!.listen(this.port, this.host, resolve));
     console.log(`[mesh-api] listening on ${this.host}:${this.listeningOn}`);
+    // Hourly: remove the mailboxes of visitors whose visits ended (visit.ts sweep).
+    if (this.visits && !this.visitSweep) {
+      const visits = this.visits;
+      this.visitSweep = setInterval(() => { void visits.sweep().catch(() => undefined); }, 3600_000);
+      this.visitSweep.unref?.();
+    }
     // The optional mTLS listener (SPEC §4.14): the same routes, over TLS that
     // asks for a client certificate, so an agent can enroll with its
     // X.509-SVID and a certificate-bound token can be checked. The
@@ -362,8 +393,12 @@ export class MeshApi {
   private cards: ReturnType<typeof agentCards> | null = null;
   /** Writes the usage store's last batch, when the Monitor routes opened it. */
   private closeUsage: () => Promise<void> = async () => {};
+  /** POST /v1/visit (keychain/visit.ts), on a mesh that takes visitors. */
+  private visits: VisitDoor | null = null;
+  private visitSweep: ReturnType<typeof setInterval> | null = null;
 
   async stop(): Promise<void> {
+    if (this.visitSweep) { clearInterval(this.visitSweep); this.visitSweep = null; }
     this.brokerAuth?.close();
     this.brokerAuth = null;
     await this.closeUsage().catch((err) => console.warn(`[mesh-api] the usage store's last batch: ${(err as Error).message}`));
@@ -398,6 +433,11 @@ export class MeshApi {
       // Whether an account holds the caller's own agent key (doors.ts keyStanding):
       // what the reference adapter asks on a mesh that offers no naming.
       if (method === "POST" && path === "/v1/key-standing") return send(res, await this.doors.keyStanding(await readJson(req), ip));
+      // A visitor from another public mesh asks for a pass (visit.ts, SPEC §21.15).
+      if (method === "POST" && path === "/v1/visit") {
+        if (!this.visits) return send(res, { status: 404, body: { error: "This mesh takes no visitors.", code: "visits_not_offered" } });
+        return send(res, await this.visits.visit(await readJson(req), ip));
+      }
       const m = /^\/v1\/key-check\/([^/]+)$/.exec(path);
       if (method === "GET" && m) return send(res, await this.doors.keyCheck(decodeURIComponent(m[1]!)));
       const sig = /^\/v1\/signals\/([^/]+)$/.exec(path);

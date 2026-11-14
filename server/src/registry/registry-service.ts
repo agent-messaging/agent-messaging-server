@@ -5,6 +5,7 @@ import { Subjects } from "../sdk.js";
 import { isStoreSettingError, keyedOf, storageOf, type KeyedLike, type KeyedStore, type StorageLike } from "../storage/index.js";
 import { AgentKeyRevocationStore } from "../shared/agent-key-revocations.js";
 import { AgentStatusStore } from "../shared/agent-status.js";
+import { VisitorStore, type VisitorList } from "../keychain/visit.js";
 import { boundKeyOf, subscribeWithHandler } from "../shared/handler.js";
 import { serviceQueue } from "../shared/queue-groups.js";
 import { identityFromEnv } from "../shared/seed.js";
@@ -126,6 +127,8 @@ export class RegistryService {
   /** Where each agent's identity came from (§9.7 identity_source), from the
    *  key chain's record, joined into discovery and get. */
   private identitySources = new IdentitySourceView(null);
+  /** The visitors this mesh issued passes to (§21.18), when it takes them. */
+  private visitors: VisitorList | null = null;
   /** Retention policy (§9.2): reclaims long-dead registrations. */
   private reaper: Reaper;
   /** State feeds (§6.6a): the durable writer + `mesh.feed.get` responder.
@@ -307,6 +310,16 @@ export class RegistryService {
       if (isStoreSettingError(err)) throw err;
       console.error(`[registry] agent status unavailable, get and register will not say paused or terminated: ${(err as Error).message}`);
     }
+    // Visitors (§21.18), on a mesh that takes them: get answers a visitor's
+    // key as a visitor, so its senders and its answers resolve.
+    if (process.env.MESH_VISITS?.trim().toLowerCase() === "on") {
+      try {
+        svc.visitors = await VisitorStore.create(js);
+      } catch (err) {
+        if (isStoreSettingError(err)) throw err;
+        console.error(`[registry] the visitor records are not available, so a visitor's key is not found: ${(err as Error).message}`);
+      }
+    }
     // Baseline first, then `start()` opens the watch that carries it forward. Any
     // write that lands between the two is covered: the watch's default replay is
     // the last value of every key, so it re-reads the bucket as it stands when it
@@ -471,7 +484,7 @@ export class RegistryService {
         this.nc,
         "mesh.registry.get.*",
         this.kp,
-        (env, msg) => handleGet(env, msg, this.kv, this.SERVICE_ID, this.cache, this.keyRevocations, this.agentStatus, this.identitySources),
+        (env, msg) => handleGet(env, msg, this.kv, this.SERVICE_ID, this.cache, this.keyRevocations, this.agentStatus, this.identitySources, this.visitors),
         undefined,
         undefined,
         serviceQueue("mesh.registry.get.*"),

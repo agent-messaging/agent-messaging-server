@@ -431,6 +431,112 @@ export function assertJobWorkerNarrow(perms: CredPermissions, agentKey: string, 
   if (bad.length) throw new Error(`refusing to mint a job credential for ${agentKey.slice(0, 12)}: ${bad.join("; ")}`);
 }
 
+/**
+ * The template for a VISITOR's pass (SPEC §21.17): an agent whose home is
+ * another mesh, here for an hour on this mesh's terms. Its key is the
+ * connection key, so possession of its own agent seed is what makes the pass
+ * usable, and every self-scoped subject names that key.
+ *
+ * What it may do: receive on its own inbox (answers, and what waited in its
+ * mailbox while it was away, §21.19), send to agents' inboxes (each door's
+ * admission still decides, §21.18), read the registry, follow the tasks it
+ * started, and drain its own mailbox. What it may not: register, deregister
+ * or be discovered as one of this mesh's agents, heartbeat or publish
+ * presence, guard an inbox, hold rooms, artifacts, boards or feeds, or listen
+ * on any other agent's inbox. The deny list holds as on every credential.
+ */
+export function visitorPermissions(agentKey: string): CredPermissions {
+  const stream = inboxStream(agentKey);
+  return {
+    pub: {
+      allow: [
+        // Reading the registry: one agent by id, and discovery.
+        "mesh.registry.get.*",
+        REGISTRY_DISCOVER,
+        // Reaching agents is the visit's whole point (§21.14).
+        "mesh.agent.*.inbox",
+        // Its own outbox tap and its own spans, scoped to its own key.
+        `mesh.agent.${agentKey}.outbox`,
+        `mesh.trace.${agentKey}`,
+        // The durable record of a task it started, which only a task's two
+        // parties are answered (§7.4): how a late answer to a long task is
+        // read on the next visit.
+        "mesh.task.get.*",
+        // Every request it makes subscribes a reply subject for the
+        // transport's liveness verdict (§18.7).
+        "_INBOX.>",
+        // Its own mailbox, exactly, as on the node template.
+        "$JS.API.INFO",
+        `$JS.API.STREAM.INFO.${stream}`,
+        `$JS.API.CONSUMER.INFO.${stream}.*`,
+        `$JS.API.CONSUMER.CREATE.${stream}.*`,
+        `$JS.API.CONSUMER.DURABLE.CREATE.${stream}.*`,
+        `$JS.API.CONSUMER.MSG.NEXT.${stream}.*`,
+        `$JS.ACK.${stream}.>`,
+      ],
+      deny: [...NEVER, ...VISITOR_NEVER_PUB],
+    },
+    sub: {
+      allow: [
+        // THE point of a pass: its own inbox, and nobody else's.
+        `mesh.agent.${agentKey}.inbox`,
+        "_INBOX.>",
+        ...taskSubscriptions("mesh.task.>"),
+      ],
+      deny: [...NEVER],
+    },
+  };
+}
+
+const REGISTRY_DISCOVER = "mesh.registry.discover";
+
+/** What a visitor may never publish, denied outright so that a later widening
+ *  of the allow list by accident still leaves these out (§21.17). */
+const VISITOR_NEVER_PUB = [
+  "mesh.registry.register",
+  "mesh.registry.deregister",
+  "mesh.heartbeat.*",
+  "mesh.presence.>",
+  "mesh.admission.>",
+  "mesh.feed.>",
+];
+
+/**
+ * The guard on a visitor's pass, run on the claim being signed. A pass is
+ * handed to an agent this mesh holds no account for, so every rule here is
+ * one that must never be broken for it.
+ */
+export function assertNarrowVisitor(perms: CredPermissions, agentKey: string): void {
+  const bad: string[] = [];
+  const stream = inboxStream(agentKey);
+  if (!perms.pub?.allow?.length) bad.push("pub.allow is empty, which INHERITS account defaults");
+  if (!perms.sub?.allow?.length) bad.push("sub.allow is empty, which INHERITS account defaults");
+  for (const s of NEVER) {
+    if (!perms.pub?.deny?.includes(s)) bad.push(`pub.deny is missing "${s}"`);
+    if (!perms.sub?.deny?.includes(s)) bad.push(`sub.deny is missing "${s}"`);
+  }
+  for (const s of VISITOR_NEVER_PUB) {
+    if (!perms.pub?.deny?.includes(s)) bad.push(`pub.deny is missing "${s}"`);
+  }
+  // It listens on its own inbox only, by any spelling.
+  for (const s of perms.sub?.allow ?? []) {
+    if (!s.startsWith("mesh.agent.")) continue;
+    if (s !== `mesh.agent.${agentKey}.inbox`) bad.push(`sub.allow "${s}" is not the visitor's own inbox`);
+  }
+  for (const s of perms.pub?.allow ?? []) {
+    // It never registers, heartbeats, guards, or publishes a feed.
+    if (s === "mesh.registry.>" || s.startsWith("mesh.registry.register") || s.startsWith("mesh.registry.deregister")) bad.push(`pub.allow "${s}": a visitor is not one of this mesh's agents`);
+    if (s.startsWith("mesh.heartbeat.") || s.startsWith("mesh.presence.") || s.startsWith("mesh.admission.") || s.startsWith("mesh.feed.")) bad.push(`pub.allow "${s}": a visitor does not publish that`);
+    if (ROOMS_CONTROL.includes(s) || ARTIFACTS_CONTROL.includes(s) || BOARD_CONTROL.includes(s)) bad.push(`pub.allow "${s}": a visitor holds no rooms, artifacts or boards`);
+    // Its own outbox only: another agent's would be speaking as them.
+    if (s.startsWith("mesh.agent.") && s.endsWith(".outbox") && s !== `mesh.agent.${agentKey}.outbox`) bad.push(`pub.allow "${s}" is another agent's outbox`);
+    if (s.startsWith("mesh.trace.") && s !== `mesh.trace.${agentKey}`) bad.push(`pub.allow "${s}" is another agent's spans`);
+    // JetStream inside its own mailbox only.
+    if (s.startsWith("$JS.") && s !== "$JS.API.INFO" && !s.includes(stream)) bad.push(`pub.allow "${s}" reaches JetStream outside the visitor's own mailbox`);
+  }
+  if (bad.length) throw new Error(`refusing to mint a visitor's pass for ${agentKey.slice(0, 12)}: ${bad.join("; ")}`);
+}
+
 export function durableAgentPermissions(agentKey: string): CredPermissions {
   const stream = inboxStream(agentKey);
   return {
