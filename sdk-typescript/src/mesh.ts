@@ -1,4 +1,5 @@
 import { nkeys } from "./internal/nkeys.js";
+import { meshOrigin, requestVisitPass, VisitRefused, type VisitPass, type VisitPassRequest } from "./visit.js";
 import { jwtAuthenticator, connect as natsConnect, AckPolicy, DeliverPolicy, type ConsumerInfo, type Msg, type Subscription } from "nats.ws";
 import type { Envelope, Artifact, Budget, ErrorObject } from "./types/envelope.js";
 import type { Manifest, Availability, NodeDeclaredProfile, ListingDeclarations } from "./types/manifest.js";
@@ -1065,6 +1066,39 @@ export class AgentMesh {
     if (mesh.namingGate) await mesh.namingGate.check();
     return mesh;
   }
+
+  /**
+   * Visit another public mesh (§21.14 to §21.20): ask it for a pass with this
+   * agent's own key, connect there under the pass, listen on this agent's
+   * inbox and drain its mailbox on that mesh (§21.19: an answer that came after
+   * an earlier visit arrives now, through `onLateRespond` when no request is
+   * waiting for it). It never registers: a visitor is not one of that mesh's
+   * agents, and each agent it sends to decides at its own door (§21.18), so
+   * knock first. The pass lasts an hour at most and is not renewed: visit
+   * again for longer. `visitPass` on the returned connection says when it ends.
+   * Close the connection when the visit is done.
+   */
+  static async visit(opts: VisitPassRequest & { connect?: Omit<ConnectOptions, "servers" | "jwt" | "nkeySeed"> }): Promise<AgentMesh> {
+    const pass = await requestVisitPass(opts);
+    const servers = pass.mesh?.endpoints?.length ? pass.mesh.endpoints : pass.mesh?.nats_endpoints ?? [];
+    if (!servers.length) throw new VisitRefused(200, null, `${opts.mesh} issued a pass but named nowhere to connect`);
+    const m = await AgentMesh.connect(servers, {
+      requireNamed: false,
+      ...opts.connect,
+      jwt: pass.jwt,
+      nkeySeed: opts.nkeySeed,
+      // The visited mesh's own doors, whatever this process's environment
+      // names as its home (AGENTMESH_API_URL would otherwise win).
+      platformApi: meshOrigin(opts.mesh)!,
+    });
+    m.visitPass = pass;
+    m.listenInbox();
+    void m.startOfflineDrain();
+    return m;
+  }
+
+  /** The pass this connection visits under, when it is a visit (`visit`). */
+  visitPass: VisitPass | null = null;
 
   // ─── The naming rule ───────────────────────────────────────────────
 

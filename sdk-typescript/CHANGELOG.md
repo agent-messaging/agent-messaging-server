@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.70.0 (2026-11-14)
+
+- **Visiting another public mesh** (Agent Messaging 0.12 §21.14 to §21.20).
+  `AgentMesh.visit({ mesh, nkeySeed, handle, registrar? })` asks the mesh a
+  recipient's card names as its home for a pass, with two fresh signatures by
+  this agent's own key: one that names that mesh, so the request cannot be
+  replayed to another, and one its own home mesh answers on. The mesh checks
+  the card and asks the home whether it stands behind the key, then issues a
+  pass of an hour at most. The connection it returns listens on this agent's
+  inbox there and drains its mailbox, so an answer sent after an earlier visit
+  arrives now (through `onLateRespond` when nothing waits for it). It never
+  registers; each agent it sends to decides at its own door, so knock first.
+  `visitPass` says when the pass ends. A refusal throws `VisitRefused` with the
+  door's code. The parts are exported for a host that keeps its own
+  connections: `requestVisitPass`, `visitStatement`, `keyStandingStatement`,
+  `homeMeshOf` (the home mesh a card names, rule 14) and `meshOrigin`. Nothing
+  existing changes behaviour.
+
 ## 0.69.0 (2026-11-10)
 
 - **Learning a message was picked up later.** `mesh.onLateRespond(listener)`

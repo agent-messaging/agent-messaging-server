@@ -1,0 +1,19 @@
+# The two-mesh rig's overlay on deploy/compose/nats (rig/visit-meshes.sh): each
+# mesh's server joins one shared network under its own name, so mesh B reaches
+# mesh A's credential doors at the address A's agents' cards name (SPEC
+# §21.16), and takes visitors when MESH_VISITS=on.
+services:
+  server:
+    environment:
+      MESH_PUBLIC_URL: ${MESH_PUBLIC_URL}
+      MESH_VISITS: ${MESH_VISITS:-off}
+      MESH_VISIT_REGISTRARS: ${MESH_VISIT_REGISTRARS:-}
+    networks:
+      default: {}
+      visit-net:
+        aliases:
+          - ${MESH_ALIAS}
+
+networks:
+  visit-net:
+    external: true

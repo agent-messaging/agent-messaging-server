@@ -27,6 +27,20 @@ export {
   type DurableFeedSubscription,
 } from "./mesh.js";
 
+// A visit (§21.14 to §21.20): AgentMesh.visit asks another public mesh for a
+// pass and connects there; these are its parts, for a host that keeps its own
+// connections (the reference adapter).
+export {
+  requestVisitPass,
+  visitStatement,
+  keyStandingStatement,
+  homeMeshOf,
+  meshOrigin,
+  VisitRefused,
+  type VisitPass,
+  type VisitPassRequest,
+} from "./visit.js";
+
 // Sender pre-flight (§6.4b): the sender-side mirror of the §22 receiver
 // obligations, run by request()/requestStream() before publishing and refused
 // locally with the recipient's own codes. Exported so hosts that publish

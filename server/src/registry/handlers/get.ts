@@ -6,6 +6,7 @@ import { withEndpoints } from "../endpoints.js";
 import { AGENT_KEY_REVOKED, type AgentKeyRevocationLookup } from "../../shared/agent-key-revocations.js";
 import type { AgentStatusLookup } from "../../shared/agent-status.js";
 import { withIdentitySource, type IdentitySourceView } from "../identity-source-view.js";
+import { visitorCurrent, type VisitorList } from "../../keychain/visit.js";
 
 export async function handleGet(
   env: Envelope,
@@ -18,6 +19,8 @@ export async function handleGet(
   statuses?: AgentStatusLookup,
   /** Where each agent's identity came from (§9.7), joined on read. */
   sources?: IdentitySourceView | null,
+  /** The visitors this mesh issued passes to (keychain/visit.ts). */
+  visitors?: VisitorList | null,
 ): Promise<Envelope> {
   // Extract agent_id from subject: mesh.registry.get.{agent_id}
   const parts = msg.subject.split(".");
@@ -75,7 +78,32 @@ export async function handleGet(
   const entry = await kv.get(agentId);
   // A deregistered agent leaves a delete marker, which is absent too
   // (storage/types.ts): reading it as a manifest answered INTERNAL_ERROR.
-  if (!entry || entry.operation === "DEL" || entry.operation === "PURGE" || entry.value?.length === 0) {
+  const absent = !entry || entry.operation === "DEL" || entry.operation === "PURGE" || entry.value?.length === 0;
+  // A visitor (§21.18): not one of this mesh's agents, but a verified
+  // identity this mesh checked when it issued the pass. Answered as what was
+  // checked, marked as a visitor, so every door sorts it in the `registered`
+  // tier and never as anonymous, and its inbox resolves for an answer. It is
+  // never listed: discovery reads the registrations only.
+  if (absent && visitors) {
+    const rec = await visitors.get(agentId).catch(() => null);
+    if (visitorCurrent(rec)) {
+      return createEnvelope({
+        type: "respond",
+        from: serviceId,
+        to: env.from,
+        in_reply_to: env.id,
+        trace: childSpan(env.trace),
+        payload: withEndpoints({
+          id: agentId,
+          name: rec!.handle,
+          endpoint: `mesh.agent.${agentId}.inbox`,
+          visibility: "unlisted",
+          visitor: { handle: rec!.handle, home_mesh: rec!.home_mesh, pass_expires_at: rec!.pass_expires_at },
+        } as unknown as Manifest),
+      });
+    }
+  }
+  if (absent) {
     return createEnvelope({
       type: "respond",
       from: serviceId,
