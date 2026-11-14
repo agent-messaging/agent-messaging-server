@@ -195,9 +195,11 @@ export function visitDoor(deps: VisitDeps) {
     return { status: r.status, body };
   }
 
-  async function signingKeys(registrar: string): Promise<string[]> {
+  /** The naming service's card-signing keys, kept an hour. `fresh` reads them
+   *  again: a key not in the kept list may be one the service rotated to. */
+  async function signingKeys(registrar: string, fresh = false): Promise<string[]> {
     const hit = registrarKeys.get(registrar);
-    if (hit && now() - hit.at < 3600_000) return hit.keys;
+    if (!fresh && hit && now() - hit.at < 3600_000) return hit.keys;
     const { status, body } = await getJson(`${registrar}/api/registrar-key`);
     if (status !== 200 || !body) throw new Error("the registrar's keys could not be read");
     const keys = [
@@ -219,7 +221,7 @@ export function visitDoor(deps: VisitDeps) {
     const rkey = typeof body.registrar_key === "string" ? body.registrar_key : "";
     const rsig = typeof body.registrar_sig === "string" ? body.registrar_sig : "";
     if (!card || !rkey || !rsig) return refuse(403, "visitor_card_invalid", `The card for ${handle} is not signed.`);
-    if (!(await signingKeys(registrar)).includes(rkey)) return refuse(403, "visitor_card_invalid", `The card for ${handle} is signed by a key its naming service does not list.`);
+    if (!(await signingKeys(registrar)).includes(rkey) && !(await signingKeys(registrar, true)).includes(rkey)) return refuse(403, "visitor_card_invalid", `The card for ${handle} is signed by a key its naming service does not list.`);
     let ok = false;
     try {
       ok = nkeys.fromPublic(rkey).verify(new TextEncoder().encode(canonicalJSON(card)), new Uint8Array(Buffer.from(rsig, "base64")));

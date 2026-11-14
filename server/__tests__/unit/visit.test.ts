@@ -19,7 +19,7 @@ const HOME = "https://mesh-a.example";
 const NAMING = "https://naming.example";
 const HANDLE = "tz.alice@example.com";
 
-const registrar = nkeys.createAccount();
+const REGISTRAR = nkeys.createAccount();
 const account = nkeys.createAccount();
 const sign = (kp: ReturnType<typeof nkeys.createUser>, s: string) => Buffer.from(kp.sign(new TextEncoder().encode(s))).toString("base64");
 
@@ -30,8 +30,11 @@ function world(over: {
   enrolled?: boolean;
   check?: Record<string, unknown>;
   homeDown?: boolean;
+  /** The naming service's signing key, read at each request (so a test can rotate it). */
+  reg?: { kp: ReturnType<typeof nkeys.createAccount> };
 } = {}, key: string) {
   const asked: string[] = [];
+  const registrar = { getPublicKey: () => (over.reg?.kp ?? REGISTRAR).getPublicKey(), sign: (b: Uint8Array) => (over.reg?.kp ?? REGISTRAR).sign(b) };
   const card = over.card === undefined
     ? { handle: HANDLE, expires_at: new Date(Date.now() + 3600_000).toISOString(), endpoints: [{ protocol: "agentmesh", agent_id: key, mesh: `${HOME}/` }] }
     : over.card && over.card(key);
@@ -135,6 +138,15 @@ describe("the pass door (§21.15, §21.16)", () => {
     const r = rig({ badSig: true });
     const a = await r.door.visit(r.body(), "1.2.3.4");
     expect(a.body.code).toBe("visitor_card_invalid");
+  });
+
+  it("takes a card signed by a key its naming service rotated to since it last asked", async () => {
+    const reg = { kp: nkeys.createAccount() };
+    const r = rig({ reg });
+    expect((await r.door.visit(r.body(), "1.2.3.4")).status).toBe(200);
+    reg.kp = nkeys.createAccount();
+    const again = await r.door.visit(r.body(), "1.2.3.4");
+    expect(again.status, JSON.stringify(again.body)).toBe(200);
   });
 
   it("resolves only at a naming service this mesh trusts", async () => {
