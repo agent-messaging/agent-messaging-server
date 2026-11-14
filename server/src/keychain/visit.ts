@@ -30,8 +30,8 @@
  * of the key as a visitor (registry/handlers/get.ts) and the sweep reads to
  * remove a mailbox nobody will come back for.
  *
- * Off unless MESH_VISITS=on. Settings, read by exact name: MESH_PUBLIC_URL
- * (this mesh's control plane, the URL a card's `mesh` names), MESH_VISIT_PASS_SECONDS
+ * Off unless MESH_VISITS=on. Settings, read by exact name: MESH_PUBLIC_URL, else
+ * API_BASE_URL (this mesh's control plane, the URL a card's `mesh` names), MESH_VISIT_PASS_SECONDS
  * (3600), MESH_VISIT_REGISTRARS (naming services trusted to resolve a
  * visitor's handle, comma-separated; default this mesh's own, PAN_URL),
  * MESH_VISIT_BARRED (home hosts refused, comma-separated), MESH_VISITORS_MAX
@@ -164,7 +164,8 @@ export interface VisitDeps {
  *  door is off (MESH_VISITS is not `on`) or this mesh has no public address. */
 export function visitSettings(env: NodeJS.ProcessEnv): Pick<VisitDeps, "self" | "registrars" | "barred" | "passSeconds" | "maxVisitors"> | null {
   if (env.MESH_VISITS?.trim().toLowerCase() !== "on") return null;
-  const self = meshOrigin(env.MESH_PUBLIC_URL);
+  // The same public address the rest of the mesh API uses (mesh-api.ts).
+  const self = meshOrigin(env.MESH_PUBLIC_URL ?? env.API_BASE_URL);
   if (!self) return null;
   const own = env.PAN_URL?.trim() || env.AGENTMESH_NAMING_URL?.trim();
   const registrars = [...new Set([...list(env.MESH_VISIT_REGISTRARS), ...(own ? [own] : [])].map(meshOrigin).filter((x): x is string => !!x))];

@@ -277,5 +277,7 @@ describe("settings", () => {
     expect(s?.registrars).toEqual(["https://naming.example"]);
     expect(s?.passSeconds).toBe(3600);
     expect(meshOrigin("ftp://x")).toBeNull();
+    // Without MESH_PUBLIC_URL, the address the rest of the mesh API uses.
+    expect(visitSettings({ MESH_VISITS: "on", API_BASE_URL: "https://app.example" })?.self).toBe("https://app.example");
   });
 });
