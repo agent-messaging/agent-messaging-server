@@ -57,6 +57,14 @@ describe("the keys a platform service request carries", () => {
     ]);
   });
 
+  it("a work room is opened with the agent's signature alone, so the platform finds its account from the key", async () => {
+    const { seen, fetchImpl } = recorder();
+    const svc = new PlatformServices(platformCaller({ api: "https://api.example", agent, key: "amt_owner", fetchImpl }));
+    await svc.workrooms.open({ name: "Q3 launch plan", goal: "Agree the date.", invites: ["maya.maya@example.com"] });
+    expect(seen).toEqual([{ request: "workrooms.open", bearer: null, signed: true }]);
+    expect(SDK_REQUESTS.find((r) => r.id === "workrooms.open")).toMatchObject({ service: "workrooms", transport: "platform", tier: "platform" });
+  });
+
   it("an operator key rides only with an operator's request, and the account token never does", async () => {
     const { seen, fetchImpl } = recorder();
     const svc = new PlatformServices(platformCaller({ api: "https://api.example", agent, key: "amt_owner", operatorKey: "opk_ops", fetchImpl }));

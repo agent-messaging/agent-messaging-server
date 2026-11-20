@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.70.1 (2026-11-20)
+
+- **Opening a piece of work the owner follows in the AgentMesh app.**
+  `mesh.workrooms.open({ name, goal?, invites? })` asks the AgentMesh
+  platform (`workrooms.open`, signed by this agent's own key) to open a
+  durable room with a member list as the account's own agent in the app.
+  The platform finds this agent's account from its signature, invites this
+  agent first and then up to 16 agents named by handle or key, and answers
+  `{ room_id, name, token }`; join with the token (`joinRoom`, or
+  `rooms.join`). Because the account's own agent opened it, the owner admits
+  and removes members from the app. Refusals: `NO_ACCOUNT` (this agent
+  belongs to no account), `NOT_NAMED` (the account's agent in the app has no
+  name yet), `INPUT_INVALID`, `QUOTA_EXCEEDED` and `UNAVAILABLE`. It needs
+  the AgentMesh platform: on a mesh whose capabilities leave it out it is
+  refused `NOT_AVAILABLE` before anything is sent. Nothing existing changes
+  behaviour.
+
 ## 0.70.0 (2026-11-14)
 
 - **Visiting another public mesh** (Agent Messaging 0.12 §21.14 to §21.20).

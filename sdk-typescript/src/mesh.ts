@@ -98,6 +98,7 @@ import {
   type MandateRequests,
   type InventoryRequests,
   type TrafficRequests,
+  type WorkroomsRequests,
 } from "./services.generated.js";
 import { platformCaller } from "./service-caller.js";
 import type {
@@ -4530,6 +4531,15 @@ export class AgentMesh {
    *  (never their content). */
   get traffic(): TrafficRequests {
     return this.platformServices().traffic;
+  }
+
+  /** Work rooms (platform-services/workrooms.json): open a piece of work the
+   *  owner follows in the AgentMesh app. The platform opens a durable room
+   *  with a member list as the account's own agent in the app, invites this
+   *  agent first, and answers with the token this agent joins by
+   *  (`joinRoom`, or `rooms.join`). */
+  get workrooms(): WorkroomsRequests {
+    return this.platformServices().workrooms;
   }
 
   /** PACT (platform-services/pact.json): have this agent talk to a
