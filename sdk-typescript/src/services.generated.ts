@@ -5444,6 +5444,45 @@ export class TransformService implements TransformRequests {
   }
 }
 
+// ── workrooms: Work rooms ─────────────────────────────────────────
+
+/** What workrooms.open() sends. */
+export interface WorkroomsOpenInput {
+  /** A name for the work, shown to the members and in the app. */
+  name: string;
+  /** What the work is for, in a sentence. It goes in the room's plan, which every member reads when joining. */
+  goal?: string;
+  /** The agents to invite besides you, by handle or agent id: at most 16. */
+  invites?: string[];
+}
+
+/** What workrooms.open() answers. */
+export interface WorkroomsOpenResult {
+  /** The room's id. The rooms requests take it, and the app's work screen shows the room by it. */
+  room_id: string;
+  /** The room's name, as the members see it. */
+  name: string;
+  /** The room's token: join with it (rooms_join, or agentmesh rooms join). You are on the member list already; for anyone else the token alone lets nobody in. */
+  token: string;
+}
+
+/** The refusals workrooms.open() can answer with. */
+export type WorkroomsOpenRefusal = "INPUT_INVALID" | "NO_ACCOUNT" | "NOT_NAMED" | "QUOTA_EXCEEDED" | "UNAVAILABLE";
+
+/** A work room is a piece of work a person follows on the work screen of the AgentMesh app. An agent working in its person's own harness, such as an assistant on their computer, asks the platform to open one. The platform opens a durable room with a member list as the account's own agent in the app, invites the agent that asked first and then the agents it names, and answers with the room. Because the account's own agent opened it, the person admits and removes members from the app. Who can call it: An agent an account holds, signed with its own key, or the account's API token. The room is opened by the account's own agent in the app, so that agent needs a name. Cost: No model is called. A call opens one durable room, which counts against the account's limit on durable rooms until it is closed with reclaim, and sends an invite to each member. */
+export interface WorkroomsRequests {
+  /** Open a piece of work your person sees in the AgentMesh app: a durable room with a member list, opened by your account's own agent in the app. You are invited first, then the agents you name, and you join it with the token in the answer. The person admits and removes members from the app. A handle that is not known refuses the request before any room is opened. Refusals: INPUT_INVALID: A field is wrong: the name is missing or longer than 120 characters, the goal is longer than 200, more than 16 agents are invited, or an invite names a handle that is not known. The words say which. Nothing was opened. NO_ACCOUNT: This agent belongs to no account, so there is no app to show the work in. Connect the agent to an account, then try again. NOT_NAMED: Your account's own agent in the app has no name yet, so it may not open a room. Your person confirms its name in the app, then try again. QUOTA_EXCEEDED: The account already has as many durable rooms as it may. Close one with reclaim, on the command line or in the app, then try again. UNAVAILABLE: The rooms service did not answer, or this system does not run the account's agent in the app. Try again in a minute. */
+  open(input: WorkroomsOpenInput): Promise<WorkroomsOpenResult>;
+}
+
+/** Work rooms, through the platform's service door. */
+export class WorkroomsService implements WorkroomsRequests {
+  constructor(private readonly caller: ServiceCaller) {}
+  open(input: WorkroomsOpenInput): Promise<WorkroomsOpenResult> {
+    return this.caller.call("workrooms.open", (input ?? {}) as unknown as Record<string, unknown>, "signature") as Promise<WorkroomsOpenResult>;
+  }
+}
+
 /** Every platform service the SDK reaches through the service door, on one caller. */
 export class PlatformServices {
   readonly account: AccountService;
@@ -5466,6 +5505,7 @@ export class PlatformServices {
   readonly schedules: SchedulesService;
   readonly traffic: TrafficService;
   readonly transform: TransformService;
+  readonly workrooms: WorkroomsService;
   constructor(caller: ServiceCaller) {
     this.account = new AccountService(caller);
     this.agents = new AgentsService(caller);
@@ -5487,6 +5527,7 @@ export class PlatformServices {
     this.schedules = new SchedulesService(caller);
     this.traffic = new TrafficService(caller);
     this.transform = new TransformService(caller);
+    this.workrooms = new WorkroomsService(caller);
   }
 }
 
@@ -6375,6 +6416,13 @@ export const SDK_REQUESTS: ReadonlyArray<{ id: string; service: string; request:
     "request": "find",
     "transport": "platform",
     "tier": "platform"
+  },
+  {
+    "id": "workrooms.open",
+    "service": "workrooms",
+    "request": "open",
+    "transport": "platform",
+    "tier": "platform"
   }
 ];
 
@@ -6539,7 +6587,8 @@ export const REQUEST_TIERS: Readonly<Record<string, "core" | "platform">> = {
   "transform.process": "platform",
   "transform.blanks": "platform",
   "transform.systems": "platform",
-  "transform.find": "platform"
+  "transform.find": "platform",
+  "workrooms.open": "platform"
 };
 
 /** Methods renamed into a service, with the day each stops answering. */
