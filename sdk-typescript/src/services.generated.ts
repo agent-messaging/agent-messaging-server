@@ -1813,6 +1813,8 @@ export class DependentsService implements DependentsRequests {
   }
 }
 
+// ── entitlements: Entitlements ────────────────────────────────────
+
 // ── errors: Errors ────────────────────────────────────────────────
 
 /** What errors.report() sends. */
@@ -6471,6 +6473,10 @@ export const REQUEST_TIERS: Readonly<Record<string, "core" | "platform">> = {
   "debt.show": "platform",
   "debt.transition": "platform",
   "dependents.list": "platform",
+  "entitlements.list": "platform",
+  "entitlements.check": "platform",
+  "entitlements.grant": "platform",
+  "entitlements.revoke": "platform",
   "errors.report": "platform",
   "errors.list": "platform",
   "errors.resolve": "platform",
