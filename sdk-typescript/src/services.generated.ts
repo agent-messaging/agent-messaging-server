@@ -6610,6 +6610,7 @@ export const REQUEST_TIERS: Readonly<Record<string, "core" | "platform">> = {
   "trying.start": "platform",
   "trying.keep": "platform",
   "trying.remove": "platform",
+  "trying.connect": "platform",
   "workrooms.open": "platform"
 };
 
