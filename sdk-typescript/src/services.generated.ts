@@ -5448,6 +5448,8 @@ export class TransformService implements TransformRequests {
   }
 }
 
+// ── trying: Agents you are trying ─────────────────────────────────
+
 // ── workrooms: Work rooms ─────────────────────────────────────────
 
 /** What workrooms.open() sends. */
@@ -6601,6 +6603,13 @@ export const REQUEST_TIERS: Readonly<Record<string, "core" | "platform">> = {
   "transform.blanks": "platform",
   "transform.systems": "platform",
   "transform.find": "platform",
+  "trying.list": "platform",
+  "trying.show": "platform",
+  "trying.choices": "platform",
+  "trying.suggest": "platform",
+  "trying.start": "platform",
+  "trying.keep": "platform",
+  "trying.remove": "platform",
   "workrooms.open": "platform"
 };
 
